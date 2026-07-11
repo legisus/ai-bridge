@@ -2,7 +2,7 @@
 // Maintains a WebSocket to the local bridge server and executes commands
 // against chrome.* APIs. Trusted input and CSP-proof eval go through
 // chrome.debugger (DevTools protocol), so they work on sites that reject
-// synthetic DOM events (Gmail, Grammarly, Google Docs, ...).
+// synthetic DOM events (webmail clients, rich-text editors, collaborative docs, ...).
 
 const DEFAULTS = { port: 8765, token: "", allowlist: [] };
 

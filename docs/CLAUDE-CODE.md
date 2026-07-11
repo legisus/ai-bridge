@@ -62,7 +62,7 @@ Each call prints JSON to stdout and exits non-zero on failure. Commands:
 Rules:
 - Always `ping` first; if it fails, tell me to start the server / check the extension.
 - Prefer `eval` for reading pages; use `click`/`insertText`/`key` only when a site
-  rejects synthetic events (rich editors like Google Docs, Grammarly).
+  rejects synthetic events (contenteditable/ProseMirror-class rich-text editors).
 - Open new tabs in the background (default) — do not steal my focus.
 - `detach` from tabs when finished so the debugger banner goes away.
 - This is my real browser with my real sessions: never log out, change account
@@ -70,7 +70,7 @@ Rules:
 ```
 
 That's the whole integration. Once the block is in `CLAUDE.md`, you can ask things
-like *"open my Gmail, find the invoice from ACME and save the attachment"* and Claude
+like *"open my webmail, find the invoice from ACME and save the attachment"* and Claude
 Code will compose the calls itself.
 
 ### Optional: shell alias

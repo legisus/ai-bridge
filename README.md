@@ -6,8 +6,8 @@ localhost, with no cloud in the loop.
 
 Born from a practical problem: an AI agent working in a terminal needed to download email
 attachments, fill review forms, and drive web editors on sites the user was logged into.
-OS-level scripting (AppleScript/xdotool) is platform-bound, steals window focus, and its
-synthetic events are rejected by CSP-strict editors like Gmail or Grammarly. This bridge
+OS-level input synthesis is platform-bound, steals window focus, and its
+synthetic events are rejected by CSP-strict web apps and rich-text editors. This bridge
 fixes all of that with three small pieces:
 
 ```
@@ -21,16 +21,17 @@ AI agent / your scripts          bridge server               Chrome extension
 ## Why the `chrome.debugger` route matters
 
 - **Trusted input.** `Input.dispatchMouseEvent` / `Input.insertText` produce events with
-  `isTrusted: true` — rich editors (Google Docs, Grammarly, Slate/ProseMirror apps) accept
+  `isTrusted: true` — rich editors (contenteditable, ProseMirror- and Slate-class apps) accept
   them where synthetic DOM events are ignored.
 - **CSP-proof eval.** `Runtime.evaluate` works on pages whose Content-Security-Policy
   blocks injected `eval`.
 - **No focus stealing.** Everything runs in background tabs (`newTab` opens with
   `active:false`); your work is never interrupted.
-- **Your sessions, no re-login.** The extension lives in your normal profile, so Gmail,
-  journals, dashboards — anything you're logged into — just work. This also sidesteps
+- **Your sessions, no re-login.** The extension lives in your normal profile, so webmail,
+  dashboards, internal tools — anything you're logged into — just work. This also sidesteps
   Chrome 136+'s restriction on `--remote-debugging-port` with the default profile.
-- **Cross-platform.** macOS, Windows, Linux — no osascript, no xdotool.
+- **Cross-platform.** macOS, Windows, Linux — no OS-level input scripting or
+  accessibility APIs required.
 
 ## Install
 
@@ -56,7 +57,7 @@ AI agent / your scripts          bridge server               Chrome extension
 bridge() { node /path/to/ai-bridge/server/cli.js "$@"; }
 
 bridge listTabs
-bridge newTab   '{"url":"https://mail.google.com"}'          # opens in background
+bridge newTab   '{"url":"https://example.com"}'               # opens in background
 bridge eval     '{"tabId":123,"code":"document.title"}'
 bridge eval     '{"tabId":123}' --file scrape.js              # long scripts from a file
 bridge click    '{"tabId":123,"x":420,"y":310}'               # trusted click

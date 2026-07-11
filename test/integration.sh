@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Live integration test for AI Browser Bridge.
 # Requires: server running + extension loaded, provisioned, and connected.
-# Exercises every command that replaces an AppleScript technique used in the
-# original browser-automation session. Prints a PASS/FAIL table; exits non-zero
+# Exercises every command the bridge exposes, end-to-end against a self-injected
+# fixture page. Prints a PASS/FAIL table; exits non-zero
 # on any failure. Runs in a throwaway background tab; does not touch your tabs.
 
 set -u
@@ -56,7 +56,7 @@ b insertText "{\"tabId\":$TID,\"text\":\"pasted-text\"}" >/dev/null
 INVAL=$(b eval "{\"tabId\":$TID,\"code\":\"document.getElementById('in').value\"}" | tr -d '"')
 check "insertText (trusted paste into input)" "$INVAL" "pasted-text"
 
-# 5) click at coords — replaces: System Events trusted click -----------
+# 5) click at coords — replaces: OS-level synthetic click --------------
 XY=$(b eval "{\"tabId\":$TID,\"code\":\"(function(){var r=document.getElementById('btn').getBoundingClientRect();return Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2)})()\"}" | tr -d '"')
 CX="${XY%,*}"; CY="${XY#*,}"
 b click "{\"tabId\":$TID,\"x\":$CX,\"y\":$CY}" >/dev/null
