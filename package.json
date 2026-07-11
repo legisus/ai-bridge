@@ -1,6 +1,6 @@
 {
   "name": "ai-browser-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local bridge between an AI coding agent (or any local tool) and your logged-in Chrome: tabs, CSP-proof eval, trusted input, authenticated downloads, print-to-PDF. No cloud, localhost only.",
   "author": "Mykola Bielousov",
   "license": "MIT",

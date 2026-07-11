@@ -157,11 +157,16 @@ async function handle(cmd, p) {
     }
 
     case "key": {
-      // Trusted key press, e.g. {key:"Enter", code:"Enter", modifiers:0}
+      // Trusted key press, e.g. {key:"Enter", code:"Enter", modifiers:0}.
+      // Optional `commands` (e.g. ["paste"], ["selectAll"]) run the matching
+      // editing command with the keyDown, so shortcuts like Cmd/Ctrl+V trigger
+      // the browser's native paste instead of just delivering the raw key.
       await assertAllowed(p.tabId);
       await dbgAttach(p.tabId);
       const ev = { key: p.key, code: p.code || p.key, modifiers: p.modifiers || 0 };
-      await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyDown", ...ev });
+      const down = { type: "keyDown", ...ev };
+      if (Array.isArray(p.commands) && p.commands.length) down.commands = p.commands;
+      await dbg(p.tabId, "Input.dispatchKeyEvent", down);
       await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...ev });
       return { ok: true };
     }

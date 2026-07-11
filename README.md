@@ -63,6 +63,7 @@ bridge eval     '{"tabId":123}' --file scrape.js              # long scripts fro
 bridge click    '{"tabId":123,"x":420,"y":310}'               # trusted click
 bridge insertText '{"tabId":123,"text":"Hello"}'              # trusted "paste" at caret
 bridge key      '{"tabId":123,"key":"Enter"}'
+bridge key      '{"tabId":123,"key":"v","modifiers":4,"commands":["paste"]}'  # native paste from the clipboard
 bridge download '{"url":"https://.../file.pdf","filename":"file.pdf"}'   # uses your cookies
 bridge pdf      '{"tabId":123}' --out page.pdf
 bridge screenshot '{"tabId":123}' --out page.png
