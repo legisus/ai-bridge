@@ -53,7 +53,7 @@ AI agent / your scripts          bridge server               Chrome extension
 ## Usage
 
 ```bash
-bridge() { node /path/to/ai-extension/server/cli.js "$@"; }
+bridge() { node /path/to/ai-bridge/server/cli.js "$@"; }
 
 bridge listTabs
 bridge newTab   '{"url":"https://mail.google.com"}'          # opens in background
@@ -71,6 +71,13 @@ bridge detach   '{"tabId":123}'                               # remove the debug
 
 For an AI agent, the contract is simple: every command is one shell invocation that
 prints JSON to stdout and exits non-zero on failure.
+
+## Use from Claude Code
+
+See **[docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md)** for a copy-paste `CLAUDE.md`
+block that teaches Claude Code every command, plus permission and troubleshooting
+notes. Once added, you can ask things like *"open the dashboard tab and screenshot
+the error"* and the agent composes the CLI calls itself.
 
 ## Security model
 
@@ -100,6 +107,12 @@ extension/    Manifest V3 extension (service worker + options page)
 server/       relay server (server.js) and CLI client (cli.js)
 test/         protocol round-trip test with a simulated extension
 ```
+
+## Contributing
+
+Improvements welcome — new CDP-backed commands, a Firefox port, reliability fixes.
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, the two-layer test
+suite, and the security ground rules every PR must preserve.
 
 ## License
 

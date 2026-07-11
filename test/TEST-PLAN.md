@@ -21,11 +21,11 @@ Two layers:
 | 1 | `make new tab/window` (background, minimized) | `newTab` (`active:false`) | newTab background | returns a tab id; opens without focus |
 | 2 | `execute javascript` — read innerText, scrape, set form fields | `eval` (CSP-proof `Runtime.evaluate`) | eval inject fixture / DOM read | reads title + element presence |
 | 3 | list tabs / find tab by URL substring | `listTabs` | listTabs present | fixture tab id found in list |
-| 4 | real **Cmd+V paste** (Grammarly/IJECE forms) | `insertText` (trusted) | insertText into input | input `.value` equals inserted text |
+| 4 | real **Cmd+V paste** (Grammarly/CSP-strict web forms) | `insertText` (trusted) | insertText into input | input `.value` equals inserted text |
 | 5 | `System Events` **click at {x,y}** (trusted) | `click` (trusted mouse event) | click fires handler | page `__clicked` flips true |
 | 6 | `keystroke` (Enter, Cmd+A) | `key` (trusted key event) | keydown Enter | page records `__lastKey==="Enter"` |
 | 7 | `set URL of tab` | `navigate` | navigate URL change | `location.hostname` updates |
-| 8 | `chrome --headless --print-to-pdf` (email/exhibit PDFs) | `pdf` | print-to-PDF | output file starts with `%PDF` |
+| 8 | `chrome --headless --print-to-pdf` (archiving pages as PDF) | `pdf` | print-to-PDF | output file starts with `%PDF` |
 | 9 | `screencapture` (Grammarly screenshot) | `screenshot` | PNG bytes | output file has PNG magic bytes |
 | 10 | Gmail attachment: fetch in page → base64 → file | `download` (uses browser cookies) | authenticated download | file lands on disk, path returned |
 | 11 | `activate` / `set index` / focus window / un-minimize | `activateTab` | focus tab+window | returns `{ok:true}`; tab becomes active |
