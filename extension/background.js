@@ -109,7 +109,7 @@ async function setIndicator(tabId, on) {
           if (!el) {
             el = document.createElement("div");
             el.id = ID;
-            el.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;border:3px solid #16a34a;box-shadow:inset 0 0 0 1px rgba(22,163,74,.35)";
+            el.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;border:6px solid #16a34a;box-shadow:inset 0 0 0 2px rgba(22,163,74,.35)";
             (document.documentElement || document.body).appendChild(el);
           }
           if (window.__aiBridgeTitle == null) { window.__aiBridgeTitle = document.title; document.title = "🟢 " + document.title; }
