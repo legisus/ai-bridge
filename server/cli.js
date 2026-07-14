@@ -52,14 +52,18 @@ ws.on("message", (data) => {
     clearTimeout(timer);
     if (!msg.ok) { console.error("ERROR:", msg.error); process.exit(1); }
     // Binary results (pdf/screenshot) can be written straight to a file.
+    let out;
     if (flags.out && msg.result && msg.result.base64) {
       fs.writeFileSync(flags.out, Buffer.from(msg.result.base64, "base64"));
-      console.log(JSON.stringify({ written: flags.out }));
+      out = JSON.stringify({ written: flags.out });
     } else {
-      console.log(JSON.stringify(msg.result));
+      out = JSON.stringify(msg.result);
     }
     ws.close();
-    process.exit(0);
+    // process.exit() right after console.log truncates large outputs: stdout
+    // to a pipe is async and exit doesn't wait for the flush. Write with a
+    // callback and exit only once the payload is fully out.
+    process.stdout.write(out + "\n", () => process.exit(0));
   }
 });
 ws.on("error", (e) => { console.error("connect failed:", e.message); process.exit(4); });
