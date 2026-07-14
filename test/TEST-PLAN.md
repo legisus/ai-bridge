@@ -32,6 +32,11 @@ Two layers:
 | 12 | (no OS-level equivalent) clear DevTools debugger banner | `detach` | release debugger | returns `{ok:true}` |
 | 13 | `close tab` / `close window` | `closeTab` | tab removed | tab id absent from `listTabs` |
 | 14 | (n/a) many CLIs, one tab, first-touch attach | per-tab attach lock | concurrency | 6 concurrent `eval` all return their own value; no attach race |
+| 15 | type into autocomplete/React widget | `type` (per-char keystrokes) | type into input | input `.value` equals typed text |
+| 16 | click without pixel math | `click` (`selector`) | click by selector | handler fires from selector-resolved center |
+| 17 | wait for async element/condition | `waitFor` | selector becomes present | returns `{ok:true}` once `#late[data-ready]` appears |
+| 18 | scroll page (to selector/top/bottom/by) | `scroll` | scroll to bottom | `window.scrollY` advances |
+| 19 | health of connection + attached tabs | `status` | status shape | returns `version` + `attachedTabs[]` |
 | — | auth/token rejection (security) | server auth | protocol.test.js | bad token → socket closed |
 
 ### Techniques deliberately NOT ported (host-OS, out of scope for the extension)

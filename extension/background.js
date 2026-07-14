@@ -4,7 +4,7 @@
 // chrome.debugger (DevTools protocol), so they work on sites that reject
 // synthetic DOM events (webmail clients, rich-text editors, collaborative docs, ...).
 
-const DEFAULTS = { port: 8765, token: "", allowlist: [] };
+const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true };
 
 let ws = null;
 let attached = new Set(); // tabIds with debugger attached
@@ -44,7 +44,7 @@ async function connect() {
     }
     try { ws.send(JSON.stringify(reply)); } catch {}
   };
-  ws.onclose = () => { ws = null; };
+  ws.onclose = () => { ws = null; setTimeout(connect, 1000); }; // quick reconnect while SW is alive; the alarm is the backstop
   ws.onerror = () => { try { ws && ws.close(); } catch {} };
 }
 
@@ -77,18 +77,61 @@ async function dbgAttach(tabId) {
   let p = attaching.get(tabId);
   if (!p) {
     p = chrome.debugger.attach({ tabId }, "1.3")
-      .then(() => { attached.add(tabId); })
+      .then(() => { attached.add(tabId); return setIndicator(tabId, true); })
       .finally(() => { attaching.delete(tabId); });
     attaching.set(tabId, p);
   }
   return p;
 }
 
-chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); } });
+chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); setIndicator(src.tabId, false); } });
 chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); });
 
 function dbg(tabId, method, params) {
   return chrome.debugger.sendCommand({ tabId }, method, params || {});
+}
+
+// ---------- visual indicator ----------
+
+// A green frame + title dot on tabs the agent is actively driving, so autonomous
+// work is visible per-tab — more granular than Chrome's global debugger banner
+// (it shows WHICH tabs are live). Toggle via the "indicator" option; removal
+// always runs regardless of the flag so nothing is left stuck on.
+async function setIndicator(tabId, on) {
+  if (on && !(await config()).indicator) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (on) => {
+        const ID = "__ai_bridge_frame__";
+        let el = document.getElementById(ID);
+        if (on) {
+          if (!el) {
+            el = document.createElement("div");
+            el.id = ID;
+            el.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;border:3px solid #16a34a;box-shadow:inset 0 0 0 1px rgba(22,163,74,.35)";
+            (document.documentElement || document.body).appendChild(el);
+          }
+          if (window.__aiBridgeTitle == null) { window.__aiBridgeTitle = document.title; document.title = "🟢 " + document.title; }
+        } else {
+          if (el) el.remove();
+          if (window.__aiBridgeTitle != null) { document.title = window.__aiBridgeTitle; window.__aiBridgeTitle = null; }
+        }
+      },
+      args: [on],
+    });
+  } catch (e) { /* injection blocked on chrome://, PDF viewer, etc. — non-fatal */ }
+}
+
+// Resolve a CSS selector to its viewport-center coordinates (CSS px), scrolling it
+// into view first — lets click target elements by selector with no pixel math.
+async function selectorCenter(tabId, selector) {
+  await dbgAttach(tabId);
+  const r = await dbg(tabId, "Runtime.evaluate", {
+    expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; el.scrollIntoView({ block: "center", inline: "center" }); const b = el.getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; })()`,
+    returnByValue: true,
+  });
+  return (r.result && r.result.value) || null;
 }
 
 // ---------- commands ----------
@@ -156,14 +199,21 @@ async function handle(cmd, p) {
     }
 
     case "click": {
-      // Trusted click at viewport coordinates (CSS px).
+      // Trusted click at viewport coordinates (CSS px), or at a CSS `selector`'s
+      // center (resolved in-page — no screenshot/DPR pixel math needed).
       await assertAllowed(p.tabId);
       await dbgAttach(p.tabId);
-      const base = { x: p.x, y: p.y, button: "left", clickCount: 1 };
+      let x = p.x, y = p.y;
+      if (p.selector) {
+        const c = await selectorCenter(p.tabId, p.selector);
+        if (!c) throw new Error(`click: selector not found: ${p.selector}`);
+        x = Math.round(c.x); y = Math.round(c.y);
+      }
+      const base = { x, y, button: "left", clickCount: p.clickCount || 1 };
       await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none" });
       await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...base });
       await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...base });
-      return { ok: true };
+      return { ok: true, x, y };
     }
 
     case "insertText": {
@@ -181,8 +231,16 @@ async function handle(cmd, p) {
       // the browser's native paste instead of just delivering the raw key.
       await assertAllowed(p.tabId);
       await dbgAttach(p.tabId);
-      const ev = { key: p.key, code: p.code || p.key, modifiers: p.modifiers || 0 };
+      const mods = p.modifiers || 0;
+      const ev = { key: p.key, code: p.code || p.key, modifiers: mods };
       const down = { type: "keyDown", ...ev };
+      // A printable character needs `text` set, or CDP delivers the key event
+      // without actually inserting the character. Skip it when Ctrl/Meta is held
+      // (that's a shortcut like Ctrl+A, not text entry).
+      const isChar = typeof p.key === "string" && [...p.key].length === 1;
+      const ctrlOrMeta = (mods & 2) || (mods & 4); // Ctrl=2, Meta=4
+      const text = p.text != null ? p.text : (isChar && !ctrlOrMeta ? p.key : null);
+      if (text != null) { down.text = text; down.unmodifiedText = text; }
       if (Array.isArray(p.commands) && p.commands.length) down.commands = p.commands;
       await dbg(p.tabId, "Input.dispatchKeyEvent", down);
       await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...ev });
@@ -231,8 +289,69 @@ async function handle(cmd, p) {
         await chrome.debugger.detach({ tabId: p.tabId });
         attached.delete(p.tabId);
       }
+      await setIndicator(p.tabId, false);
       return { ok: true };
     }
+
+    case "type": {
+      // Real per-character keystrokes — what autocomplete / React widgets listen
+      // for, where insertText (a paste) is silently ignored.
+      await assertAllowed(p.tabId);
+      await dbgAttach(p.tabId);
+      const text = String(p.text ?? "");
+      const delay = p.delay || 0;
+      for (const ch of text) {
+        await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch, unmodifiedText: ch });
+        await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: ch });
+        if (delay) await new Promise((r) => setTimeout(r, delay));
+      }
+      return { ok: true, typed: [...text].length };
+    }
+
+    case "scroll": {
+      // Scroll a tab: to a `selector`, to `top`/`bottom`, or by `dx`/`dy`.
+      // Uses chrome.scripting (no debugger, no banner) — it's a plain page action.
+      await assertAllowed(p.tabId);
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: p.tabId },
+        func: (o) => {
+          if (o.selector) { const el = document.querySelector(o.selector); if (!el) return { error: "selector not found" }; el.scrollIntoView({ block: "center", inline: "center" }); return { ok: true, into: o.selector }; }
+          if (o.top) { window.scrollTo(0, 0); return { ok: true, y: 0 }; }
+          if (o.bottom) { window.scrollTo(0, document.body.scrollHeight); return { ok: true, y: window.scrollY }; }
+          window.scrollBy(o.dx || 0, o.dy || 0); return { ok: true, x: window.scrollX, y: window.scrollY };
+        },
+        args: [{ selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom }],
+      });
+      const out = res && res.result;
+      if (out && out.error) throw new Error(`scroll: ${out.error}`);
+      return out || { ok: true };
+    }
+
+    case "waitFor": {
+      // Poll until a `selector` exists or a JS `code` condition is truthy.
+      // Selector checks use chrome.scripting (no banner); code uses CSP-proof eval.
+      await assertAllowed(p.tabId);
+      const timeout = p.timeoutMs || 10000;
+      const poll = p.pollMs || 200;
+      const start = Date.now();
+      while (Date.now() < start + timeout) {
+        let ok = false;
+        if (p.code) {
+          await dbgAttach(p.tabId);
+          const r = await dbg(p.tabId, "Runtime.evaluate", { expression: `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, returnByValue: true });
+          ok = !!(r.result && r.result.value);
+        } else {
+          const [res] = await chrome.scripting.executeScript({ target: { tabId: p.tabId }, func: (sel) => !!document.querySelector(sel), args: [p.selector || ""] });
+          ok = !!(res && res.result);
+        }
+        if (ok) return { ok: true, waitedMs: Date.now() - start };
+        await new Promise((r) => setTimeout(r, poll));
+      }
+      throw new Error(`waitFor timed out after ${timeout}ms`);
+    }
+
+    case "status":
+      return { version: chrome.runtime.getManifest().version, attachedTabs: [...attached], indicator: (await config()).indicator };
 
     default:
       throw new Error(`unknown command: ${cmd}`);

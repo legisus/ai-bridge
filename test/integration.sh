@@ -119,6 +119,51 @@ rm -f "$CRES"
 check "concurrency (6 CLIs, same tab first-touch, no attach race)" "$OKC" "clean"
 b closeTab "{\"tabId\":$CTAB}" >/dev/null
 
+# 15-19) v0.1.3 commands on a fresh fixture tab ------------------------
+NTAB=$(b newTab '{"url":"about:blank"}' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
+cat > /tmp/fixture2.js <<'EOF'
+(function(){
+  document.title = "V13";
+  document.body.innerHTML =
+    '<input id="in2" value="">' +
+    '<button id="btn2" style="position:fixed;left:60px;top:400px;width:120px;height:40px">Go</button>' +
+    '<div id="tall" style="height:3000px"></div>' +
+    '<div id="late"></div>';
+  window.__c2 = false;
+  document.getElementById("btn2").addEventListener("click", function(){ window.__c2 = true; });
+  setTimeout(function(){ document.getElementById("late").setAttribute("data-ready","1"); }, 800);
+  return "ok";
+})();
+EOF
+b eval "{\"tabId\":$NTAB}" --file /tmp/fixture2.js >/dev/null
+
+# 15) type — real per-character keystrokes into a focused input
+b eval "{\"tabId\":$NTAB,\"code\":\"document.getElementById('in2').focus()\"}" >/dev/null
+b type "{\"tabId\":$NTAB,\"text\":\"hello\"}" >/dev/null
+TYPED=$(b eval "{\"tabId\":$NTAB,\"code\":\"document.getElementById('in2').value\"}" | tr -d '"')
+check "type (per-char keystrokes land in input)" "$TYPED" "hello"
+
+# 16) click by selector — no coordinates
+b click "{\"tabId\":$NTAB,\"selector\":\"#btn2\"}" >/dev/null
+C2=$(b eval "{\"tabId\":$NTAB,\"code\":\"window.__c2\"}")
+check "click (by CSS selector fires handler)" "$C2" "true"
+
+# 17) waitFor selector — element appears ~800ms after load
+WF=$(b waitFor "{\"tabId\":$NTAB,\"selector\":\"#late[data-ready]\",\"timeoutMs\":5000}" | node -e 'process.stdin.on("data",d=>{try{console.log(JSON.parse(d).ok)}catch{console.log("no")}})')
+check "waitFor (selector becomes present)" "$WF" "true"
+
+# 18) scroll — to bottom of a tall page
+b scroll "{\"tabId\":$NTAB,\"bottom\":true}" >/dev/null
+SY=$(b eval "{\"tabId\":$NTAB,\"code\":\"window.scrollY>100\"}")
+check "scroll (bottom moves the viewport)" "$SY" "true"
+
+# 19) status — reports version + attached tabs
+ST=$(b status | node -e 'process.stdin.on("data",d=>{try{const s=JSON.parse(d);console.log(s.version&&Array.isArray(s.attachedTabs)?"ok":"no")}catch{console.log("no")}})')
+check "status (version + attachedTabs)" "$ST" "ok"
+
+b detach "{\"tabId\":$NTAB}" >/dev/null
+b closeTab "{\"tabId\":$NTAB}" >/dev/null
+
 echo "----------------------------------------"
 echo "RESULT: $pass passed, $fail failed"
 exit $([ "$fail" -eq 0 ] && echo 0 || echo 1)

@@ -60,16 +60,22 @@ bridge listTabs
 bridge newTab   '{"url":"https://example.com"}'               # opens in background
 bridge eval     '{"tabId":123,"code":"document.title"}'
 bridge eval     '{"tabId":123}' --file scrape.js              # long scripts from a file
-bridge click    '{"tabId":123,"x":420,"y":310}'               # trusted click
+bridge click    '{"tabId":123,"x":420,"y":310}'               # trusted click at CSS px
+bridge click    '{"tabId":123,"selector":".submit-btn"}'      # …or click an element by selector (no pixel math)
 bridge insertText '{"tabId":123,"text":"Hello"}'              # trusted "paste" at caret
+bridge type     '{"tabId":123,"text":"hello"}'                # real per-char keystrokes (autocomplete/React widgets)
 bridge key      '{"tabId":123,"key":"Enter"}'
 bridge key      '{"tabId":123,"key":"v","modifiers":4,"commands":["paste"]}'  # native paste from the clipboard
+bridge waitFor  '{"tabId":123,"selector":"#results"}'         # poll until an element appears
+bridge waitFor  '{"tabId":123,"code":"document.readyState==='"'"'complete'"'"'"}'  # …or a JS condition
+bridge scroll   '{"tabId":123,"bottom":true}'                 # also: {selector}, {top}, {dx,dy}
 bridge download '{"url":"https://.../file.pdf","filename":"file.pdf"}'   # uses your cookies
 bridge pdf      '{"tabId":123}' --out page.pdf
 bridge screenshot '{"tabId":123}' --out page.png
 bridge selectTab '{"tabId":123}'                              # activate tab, don't focus its window
+bridge status                                                 # version + which tabs are attached
 bridge closeTab '{"tabId":123}'
-bridge detach   '{"tabId":123}'                               # remove the debugger banner
+bridge detach   '{"tabId":123}'                               # release debugger + clear the tab indicator
 ```
 
 For an AI agent, the contract is simple: every command is one shell invocation that
@@ -111,7 +117,11 @@ Read this before installing — the extension can act as *you* on any site you'r
 - Every command is **logged** to `~/.ai-browser-bridge/bridge.log`.
 - Chrome shows its native **"… is debugging this browser"** banner whenever the
   debugger is attached — you always see when trusted-input mode is active. Use
-  `detach` to clear it.
+  `detach` to clear it. (The banner is browser-enforced and can't be hidden from an
+  extension; that's the point.)
+- **Per-tab activity indicator** (on by default, toggle in Options): a green frame
+  and a 🟢 in the title mark exactly which tabs the agent is driving — finer-grained
+  than the global banner. Cleared on `detach`.
 - No analytics, no telemetry, no external requests of any kind.
 
 ## Test

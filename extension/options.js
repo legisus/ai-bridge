@@ -1,9 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
-chrome.storage.local.get({ token: "", port: 8765, allowlist: [] }).then((cfg) => {
+chrome.storage.local.get({ token: "", port: 8765, allowlist: [], indicator: true }).then((cfg) => {
   $("token").value = cfg.token;
   $("port").value = cfg.port;
   $("allowlist").value = (cfg.allowlist || []).join("\n");
+  $("indicator").checked = cfg.indicator !== false;
 });
 
 $("save").addEventListener("click", async () => {
@@ -12,6 +13,7 @@ $("save").addEventListener("click", async () => {
     token: $("token").value.trim(),
     port: Number($("port").value) || 8765,
     allowlist,
+    indicator: $("indicator").checked,
   });
   $("status").textContent = "Saved.";
   setTimeout(() => ($("status").textContent = ""), 2000);

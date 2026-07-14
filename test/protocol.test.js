@@ -45,8 +45,11 @@ const assert = (cond, name) => {
       listTabs: [{ id: 1, url: "https://example.com", title: "Example", active: true, windowId: 1 }],
       eval: "Example Domain",
       ping: { pong: true, version: "test" },
+      status: { version: "test", attachedTabs: [1], indicator: true },
     };
-    ext.send(JSON.stringify({ type: "response", id: msg.id, ok: true, result: results[msg.cmd] ?? null }));
+    // Unknown/newer commands: echo the params so tests can assert the CLI forwarded them.
+    const result = msg.cmd in results ? results[msg.cmd] : { echo: msg.cmd, params: msg.params };
+    ext.send(JSON.stringify({ type: "response", id: msg.id, ok: true, result }));
   });
   await new Promise((r) => setTimeout(r, 500));
 
@@ -61,6 +64,22 @@ const assert = (cond, name) => {
 
     const pong = JSON.parse((await run("node", [cli, "ping", "--timeout", "5000"], { env })).stdout);
     assert(pong.pong === true, "cli ping round-trip");
+
+    const status = JSON.parse((await run("node", [cli, "status", "--timeout", "5000"], { env })).stdout);
+    assert(status.version === "test" && Array.isArray(status.attachedTabs), "cli status round-trip");
+
+    // v0.1.3 commands must forward their params through the relay unchanged
+    const typed = JSON.parse((await run("node", [cli, "type", '{"tabId":1,"text":"hi"}', "--timeout", "5000"], { env })).stdout);
+    assert(typed.echo === "type" && typed.params.text === "hi", "cli type forwards params");
+
+    const clicked = JSON.parse((await run("node", [cli, "click", '{"tabId":1,"selector":".btn"}', "--timeout", "5000"], { env })).stdout);
+    assert(clicked.params && clicked.params.selector === ".btn", "cli click(selector) forwards params");
+
+    const waited = JSON.parse((await run("node", [cli, "waitFor", '{"tabId":1,"selector":"#x"}', "--timeout", "5000"], { env })).stdout);
+    assert(waited.params.selector === "#x", "cli waitFor forwards params");
+
+    const scrolled = JSON.parse((await run("node", [cli, "scroll", '{"tabId":1,"bottom":true}', "--timeout", "5000"], { env })).stdout);
+    assert(scrolled.params.bottom === true, "cli scroll forwards params");
   } catch (e) {
     assert(false, `cli round-trip threw: ${e.message}`);
   } finally {
