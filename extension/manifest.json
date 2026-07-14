@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Browser Bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local bridge that lets an AI coding agent (or any local tool) drive your logged-in browser: tabs, trusted input, downloads, PDFs. Talks only to a server on 127.0.0.1 that you run yourself.",
   "author": "Mykola Bielousov",
   "permissions": [

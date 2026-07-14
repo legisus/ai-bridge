@@ -127,6 +127,14 @@ async function handle(cmd, p) {
       return { ok: true, tabId: p.tabId, windowId: tab && tab.windowId };
     }
 
+    case "selectTab": {
+      // Make the tab active WITHIN its window without focusing the window —
+      // for background automation that must never steal the user's focus
+      // (activateTab does both; this does only the tab half).
+      await chrome.tabs.update(p.tabId, { active: true });
+      return { ok: true, tabId: p.tabId };
+    }
+
     case "closeTab":
       await chrome.tabs.remove(p.tabId);
       return { ok: true };

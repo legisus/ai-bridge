@@ -67,6 +67,7 @@ bridge key      '{"tabId":123,"key":"v","modifiers":4,"commands":["paste"]}'  # 
 bridge download '{"url":"https://.../file.pdf","filename":"file.pdf"}'   # uses your cookies
 bridge pdf      '{"tabId":123}' --out page.pdf
 bridge screenshot '{"tabId":123}' --out page.png
+bridge selectTab '{"tabId":123}'                              # activate tab, don't focus its window
 bridge closeTab '{"tabId":123}'
 bridge detach   '{"tabId":123}'                               # remove the debugger banner
 ```
