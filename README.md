@@ -74,6 +74,23 @@ bridge detach   '{"tabId":123}'                               # remove the debug
 For an AI agent, the contract is simple: every command is one shell invocation that
 prints JSON to stdout and exits non-zero on failure.
 
+## Concurrency
+
+The server is a many-CLI → single-extension relay. Any number of CLI clients can
+connect at once; each request carries a random id and its response is routed back to
+the CLI that sent it, so concurrent clients never cross wires.
+
+The scaling axis is **tabs, not throughput** — everything funnels through one browser
+and one extension. The rule that keeps concurrency safe:
+
+- **One CLI per tab.** Driving N *different* tabs from N parallel CLI calls works
+  cleanly — each tab attaches its own debugger session independently.
+- **Don't point two clients at the same tab.** Concurrent trusted input (`click`,
+  `insertText`, `key`) on one tab interleaves into garbage, and — before v0.1.2 —
+  simultaneous *first* commands on a not-yet-attached tab could race the debugger
+  attach (`Another debugger is already attached`). v0.1.2 dedupes that attach, but
+  same-tab writes are still logically single-writer: serialize them.
+
 ## Use from Claude Code
 
 See **[docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md)** for a copy-paste `CLAUDE.md`

@@ -8,6 +8,7 @@ const DEFAULTS = { port: 8765, token: "", allowlist: [] };
 
 let ws = null;
 let attached = new Set(); // tabIds with debugger attached
+const attaching = new Map(); // tabId -> in-flight attach promise (dedupes concurrent first-touch)
 
 // ---------- config ----------
 
@@ -70,12 +71,21 @@ async function assertAllowed(tabId) {
 
 async function dbgAttach(tabId) {
   if (attached.has(tabId)) return;
-  await chrome.debugger.attach({ tabId }, "1.3");
-  attached.add(tabId);
+  // Dedupe concurrent first-touch: several commands hitting the same not-yet-attached
+  // tab at once must share ONE attach, or Chrome rejects the extras with
+  // "Another debugger is already attached". Later callers await the same promise.
+  let p = attaching.get(tabId);
+  if (!p) {
+    p = chrome.debugger.attach({ tabId }, "1.3")
+      .then(() => { attached.add(tabId); })
+      .finally(() => { attaching.delete(tabId); });
+    attaching.set(tabId, p);
+  }
+  return p;
 }
 
-chrome.debugger.onDetach.addListener((src) => { if (src.tabId) attached.delete(src.tabId); });
-chrome.tabs.onRemoved.addListener((tabId) => attached.delete(tabId));
+chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); } });
+chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); });
 
 function dbg(tabId, method, params) {
   return chrome.debugger.sendCommand({ tabId }, method, params || {});

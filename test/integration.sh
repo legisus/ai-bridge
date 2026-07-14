@@ -104,6 +104,21 @@ b closeTab "{\"tabId\":$TID}" >/dev/null
 GONE=$(b listTabs | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const t=JSON.parse(s);console.log(t.some(x=>x.id==='"$TID"')?"still-there":"gone")})')
 check "closeTab (tab removed)" "$GONE" "gone"
 
+# 14) concurrency — many CLIs, first-touch attach race must NOT fire ----
+# Open a fresh tab, then fire N concurrent eval commands at it. Before the
+# per-tab attach lock (v0.1.2) one of these failed with "Another debugger is
+# already attached". All N must now return their own value.
+CTAB=$(b newTab '{"url":"about:blank"}' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
+CRES=$(mktemp)
+for n in 1 2 3 4 5 6; do
+  ( b eval "{\"tabId\":$CTAB,\"code\":\"$n*7\"}" 2>&1 | tr -d '"' >> "$CRES" ) &
+done
+wait
+OKC=$(node -e 'const want=new Set([7,14,21,28,35,42].map(String));const got=require("fs").readFileSync(process.argv[1],"utf8").split("\n").map(s=>s.trim()).filter(Boolean);const bad=got.filter(g=>!want.has(g));console.log(got.length===6&&bad.length===0?"clean":"raced:"+bad.join(","))' "$CRES")
+rm -f "$CRES"
+check "concurrency (6 CLIs, same tab first-touch, no attach race)" "$OKC" "clean"
+b closeTab "{\"tabId\":$CTAB}" >/dev/null
+
 echo "----------------------------------------"
 echo "RESULT: $pass passed, $fail failed"
 exit $([ "$fail" -eq 0 ] && echo 0 || echo 1)

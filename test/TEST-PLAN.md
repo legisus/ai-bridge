@@ -31,6 +31,7 @@ Two layers:
 | 11 | `activate` / `set index` / focus window / un-minimize | `activateTab` | focus tab+window | returns `{ok:true}`; tab becomes active |
 | 12 | (no OS-level equivalent) clear DevTools debugger banner | `detach` | release debugger | returns `{ok:true}` |
 | 13 | `close tab` / `close window` | `closeTab` | tab removed | tab id absent from `listTabs` |
+| 14 | (n/a) many CLIs, one tab, first-touch attach | per-tab attach lock | concurrency | 6 concurrent `eval` all return their own value; no attach race |
 | — | auth/token rejection (security) | server auth | protocol.test.js | bad token → socket closed |
 
 ### Techniques deliberately NOT ported (host-OS, out of scope for the extension)
