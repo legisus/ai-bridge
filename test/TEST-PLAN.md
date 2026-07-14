@@ -36,7 +36,8 @@ Two layers:
 | 16 | click without pixel math | `click` (`selector`) | click by selector | handler fires from selector-resolved center |
 | 17 | wait for async element/condition | `waitFor` | selector becomes present | returns `{ok:true}` once `#late[data-ready]` appears |
 | 18 | scroll page (to selector/top/bottom/by) | `scroll` | scroll to bottom | `window.scrollY` advances |
-| 19 | health of connection + attached tabs | `status` | status shape | returns `version` + `attachedTabs[]` |
+| 19 | health of connection + attached tabs | `status` | status shape | returns `version` + `attachedTabs[]` + `idleDetachMs` |
+| 20 | clear all debugger banners at once | `detachAll` | detachAll | after call, `status.attachedTabs` is empty |
 | — | auth/token rejection (security) | server auth | protocol.test.js | bad token → socket closed |
 
 ### Techniques deliberately NOT ported (host-OS, out of scope for the extension)

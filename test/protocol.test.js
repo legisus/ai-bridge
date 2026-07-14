@@ -45,7 +45,8 @@ const assert = (cond, name) => {
       listTabs: [{ id: 1, url: "https://example.com", title: "Example", active: true, windowId: 1 }],
       eval: "Example Domain",
       ping: { pong: true, version: "test" },
-      status: { version: "test", attachedTabs: [1], indicator: true },
+      status: { version: "test", attachedTabs: [1], indicator: true, idleDetachMs: 120000 },
+      detachAll: { ok: true, detached: [1, 2] },
     };
     // Unknown/newer commands: echo the params so tests can assert the CLI forwarded them.
     const result = msg.cmd in results ? results[msg.cmd] : { echo: msg.cmd, params: msg.params };
@@ -66,7 +67,10 @@ const assert = (cond, name) => {
     assert(pong.pong === true, "cli ping round-trip");
 
     const status = JSON.parse((await run("node", [cli, "status", "--timeout", "5000"], { env })).stdout);
-    assert(status.version === "test" && Array.isArray(status.attachedTabs), "cli status round-trip");
+    assert(status.version === "test" && Array.isArray(status.attachedTabs) && typeof status.idleDetachMs === "number", "cli status round-trip");
+
+    const detachedAll = JSON.parse((await run("node", [cli, "detachAll", "--timeout", "5000"], { env })).stdout);
+    assert(detachedAll.ok === true && Array.isArray(detachedAll.detached), "cli detachAll round-trip");
 
     // v0.1.3 commands must forward their params through the relay unchanged
     const typed = JSON.parse((await run("node", [cli, "type", '{"tabId":1,"text":"hi"}', "--timeout", "5000"], { env })).stdout);

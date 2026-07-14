@@ -161,7 +161,12 @@ check "scroll (bottom moves the viewport)" "$SY" "true"
 ST=$(b status | node -e 'process.stdin.on("data",d=>{try{const s=JSON.parse(d);console.log(s.version&&Array.isArray(s.attachedTabs)?"ok":"no")}catch{console.log("no")}})')
 check "status (version + attachedTabs)" "$ST" "ok"
 
-b detach "{\"tabId\":$NTAB}" >/dev/null
+# 20) detachAll — release every attached tab; status reports none left
+b eval "{\"tabId\":$NTAB,\"code\":\"1\"}" >/dev/null   # ensure NTAB is attached
+b detachAll >/dev/null
+LEFT=$(b status | node -e 'process.stdin.on("data",d=>{try{console.log(JSON.parse(d).attachedTabs.length===0?"none":"some")}catch{console.log("err")}})')
+check "detachAll (clears all attachments)" "$LEFT" "none"
+
 b closeTab "{\"tabId\":$NTAB}" >/dev/null
 
 echo "----------------------------------------"

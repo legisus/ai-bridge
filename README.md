@@ -76,6 +76,7 @@ bridge selectTab '{"tabId":123}'                              # activate tab, do
 bridge status                                                 # version + which tabs are attached
 bridge closeTab '{"tabId":123}'
 bridge detach   '{"tabId":123}'                               # release debugger + clear the tab indicator
+bridge detachAll                                              # release every attached tab in one call
 ```
 
 For an AI agent, the contract is simple: every command is one shell invocation that
@@ -116,9 +117,11 @@ Read this before installing — the extension can act as *you* on any site you'r
   and their subdomains. Empty list = allow all — set it if you want defense in depth.
 - Every command is **logged** to `~/.ai-browser-bridge/bridge.log`.
 - Chrome shows its native **"… is debugging this browser"** banner whenever the
-  debugger is attached — you always see when trusted-input mode is active. Use
-  `detach` to clear it. (The banner is browser-enforced and can't be hidden from an
-  extension; that's the point.)
+  debugger is attached — you always see when trusted-input mode is active. Clear it
+  with `detach` (one tab) or `detachAll` (every attached tab). Idle tabs also
+  auto-detach after `idleDetachMs` (default 2 min; set in Options), so banners never
+  pile up. (The banner is browser-enforced and can't be hidden from an extension;
+  that's the point.)
 - **Per-tab activity indicator** (on by default, toggle in Options): a green frame
   and a 🟢 in the title mark exactly which tabs the agent is driving — finer-grained
   than the global banner. Cleared on `detach`.

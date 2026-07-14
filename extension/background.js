@@ -4,11 +4,12 @@
 // chrome.debugger (DevTools protocol), so they work on sites that reject
 // synthetic DOM events (webmail clients, rich-text editors, collaborative docs, ...).
 
-const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true };
+const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000 };
 
 let ws = null;
 let attached = new Set(); // tabIds with debugger attached
 const attaching = new Map(); // tabId -> in-flight attach promise (dedupes concurrent first-touch)
+const lastActivity = new Map(); // tabId -> last command timestamp (for idle auto-detach)
 
 // ---------- config ----------
 
@@ -49,7 +50,7 @@ async function connect() {
 }
 
 chrome.alarms.create("reconnect", { periodInMinutes: 0.4 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === "reconnect") connect(); });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === "reconnect") { connect(); idleDetachSweep(); } });
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 connect();
@@ -84,11 +85,33 @@ async function dbgAttach(tabId) {
   return p;
 }
 
-chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); setIndicator(src.tabId, false); } });
-chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); });
+chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); lastActivity.delete(src.tabId); setIndicator(src.tabId, false); } });
+chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); lastActivity.delete(tabId); });
 
 function dbg(tabId, method, params) {
   return chrome.debugger.sendCommand({ tabId }, method, params || {});
+}
+
+// Detach one tab: release the debugger, clear its indicator and activity record.
+async function detachTab(tabId) {
+  if (attached.has(tabId)) {
+    try { await chrome.debugger.detach({ tabId }); } catch (e) { /* already gone */ }
+    attached.delete(tabId);
+  }
+  lastActivity.delete(tabId);
+  await setIndicator(tabId, false);
+}
+
+// Auto-detach tabs left idle past `idleDetachMs`, so debugger banners never pile
+// up on tabs the agent is done with. Runs on the reconnect alarm (~every 24s).
+// A later command simply re-attaches — the per-tab lock keeps that safe.
+async function idleDetachSweep() {
+  const ms = (await config()).idleDetachMs;
+  if (!ms || ms <= 0) return;
+  const now = Date.now();
+  for (const tabId of [...attached]) {
+    if (now - (lastActivity.get(tabId) || 0) > ms) await detachTab(tabId);
+  }
 }
 
 // ---------- visual indicator ----------
@@ -137,6 +160,8 @@ async function selectorCenter(tabId, selector) {
 // ---------- commands ----------
 
 async function handle(cmd, p) {
+  // Record activity so the idle sweep leaves actively-driven tabs attached.
+  if (p && p.tabId != null) lastActivity.set(p.tabId, Date.now());
   switch (cmd) {
     case "ping":
       return { pong: true, version: chrome.runtime.getManifest().version };
@@ -285,12 +310,16 @@ async function handle(cmd, p) {
     }
 
     case "detach": {
-      if (attached.has(p.tabId)) {
-        await chrome.debugger.detach({ tabId: p.tabId });
-        attached.delete(p.tabId);
-      }
-      await setIndicator(p.tabId, false);
+      await detachTab(p.tabId);
       return { ok: true };
+    }
+
+    case "detachAll": {
+      // Release every attached tab at once — clears all debugger banners the
+      // bridge is holding in a single call.
+      const ids = [...attached];
+      for (const tabId of ids) await detachTab(tabId);
+      return { ok: true, detached: ids };
     }
 
     case "type": {
@@ -350,8 +379,10 @@ async function handle(cmd, p) {
       throw new Error(`waitFor timed out after ${timeout}ms`);
     }
 
-    case "status":
-      return { version: chrome.runtime.getManifest().version, attachedTabs: [...attached], indicator: (await config()).indicator };
+    case "status": {
+      const cfg = await config();
+      return { version: chrome.runtime.getManifest().version, attachedTabs: [...attached], indicator: cfg.indicator, idleDetachMs: cfg.idleDetachMs };
+    }
 
     default:
       throw new Error(`unknown command: ${cmd}`);

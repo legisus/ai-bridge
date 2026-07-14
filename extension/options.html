@@ -31,6 +31,10 @@
   <label style="margin-top:18px"><input id="indicator" type="checkbox" style="width:auto;margin-right:6px;vertical-align:middle"> Tab activity indicator</label>
   <div class="hint">Show a green frame and a 🟢 in the title of any tab the agent is actively driving.</div>
 
+  <label>Auto-detach idle tabs after (seconds, 0 = never)</label>
+  <input id="idleDetach" type="number" min="0" value="120">
+  <div class="hint">Release the debugger (and clear its banner) on tabs with no command for this long. A later command re-attaches automatically.</div>
+
   <button id="save">Save</button><span id="status"></span>
   <script src="options.js"></script>
 </body>
