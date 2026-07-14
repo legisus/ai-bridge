@@ -157,6 +157,21 @@ async function selectorCenter(tabId, selector) {
   return (r.result && r.result.value) || null;
 }
 
+// Run a self-contained fn(arg) in the page. Prefers chrome.scripting (no debugger
+// banner); if the page blocks injection (about:blank, chrome://, the Web Store),
+// falls back to CSP-proof debugger eval. fn must not close over outer variables.
+async function pageRun(tabId, fn, arg) {
+  try {
+    const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: fn, args: [arg] });
+    return res && res.result;
+  } catch (e) {
+    await dbgAttach(tabId);
+    const r = await dbg(tabId, "Runtime.evaluate", { expression: `(${fn.toString()})(${JSON.stringify(arg)})`, returnByValue: true });
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+    return r.result && r.result.value;
+  }
+}
+
 // ---------- commands ----------
 
 async function handle(cmd, p) {
@@ -339,26 +354,23 @@ async function handle(cmd, p) {
 
     case "scroll": {
       // Scroll a tab: to a `selector`, to `top`/`bottom`, or by `dx`/`dy`.
-      // Uses chrome.scripting (no debugger, no banner) — it's a plain page action.
+      // pageRun uses chrome.scripting (no banner), falling back to the debugger
+      // on special-scheme pages it can't inject into.
       await assertAllowed(p.tabId);
-      const [res] = await chrome.scripting.executeScript({
-        target: { tabId: p.tabId },
-        func: (o) => {
-          if (o.selector) { const el = document.querySelector(o.selector); if (!el) return { error: "selector not found" }; el.scrollIntoView({ block: "center", inline: "center" }); return { ok: true, into: o.selector }; }
-          if (o.top) { window.scrollTo(0, 0); return { ok: true, y: 0 }; }
-          if (o.bottom) { window.scrollTo(0, document.body.scrollHeight); return { ok: true, y: window.scrollY }; }
-          window.scrollBy(o.dx || 0, o.dy || 0); return { ok: true, x: window.scrollX, y: window.scrollY };
-        },
-        args: [{ selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom }],
-      });
-      const out = res && res.result;
+      const out = await pageRun(p.tabId, (o) => {
+        if (o.selector) { const el = document.querySelector(o.selector); if (!el) return { error: "selector not found" }; el.scrollIntoView({ block: "center", inline: "center" }); return { ok: true, into: o.selector }; }
+        if (o.top) { window.scrollTo(0, 0); return { ok: true, y: 0 }; }
+        if (o.bottom) { window.scrollTo(0, document.body.scrollHeight); return { ok: true, y: window.scrollY }; }
+        window.scrollBy(o.dx || 0, o.dy || 0); return { ok: true, x: window.scrollX, y: window.scrollY };
+      }, { selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom });
       if (out && out.error) throw new Error(`scroll: ${out.error}`);
       return out || { ok: true };
     }
 
     case "waitFor": {
       // Poll until a `selector` exists or a JS `code` condition is truthy.
-      // Selector checks use chrome.scripting (no banner); code uses CSP-proof eval.
+      // Code uses CSP-proof debugger eval; selectors go through pageRun (no banner
+      // on normal pages, debugger fallback on special-scheme ones).
       await assertAllowed(p.tabId);
       const timeout = p.timeoutMs || 10000;
       const poll = p.pollMs || 200;
@@ -370,8 +382,7 @@ async function handle(cmd, p) {
           const r = await dbg(p.tabId, "Runtime.evaluate", { expression: `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, returnByValue: true });
           ok = !!(r.result && r.result.value);
         } else {
-          const [res] = await chrome.scripting.executeScript({ target: { tabId: p.tabId }, func: (sel) => !!document.querySelector(sel), args: [p.selector || ""] });
-          ok = !!(res && res.result);
+          ok = !!(await pageRun(p.tabId, (sel) => !!document.querySelector(sel), p.selector || ""));
         }
         if (ok) return { ok: true, waitedMs: Date.now() - start };
         await new Promise((r) => setTimeout(r, poll));
