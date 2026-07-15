@@ -122,9 +122,11 @@ Read this before installing — the extension can act as *you* on any site you'r
   auto-detach after `idleDetachMs` (default 2 min; set in Options), so banners never
   pile up. (The banner is browser-enforced and can't be hidden from an extension;
   that's the point.)
-- **Per-tab activity indicator** (on by default, toggle in Options): a green frame
-  and a 🟢 in the title mark exactly which tabs the agent is driving — finer-grained
-  than the global banner. Cleared on `detach`.
+- **Per-tab activity indicator** (on by default, toggle in Options): a thin neon
+  frame with colors flowing around the page edge, plus a small color-shifting glow
+  badge on the tab's favicon, mark exactly which tabs the agent is driving —
+  finer-grained than the global banner. The original favicon is restored and the
+  frame removed on `detach`.
 - No analytics, no telemetry, no external requests of any kind.
 
 ## Test

@@ -116,7 +116,7 @@ async function idleDetachSweep() {
 
 // ---------- visual indicator ----------
 
-// A green frame + title dot on tabs the agent is actively driving, so autonomous
+// An animated neon frame + title dot on tabs the agent is actively driving, so autonomous
 // work is visible per-tab — more granular than Chrome's global debugger banner
 // (it shows WHICH tabs are live). Toggle via the "indicator" option; removal
 // always runs regardless of the flag so nothing is left stuck on.
@@ -127,18 +127,75 @@ async function setIndicator(tabId, on) {
       target: { tabId },
       func: (on) => {
         const ID = "__ai_bridge_frame__";
+        const STYLE_ID = "__ai_bridge_frame_style__";
         let el = document.getElementById(ID);
+        let st = document.getElementById(STYLE_ID);
         if (on) {
+          if (!st) {
+            st = document.createElement("style");
+            st.id = STYLE_ID;
+            st.textContent =
+              "@property --__ai_bridge_a__{syntax:'<angle>';inherits:false;initial-value:0deg}" +
+              "#" + ID + "::before,#" + ID + "::after{content:'';position:absolute;inset:0;border-radius:inherit;" +
+              "border:3px solid transparent;" +
+              "background:conic-gradient(from var(--__ai_bridge_a__),#00e5ff,#8b5cf6,#ff2ec4,#22ffb2,#00e5ff) border-box;" +
+              "-webkit-mask:linear-gradient(#000 0 0) padding-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;" +
+              "mask:linear-gradient(#000 0 0) padding-box,linear-gradient(#000 0 0);mask-composite:exclude;" +
+              "animation:__ai_bridge_snake__ 5s linear infinite}" +
+              "#" + ID + "::after{border-width:4px;filter:blur(16px);opacity:.55}" +
+              "@keyframes __ai_bridge_snake__{to{--__ai_bridge_a__:360deg}}";
+            (document.documentElement || document.body).appendChild(st);
+          }
           if (!el) {
             el = document.createElement("div");
             el.id = ID;
-            el.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;border:6px solid #16a34a;box-shadow:inset 0 0 0 2px rgba(22,163,74,.35)";
             (document.documentElement || document.body).appendChild(el);
           }
-          if (window.__aiBridgeTitle == null) { window.__aiBridgeTitle = document.title; document.title = "🟢 " + document.title; }
+          el.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;border-radius:14px";
+          if (!window.__aiBridgeFav) {
+            const orig = [...document.querySelectorAll('link[rel~="icon"]')];
+            const srcHref = (orig.find((l) => l.href) || {}).href || location.origin + "/favicon.ico";
+            orig.forEach((l) => l.remove());
+            const link = document.createElement("link");
+            link.rel = "icon";
+            (document.head || document.documentElement).appendChild(link);
+            const c = document.createElement("canvas");
+            c.width = c.height = 32;
+            const ctx = c.getContext("2d");
+            let hue = 190;
+            let logo = null;
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => { logo = img; };
+            img.src = srcHref;
+            const draw = () => {
+              ctx.clearRect(0, 0, 32, 32);
+              if (logo) ctx.drawImage(logo, 0, 0, 32, 32);
+              const g = ctx.createRadialGradient(22, 22, 1, 22, 22, 10);
+              g.addColorStop(0, "hsl(" + hue + " 100% 80%)");
+              g.addColorStop(0.6, "hsl(" + hue + " 100% 55%)");
+              g.addColorStop(1, "hsl(" + hue + " 100% 55% / 0)");
+              ctx.fillStyle = g;
+              ctx.beginPath();
+              ctx.arc(22, 22, 10, 0, Math.PI * 2);
+              ctx.fill();
+              try { link.href = c.toDataURL("image/png"); }
+              catch (e) { if (logo) { logo = null; draw(); } } // cross-origin logo tainted the canvas — badge only
+            };
+            draw();
+            window.__aiBridgeFav = { orig, link };
+            window.__aiBridgeFavTimer = setInterval(() => { hue = (hue + 12) % 360; draw(); }, 400);
+          }
         } else {
           if (el) el.remove();
+          if (st) st.remove();
           if (window.__aiBridgeTitle != null) { document.title = window.__aiBridgeTitle; window.__aiBridgeTitle = null; }
+          if (window.__aiBridgeFavTimer) { clearInterval(window.__aiBridgeFavTimer); window.__aiBridgeFavTimer = null; }
+          if (window.__aiBridgeFav) {
+            window.__aiBridgeFav.link.remove();
+            for (const l of window.__aiBridgeFav.orig) (document.head || document.documentElement).appendChild(l);
+            window.__aiBridgeFav = null;
+          }
         }
       },
       args: [on],
