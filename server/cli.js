@@ -23,7 +23,16 @@ const TOKEN = fs.readFileSync(path.join(os.homedir(), ".ai-browser-bridge", "tok
 const argv = process.argv.slice(2);
 if (argv.length === 0) {
   console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms]");
+  console.error('       bridge agent "task description" [--timeout ms] [--verbose]');
   process.exit(2);
+}
+
+// `bridge agent "task"` — token-saver agent: cheap models operate, Fable judges.
+if (argv[0] === "agent") {
+  const { spawn } = require("child_process");
+  spawn(process.execPath, [path.join(__dirname, "agent.js"), ...argv.slice(1)], { stdio: "inherit" })
+    .on("close", (code) => process.exit(code));
+  return;
 }
 
 const cmd = argv[0];

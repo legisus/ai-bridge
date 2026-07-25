@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "node test/protocol.test.js"
+    "test": "node test/protocol.test.js && node test/agent.test.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
