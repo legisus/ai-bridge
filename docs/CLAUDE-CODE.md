@@ -100,6 +100,53 @@ Think before you do this: it lets the agent act in your logged-in browser withou
 asking each time. The extension's **host allowlist** (Options page) is the safety net
 that keeps commands confined to domains you chose.
 
+## Model routing: delegate the mechanics, keep the judgment
+
+Browser driving is cheap mechanical work wrapped around a few expensive judgments — so
+running the whole loop on your most capable model wastes tokens. Two things make it costly
+if you don't split it: the model re-derives which command to send on every step, and the
+raw material (DOM dumps, page text, screenshot image tokens) piles up in the main context
+window and gets re-sent on every subsequent turn.
+
+Both problems disappear if you delegate the mechanical steps to a **subagent running a
+cheaper model**, and keep only the judgment on your main model:
+
+- **Mechanical → cheap subagent:** navigating, reading the DOM, clicking, typing,
+  screenshots, polling `waitFor`, collecting concrete facts. The DOM and screenshots stay
+  in the subagent's context; only a short structured result comes back.
+- **Judgment → main model:** deciding *what* to verify, interpreting whether something is
+  actually correct, composing the test plan, drawing the conclusion.
+
+Rule of thumb: *"go here and tell me X"* → delegate. *"is this right / what should we check"*
+→ do it yourself. A one-off single command (a quick `ping`, one screenshot) isn't worth the
+subagent hop — the win is on multi-step sequences.
+
+In Claude Code, drop an agent definition at `~/.claude/agents/ai-bridge-driver.md`:
+
+```markdown
+---
+name: ai-bridge-driver
+description: Executes a concrete browser task through the AI Browser Bridge CLI and reports
+  back a compact result. Delegate mechanical multi-step browser sequences here so the noisy
+  DOM dumps and screenshots stay out of the main context. Give it one clear goal and the
+  exact facts to collect; it returns a short structured answer, not raw page dumps.
+model: haiku   # or sonnet for vision-heavy / ambiguous pages; the parent keeps the judgment
+tools: Bash, Read
+---
+
+You drive the AI Browser Bridge. Run each command as one shell invocation:
+`bridge() { node /path/to/ai-bridge/server/cli.js "$@"; }`. `ping` first. Prefer `eval`
+to read pages (wrap multi-statement code in an IIFE returning a JSON string). For visual
+checks, `screenshot --out /tmp/x.png` then Read the file. Never dump raw DOM back — distill
+to the facts you were asked for and report PASS/FAIL/BLOCKED. Real user sessions: never log
+out, change settings, or submit destructive forms; if the goal implies that, stop and report.
+```
+
+Then the parent agent calls it for the mechanical legs and reasons over the compact results
+itself. In practice a full multi-step verification (a dozen CLI calls plus a screenshot) burns
+its tokens inside the subagent and returns a few lines — the main context stays small and the
+expensive model only spends tokens where the thinking actually is.
+
 ## Troubleshooting
 
 | Symptom | Fix |
