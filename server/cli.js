@@ -22,8 +22,12 @@ const TOKEN = fs.readFileSync(path.join(os.homedir(), ".ai-browser-bridge", "tok
 
 const argv = process.argv.slice(2);
 if (argv.length === 0) {
-  console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms]");
+  console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms] [--stealth]");
   console.error('       bridge agent "task description" [--timeout ms] [--verbose]');
+  console.error("  --stealth: drive the tab without attaching chrome.debugger (no CDP");
+  console.error("             fingerprint, no debugging banner) — for sites that fight");
+  console.error("             automation. Uses page-CSP eval + synthetic input; pdf and");
+  console.error("             background-tab screenshots are unavailable in this mode.");
   process.exit(2);
 }
 
@@ -42,9 +46,11 @@ for (let i = 1; i < argv.length; i++) {
   if (argv[i] === "--file") flags.file = argv[++i];
   else if (argv[i] === "--out") flags.out = argv[++i];
   else if (argv[i] === "--timeout") flags.timeout = Number(argv[++i]);
+  else if (argv[i] === "--stealth") flags.stealth = true;
   else params = JSON.parse(argv[i]);
 }
 if (flags.file) params.code = fs.readFileSync(flags.file, "utf8");
+if (flags.stealth) params.stealth = true;
 
 const id = crypto.randomBytes(8).toString("hex");
 const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
