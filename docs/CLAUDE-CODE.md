@@ -42,29 +42,37 @@ A local bridge to my real, logged-in Chrome is available. Run commands as:
 
     node /path/to/ai-bridge/server/cli.js <cmd> [params-json] [--file js] [--out file] [--timeout ms]
 
-Each call prints JSON to stdout and exits non-zero on failure. Commands:
+Each call prints JSON to stdout and exits non-zero on failure. Commands run in
+STEALTH mode by default (no chrome.debugger, no "is debugging" banner): eval uses
+MAIN-world scripting (subject to page CSP) and click/type/key are synthetic events.
+Add `--debugger` (alias `--no-stealth`) to attach chrome.debugger for trusted input,
+CSP-proof eval, `pdf`, or background-tab screenshots. `--debugger` requires approval:
+pass the flag, set `AI_BRIDGE_DEBUGGER=1`, or confirm the interactive prompt; with no
+TTY and no pre-approval the command fails (exit 5) instead of attaching. `pdf` and
+background-tab `screenshot` are CDP-only and always need `--debugger`. Commands:
 
 - `ping` — health check; `{"pong":true}` means the extension is connected
 - `listTabs` — all open tabs with id, url, title
 - `newTab '{"url":"https://…"}'` — opens in a BACKGROUND tab (never steals focus)
 - `navigate '{"tabId":N,"url":"https://…"}'`
-- `eval '{"tabId":N,"code":"…"}'` — CSP-proof JS eval; returns the value.
+- `eval '{"tabId":N,"code":"…"}'` — JS eval (stealth: page-CSP; --debugger: CSP-proof); returns the value.
   For long scripts use `eval '{"tabId":N}' --file script.js`
-- `click '{"tabId":N,"x":X,"y":Y}'` — trusted click (isTrusted:true) at viewport CSS px
-- `insertText '{"tabId":N,"text":"…"}'` — trusted paste at the current caret
-- `key '{"tabId":N,"key":"Enter"}'` — trusted key press
-- `screenshot '{"tabId":N}' --out page.png`
-- `pdf '{"tabId":N}' --out page.pdf`
+- `click '{"tabId":N,"x":X,"y":Y}'` — click at viewport CSS px (--debugger for isTrusted:true)
+- `insertText '{"tabId":N,"text":"…"}'` — paste at the current caret
+- `key '{"tabId":N,"key":"Enter"}'` — key press
+- `screenshot '{"tabId":N}' --out page.png` — stealth needs the tab active; add `--debugger` for background tabs
+- `pdf '{"tabId":N}' --out page.pdf` — CDP-only, needs `--debugger`
 - `download '{"url":"…","filename":"f.pdf"}'` — uses my cookies; lands in ~/Downloads
 - `activateTab '{"tabId":N}'` / `closeTab '{"tabId":N}'`
-- `detach '{"tabId":N}'` — clears Chrome's "is debugging" banner when you're done
+- `detach '{"tabId":N}'` — clears Chrome's "is debugging" banner (only appears with --debugger)
 
 Rules:
 - Always `ping` first; if it fails, tell me to start the server / check the extension.
-- Prefer `eval` for reading pages; use `click`/`insertText`/`key` only when a site
-  rejects synthetic events (contenteditable/ProseMirror-class rich-text editors).
+- Stealth is the default and is fine for most work; only add `--debugger` when a site
+  rejects synthetic events (contenteditable/ProseMirror-class rich-text editors), the
+  page's CSP blocks stealth eval, or you need pdf/background-tab screenshots.
 - Open new tabs in the background (default) — do not steal my focus.
-- `detach` from tabs when finished so the debugger banner goes away.
+- `detach` from any tab you drove with `--debugger` when finished so the banner goes away.
 - This is my real browser with my real sessions: never log out, change account
   settings, or submit destructive forms without asking me first.
 ```

@@ -33,6 +33,30 @@ AI agent / your scripts          bridge server               Chrome extension
 - **Cross-platform.** macOS, Windows, Linux — no OS-level input scripting or
   accessibility APIs required.
 
+## Stealth by default, debugger on approval
+
+By default every command runs in **stealth mode**: the bridge drives the tab
+*without* attaching `chrome.debugger`, so there's no CDP fingerprint and no
+"… is debugging this browser" banner. `eval` runs via `chrome.scripting` in the
+page's MAIN world; `click`/`type`/`insertText`/`key` are emulated with synthetic
+DOM events. This is what you want on sites that fight automation — at the cost of
+untrusted events (`isTrusted: false`) and MAIN-world eval being subject to the
+page's own CSP.
+
+When you need the `chrome.debugger` route — trusted input, CSP-proof eval, `pdf`,
+or background-tab screenshots — request it per command with **`--debugger`**
+(alias `--no-stealth`). Because attaching the debugger shows the browser banner,
+it requires **approval**, resolved in this order:
+
+1. `--debugger` flag on the call — pre-approved (works headless).
+2. `AI_BRIDGE_DEBUGGER=1` in the environment — pre-approved (works headless).
+3. Otherwise, if stdin is a TTY — an interactive `y/N` prompt.
+4. Needed but not approved and no TTY — the command **fails fast** (exit 5)
+   rather than silently attaching or hanging.
+
+`pdf` and background-tab `screenshot` are CDP-only, so they always need approval.
+(`--stealth` still exists as a legacy no-op, since stealth is now the default.)
+
 ## Install
 
 1. **Server** (Node ≥ 18):
@@ -116,12 +140,15 @@ Read this before installing — the extension can act as *you* on any site you'r
 - Optional **host allowlist** (extension Options): restrict commands to named domains
   and their subdomains. Empty list = allow all — set it if you want defense in depth.
 - Every command is **logged** to `~/.ai-browser-bridge/bridge.log`.
+- Commands run in **stealth mode by default** (no debugger, no banner). The
+  `chrome.debugger` route is opt-in via `--debugger` and gated behind approval —
+  see [Stealth by default, debugger on approval](#stealth-by-default-debugger-on-approval).
 - Chrome shows its native **"… is debugging this browser"** banner whenever the
-  debugger is attached — you always see when trusted-input mode is active. Clear it
-  with `detach` (one tab) or `detachAll` (every attached tab). Idle tabs also
-  auto-detach after `idleDetachMs` (default 2 min; set in Options), so banners never
-  pile up. (The banner is browser-enforced and can't be hidden from an extension;
-  that's the point.)
+  debugger is attached — so whenever you *do* approve `--debugger`, you always see
+  that trusted-input mode is active. Clear it with `detach` (one tab) or
+  `detachAll` (every attached tab). Idle tabs also auto-detach after `idleDetachMs`
+  (default 2 min; set in Options), so banners never pile up. (The banner is
+  browser-enforced and can't be hidden from an extension; that's the point.)
 - **Per-tab activity indicator** (on by default, toggle in Options): a thin neon
   frame with colors flowing around the page edge, plus a small color-shifting glow
   badge on the tab's favicon, mark exactly which tabs the agent is driving —

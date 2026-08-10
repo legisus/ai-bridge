@@ -258,7 +258,7 @@ async function stealthEval(tabId, code) {
     });
     return res && res.result;
   } catch (e) {
-    throw new Error(`stealth eval failed (page CSP may block eval; drop --stealth for this page): ${e && e.message || e}`);
+    throw new Error(`stealth eval failed (page CSP may block eval; add --debugger for this page): ${e && e.message || e}`);
   }
 }
 
@@ -513,7 +513,7 @@ async function handle(cmd, p) {
         // No CDP: fall back to captureVisibleTab, which only shoots the ACTIVE
         // tab of its window. Background-tab capture is a CDP-only capability.
         const tab = await chrome.tabs.get(p.tabId);
-        if (!tab.active) throw new Error("stealth screenshot: tab must be active in its window (captureVisibleTab limitation) — call selectTab first, or drop --stealth");
+        if (!tab.active) throw new Error("stealth screenshot: tab must be active in its window (captureVisibleTab limitation) — call selectTab first, or add --debugger");
         const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
         return { base64: (dataUrl.split(",")[1]) || "" };
       }
@@ -524,7 +524,7 @@ async function handle(cmd, p) {
 
     case "pdf": {
       await assertAllowed(p.tabId);
-      if (p.stealth) throw new Error("stealth pdf: Page.printToPDF is CDP-only — drop --stealth for this command");
+      if (p.stealth) throw new Error("stealth pdf: Page.printToPDF is CDP-only — add --debugger for this command");
       await dbgAttach(p.tabId);
       const r = await dbg(p.tabId, "Page.printToPDF", {
         printBackground: true,
