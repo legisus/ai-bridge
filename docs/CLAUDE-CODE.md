@@ -26,7 +26,7 @@ prints JSON to stdout and exits non-zero on failure — no SDK, no MCP server ne
 5. Verify:
    ```bash
    node server/cli.js ping
-   # {"pong":true,"version":"0.1.0"}
+   # {"pong":true,"version":"0.1.7"}
    ```
 
 ## Teach Claude Code about the bridge
@@ -38,33 +38,63 @@ path to where you cloned the repo.
 ```markdown
 ## Browser control (AI Browser Bridge)
 
+**Token saver — default for browser tasks:** for any multi-step browser task, do NOT
+drive the bridge command-by-command from this session. Delegate the whole task to the
+bridge's built-in agent, which runs the mechanical steps on cheap models and uses the
+strongest model only to judge the result (Haiku 4.5 → judge → Sonnet 5 → judge →
+Fable 5 → judge, stops at the first pass; bills to my existing Claude subscription via
+headless `claude -p`):
+
+    node /path/to/ai-bridge/server/cli.js agent "task description" [--timeout ms] [--verbose]
+
+It prints a verdict, an evidence report, and a per-stage token/cost summary; exits 0
+on pass. Give it a complete, self-contained task description (URLs, what "done" looks
+like). Only fall back to direct command-by-command driving (below) for one-off single
+commands (a quick `ping`, one `eval`, one `screenshot`) or when I explicitly ask you
+to drive the browser yourself.
+
 A local bridge to my real, logged-in Chrome is available. Run commands as:
 
     node /path/to/ai-bridge/server/cli.js <cmd> [params-json] [--file js] [--out file] [--timeout ms]
 
-Each call prints JSON to stdout and exits non-zero on failure. Commands:
+Each call prints JSON to stdout and exits non-zero on failure. Commands run in
+STEALTH mode by default (no chrome.debugger, no "is debugging" banner): eval uses
+MAIN-world scripting (subject to page CSP) and click/type/key are synthetic events.
+Add `--debugger` (alias `--no-stealth`) to attach chrome.debugger for trusted input,
+CSP-proof eval, `pdf`, or background-tab screenshots. `--debugger` requires approval:
+pass the flag, set `AI_BRIDGE_DEBUGGER=1`, or confirm the interactive prompt; with no
+TTY and no pre-approval the command fails (exit 5) instead of attaching. `pdf` and
+background-tab `screenshot` are CDP-only and always need `--debugger`. Commands:
 
 - `ping` — health check; `{"pong":true}` means the extension is connected
 - `listTabs` — all open tabs with id, url, title
 - `newTab '{"url":"https://…"}'` — opens in a BACKGROUND tab (never steals focus)
 - `navigate '{"tabId":N,"url":"https://…"}'`
-- `eval '{"tabId":N,"code":"…"}'` — CSP-proof JS eval; returns the value.
+- `eval '{"tabId":N,"code":"…"}'` — JS eval (stealth: page-CSP; --debugger: CSP-proof); returns the value.
   For long scripts use `eval '{"tabId":N}' --file script.js`
-- `click '{"tabId":N,"x":X,"y":Y}'` — trusted click (isTrusted:true) at viewport CSS px
-- `insertText '{"tabId":N,"text":"…"}'` — trusted paste at the current caret
-- `key '{"tabId":N,"key":"Enter"}'` — trusted key press
-- `screenshot '{"tabId":N}' --out page.png`
-- `pdf '{"tabId":N}' --out page.pdf`
+- `click '{"tabId":N,"x":X,"y":Y}'` — click at viewport CSS px (--debugger for isTrusted:true);
+  or `click '{"tabId":N,"selector":".btn"}'` to click an element by selector
+- `insertText '{"tabId":N,"text":"…"}'` — paste at the current caret
+- `type '{"tabId":N,"text":"…"}'` — real per-char keystrokes (autocomplete/React widgets)
+- `key '{"tabId":N,"key":"Enter"}'` — key press
+- `waitFor '{"tabId":N,"selector":"#results"}'` — poll until an element appears (or `{"code":"…"}` for a JS condition)
+- `scroll '{"tabId":N,"bottom":true}'` — also `{selector}`, `{top}`, `{dx,dy}`
+- `screenshot '{"tabId":N}' --out page.png` — stealth needs the tab active; add `--debugger` for background tabs
+- `pdf '{"tabId":N}' --out page.pdf` — CDP-only, needs `--debugger`
 - `download '{"url":"…","filename":"f.pdf"}'` — uses my cookies; lands in ~/Downloads
-- `activateTab '{"tabId":N}'` / `closeTab '{"tabId":N}'`
-- `detach '{"tabId":N}'` — clears Chrome's "is debugging" banner when you're done
+- `selectTab '{"tabId":N}'` — activate a tab without focusing its window
+- `activateTab '{"tabId":N}'` (focuses the window — avoid unless asked) / `closeTab '{"tabId":N}'`
+- `status` — version + which tabs are attached
+- `detach '{"tabId":N}'` — clears Chrome's "is debugging" banner (only appears with --debugger)
+- `detachAll` — release every attached tab in one call
 
 Rules:
 - Always `ping` first; if it fails, tell me to start the server / check the extension.
-- Prefer `eval` for reading pages; use `click`/`insertText`/`key` only when a site
-  rejects synthetic events (contenteditable/ProseMirror-class rich-text editors).
+- Stealth is the default and is fine for most work; only add `--debugger` when a site
+  rejects synthetic events (contenteditable/ProseMirror-class rich-text editors), the
+  page's CSP blocks stealth eval, or you need pdf/background-tab screenshots.
 - Open new tabs in the background (default) — do not steal my focus.
-- `detach` from tabs when finished so the debugger banner goes away.
+- `detach` from any tab you drove with `--debugger` when finished so the banner goes away.
 - This is my real browser with my real sessions: never log out, change account
   settings, or submit destructive forms without asking me first.
 ```
@@ -101,6 +131,12 @@ asking each time. The extension's **host allowlist** (Options page) is the safet
 that keeps commands confined to domains you chose.
 
 ## Model routing: delegate the mechanics, keep the judgment
+
+The built-in `bridge agent` subcommand (see the CLAUDE.md block above and the
+README's *Agent mode* section) already implements this idea end-to-end: cheap
+models operate, a strong model judges. This section explains the principle and a
+Claude Code-native alternative — a custom subagent — if you want finer control
+over what gets delegated.
 
 Browser driving is cheap mechanical work wrapped around a few expensive judgments — so
 running the whole loop on your most capable model wastes tokens. Two things make it costly
@@ -154,4 +190,5 @@ expensive model only spends tokens where the thinking actually is.
 | `connect failed: …` from the CLI | Server isn't running — `npm start` in the repo |
 | `ERROR: extension not connected` | Extension not loaded/provisioned, or wrong token/port in Options; it reconnects within ~30 s of the server starting |
 | `host "…" not in allowlist` | Add the domain in the extension Options, or clear the allowlist |
+| `` `claude` CLI not found `` from `bridge agent` | Install Claude Code and log in — the agent runs on headless `claude -p` sessions |
 | Chrome shows a "…is debugging this browser" banner | Expected whenever trusted input / eval is active; run `detach` to clear it |

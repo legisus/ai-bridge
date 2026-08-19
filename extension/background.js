@@ -3,6 +3,16 @@
 // against chrome.* APIs. Trusted input and CSP-proof eval go through
 // chrome.debugger (DevTools protocol), so they work on sites that reject
 // synthetic DOM events (webmail clients, rich-text editors, collaborative docs, ...).
+//
+// Stealth mode (params.stealth === true, set by the CLI's --stealth flag):
+// never attaches chrome.debugger for that command. eval runs via
+// chrome.scripting in the page's MAIN world; click/type/insertText/key are
+// emulated with synthetic DOM events. This removes the CDP fingerprint and the
+// "…is debugging this browser" banner — the footprint anti-bot systems
+// (Cloudflare et al.) look for — at the cost of untrusted events (isTrusted:false,
+// same as AppleScript injection) and MAIN-world eval being subject to the page's
+// own CSP. Use it on sites that fight automation; keep the default CDP path for
+// CSP-hard pages and background screenshots/PDF.
 
 const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000 };
 
@@ -217,16 +227,148 @@ async function selectorCenter(tabId, selector) {
 // Run a self-contained fn(arg) in the page. Prefers chrome.scripting (no debugger
 // banner); if the page blocks injection (about:blank, chrome://, the Web Store),
 // falls back to CSP-proof debugger eval. fn must not close over outer variables.
-async function pageRun(tabId, fn, arg) {
+async function pageRun(tabId, fn, arg, noDebugger) {
   try {
     const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: fn, args: [arg] });
     return res && res.result;
   } catch (e) {
+    if (noDebugger) throw e; // stealth: never fall back to the debugger
     await dbgAttach(tabId);
     const r = await dbg(tabId, "Runtime.evaluate", { expression: `(${fn.toString()})(${JSON.stringify(arg)})`, returnByValue: true });
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
     return r.result && r.result.value;
   }
+}
+
+// ---------- stealth (no-debugger) helpers ----------
+// All of these use chrome.scripting only — they never attach the debugger, so
+// there is no CDP fingerprint and no banner. Injected functions must be
+// self-contained (no closures over outer variables).
+
+// Evaluate an arbitrary code string in the page's MAIN world. Subject to the
+// page's own CSP (unsafe-eval) — throws on strict-CSP pages, where the caller
+// should drop --stealth and use the debugger path instead.
+async function stealthEval(tabId, code) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (c) => Promise.resolve((0, eval)(c)),
+      args: [code],
+    });
+    return res && res.result;
+  } catch (e) {
+    throw new Error(`stealth eval failed (page CSP may block eval; add --debugger for this page): ${e && e.message || e}`);
+  }
+}
+
+// Run a fixed, self-contained fn(arg) via chrome.scripting (no debugger, no
+// eval — CSP-safe). Default ISOLATED world is enough: page listeners still
+// receive events dispatched here (one shared DOM); only event.isTrusted differs.
+async function stealthRun(tabId, fn, arg) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId }, func: fn, args: [arg === undefined ? null : arg],
+  });
+  return res && res.result;
+}
+
+// Synthetic click on a selector's element (found + scrolled in-page) or the
+// element at viewport point (x,y). Dispatches the full pointer/mouse sequence
+// plus focus, so page handlers fire as they would for a real click.
+function __stealthClick(o) {
+  let el, x = o.x, y = o.y;
+  if (o.selector) {
+    el = document.querySelector(o.selector);
+    if (!el) return { error: "selector not found: " + o.selector };
+    el.scrollIntoView({ block: "center", inline: "center" });
+    const b = el.getBoundingClientRect();
+    x = b.left + b.width / 2; y = b.top + b.height / 2;
+  } else {
+    el = document.elementFromPoint(x, y);
+    if (!el) return { error: "no element at point (" + x + "," + y + ")" };
+  }
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0 };
+  try { el.focus && el.focus(); } catch (e) {}
+  el.dispatchEvent(new PointerEvent("pointerdown", { ...base, pointerId: 1, isPrimary: true }));
+  el.dispatchEvent(new MouseEvent("mousedown", base));
+  el.dispatchEvent(new PointerEvent("pointerup", { ...base, pointerId: 1, isPrimary: true }));
+  el.dispatchEvent(new MouseEvent("mouseup", base));
+  el.dispatchEvent(new MouseEvent("click", base));
+  return { ok: true, x: Math.round(x), y: Math.round(y) };
+}
+
+// Insert text at the caret of the focused element (paste-equivalent), via
+// execCommand then a native-setter + input-event fallback.
+function __stealthInsert(o) {
+  const el = document.activeElement;
+  if (!el) return { error: "no active element to insert into" };
+  const text = o.text || "";
+  try { el.focus && el.focus(); } catch (e) {}
+  try { if (document.execCommand("insertText", false, text)) return { ok: true }; } catch (e) {}
+  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+    : el instanceof HTMLInputElement ? HTMLInputElement.prototype : null;
+  if (proto) {
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, (el.value || "") + text);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+    return { ok: true };
+  }
+  if (el.isContentEditable) {
+    el.textContent = (el.textContent || "") + text;
+    el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    return { ok: true };
+  }
+  return { error: "unsupported element for insertText" };
+}
+
+// keyCode/which for the legacy handlers many composers still gate Enter on —
+// the KeyboardEvent constructor ignores both, so they're defined explicitly.
+const __KEYCODES = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, " ": 32, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Home: 36, End: 35 };
+
+// Synthetic key press (keydown/keypress/keyup) on the focused element.
+function __stealthKey(o) {
+  const el = document.activeElement || document.body;
+  const key = o.key, code = o.code || key, m = o.modifiers || 0;
+  const KC = o.keycodes;
+  const kc = KC[key] != null ? KC[key] : (key && [...key].length === 1 ? key.toUpperCase().charCodeAt(0) : 0);
+  const mk = (type) => {
+    const e = new KeyboardEvent(type, { key, code, bubbles: true, cancelable: true, composed: true,
+      altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8) });
+    Object.defineProperty(e, "keyCode", { get: () => kc });
+    Object.defineProperty(e, "which", { get: () => kc });
+    return e;
+  };
+  el.dispatchEvent(mk("keydown"));
+  el.dispatchEvent(mk("keypress"));
+  el.dispatchEvent(mk("keyup"));
+  return { ok: true };
+}
+
+// Synthetic per-character typing — keydown + value update + input + keyup per
+// char, the sequence autocomplete / React widgets listen for.
+async function __stealthType(o) {
+  const el = document.activeElement;
+  if (!el) return { error: "no active element to type into" };
+  try { el.focus && el.focus(); } catch (e) {}
+  const text = String(o.text == null ? "" : o.text), delay = o.delay || 0;
+  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+    : el instanceof HTMLInputElement ? HTMLInputElement.prototype : null;
+  const setter = proto ? Object.getOwnPropertyDescriptor(proto, "value").set : null;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (const ch of text) {
+    const kc = ch.toUpperCase().charCodeAt(0);
+    const mk = (type) => {
+      const e = new KeyboardEvent(type, { key: ch, code: "Key" + ch.toUpperCase(), bubbles: true, cancelable: true, composed: true });
+      Object.defineProperty(e, "keyCode", { get: () => kc });
+      Object.defineProperty(e, "which", { get: () => kc });
+      return e;
+    };
+    el.dispatchEvent(mk("keydown"));
+    if (setter) { setter.call(el, (el.value || "") + ch); el.dispatchEvent(new InputEvent("input", { bubbles: true, data: ch, inputType: "insertText" })); }
+    else if (el.isContentEditable) { try { document.execCommand("insertText", false, ch); } catch (e) { el.textContent = (el.textContent || "") + ch; } }
+    el.dispatchEvent(mk("keyup"));
+    if (delay) await sleep(delay);
+  }
+  return { ok: true, typed: [...text].length };
 }
 
 // ---------- commands ----------
@@ -281,7 +423,9 @@ async function handle(cmd, p) {
 
     case "eval": {
       // Runtime.evaluate via debugger: immune to page CSP, returns values.
+      // Stealth: MAIN-world scripting eval instead (no CDP; page CSP applies).
       await assertAllowed(p.tabId);
+      if (p.stealth) return await stealthEval(p.tabId, p.code);
       await dbgAttach(p.tabId);
       const r = await dbg(p.tabId, "Runtime.evaluate", {
         expression: p.code,
@@ -298,7 +442,13 @@ async function handle(cmd, p) {
     case "click": {
       // Trusted click at viewport coordinates (CSS px), or at a CSS `selector`'s
       // center (resolved in-page — no screenshot/DPR pixel math needed).
+      // Stealth: synthetic pointer/mouse events instead of CDP Input.dispatch*.
       await assertAllowed(p.tabId);
+      if (p.stealth) {
+        const out = await stealthRun(p.tabId, __stealthClick, { selector: p.selector, x: p.x, y: p.y });
+        if (out && out.error) throw new Error(`click: ${out.error}`);
+        return out;
+      }
       await dbgAttach(p.tabId);
       let x = p.x, y = p.y;
       if (p.selector) {
@@ -315,7 +465,13 @@ async function handle(cmd, p) {
 
     case "insertText": {
       // Trusted text insertion at the current caret (equivalent of a real paste).
+      // Stealth: execCommand/native-setter insertion instead of CDP Input.insertText.
       await assertAllowed(p.tabId);
+      if (p.stealth) {
+        const out = await stealthRun(p.tabId, __stealthInsert, { text: p.text });
+        if (out && out.error) throw new Error(`insertText: ${out.error}`);
+        return out;
+      }
       await dbgAttach(p.tabId);
       await dbg(p.tabId, "Input.insertText", { text: p.text });
       return { ok: true };
@@ -326,7 +482,14 @@ async function handle(cmd, p) {
       // Optional `commands` (e.g. ["paste"], ["selectAll"]) run the matching
       // editing command with the keyDown, so shortcuts like Cmd/Ctrl+V trigger
       // the browser's native paste instead of just delivering the raw key.
+      // Stealth: synthetic KeyboardEvents (keyCode/which set for legacy handlers)
+      // instead of CDP Input.dispatchKeyEvent. `commands` (native editing ops)
+      // are CDP-only and are ignored in stealth.
       await assertAllowed(p.tabId);
+      if (p.stealth) {
+        return await stealthRun(p.tabId, __stealthKey,
+          { key: p.key, code: p.code, modifiers: p.modifiers || 0, keycodes: __KEYCODES });
+      }
       await dbgAttach(p.tabId);
       const mods = p.modifiers || 0;
       const ev = { key: p.key, code: p.code || p.key, modifiers: mods };
@@ -346,6 +509,14 @@ async function handle(cmd, p) {
 
     case "screenshot": {
       await assertAllowed(p.tabId);
+      if (p.stealth) {
+        // No CDP: fall back to captureVisibleTab, which only shoots the ACTIVE
+        // tab of its window. Background-tab capture is a CDP-only capability.
+        const tab = await chrome.tabs.get(p.tabId);
+        if (!tab.active) throw new Error("stealth screenshot: tab must be active in its window (captureVisibleTab limitation) — call selectTab first, or add --debugger");
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+        return { base64: (dataUrl.split(",")[1]) || "" };
+      }
       await dbgAttach(p.tabId);
       const r = await dbg(p.tabId, "Page.captureScreenshot", { format: "png" });
       return { base64: r.data };
@@ -353,6 +524,7 @@ async function handle(cmd, p) {
 
     case "pdf": {
       await assertAllowed(p.tabId);
+      if (p.stealth) throw new Error("stealth pdf: Page.printToPDF is CDP-only — add --debugger for this command");
       await dbgAttach(p.tabId);
       const r = await dbg(p.tabId, "Page.printToPDF", {
         printBackground: true,
@@ -397,7 +569,13 @@ async function handle(cmd, p) {
     case "type": {
       // Real per-character keystrokes — what autocomplete / React widgets listen
       // for, where insertText (a paste) is silently ignored.
+      // Stealth: synthetic per-char keydown/input/keyup instead of CDP.
       await assertAllowed(p.tabId);
+      if (p.stealth) {
+        const out = await stealthRun(p.tabId, __stealthType, { text: p.text, delay: p.delay || 0 });
+        if (out && out.error) throw new Error(`type: ${out.error}`);
+        return out;
+      }
       await dbgAttach(p.tabId);
       const text = String(p.text ?? "");
       const delay = p.delay || 0;
@@ -419,7 +597,7 @@ async function handle(cmd, p) {
         if (o.top) { window.scrollTo(0, 0); return { ok: true, y: 0 }; }
         if (o.bottom) { window.scrollTo(0, document.body.scrollHeight); return { ok: true, y: window.scrollY }; }
         window.scrollBy(o.dx || 0, o.dy || 0); return { ok: true, x: window.scrollX, y: window.scrollY };
-      }, { selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom });
+      }, { selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom }, p.stealth);
       if (out && out.error) throw new Error(`scroll: ${out.error}`);
       return out || { ok: true };
     }
@@ -435,11 +613,15 @@ async function handle(cmd, p) {
       while (Date.now() < start + timeout) {
         let ok = false;
         if (p.code) {
-          await dbgAttach(p.tabId);
-          const r = await dbg(p.tabId, "Runtime.evaluate", { expression: `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, returnByValue: true });
-          ok = !!(r.result && r.result.value);
+          if (p.stealth) {
+            ok = !!(await stealthEval(p.tabId, `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`));
+          } else {
+            await dbgAttach(p.tabId);
+            const r = await dbg(p.tabId, "Runtime.evaluate", { expression: `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, returnByValue: true });
+            ok = !!(r.result && r.result.value);
+          }
         } else {
-          ok = !!(await pageRun(p.tabId, (sel) => !!document.querySelector(sel), p.selector || ""));
+          ok = !!(await pageRun(p.tabId, (sel) => !!document.querySelector(sel), p.selector || "", p.stealth));
         }
         if (ok) return { ok: true, waitedMs: Date.now() - start };
         await new Promise((r) => setTimeout(r, poll));

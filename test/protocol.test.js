@@ -84,6 +84,31 @@ const assert = (cond, name) => {
 
     const scrolled = JSON.parse((await run("node", [cli, "scroll", '{"tabId":1,"bottom":true}', "--timeout", "5000"], { env })).stdout);
     assert(scrolled.params.bottom === true, "cli scroll forwards params");
+
+    // v0.1.7: stealth is the default; the debugger is opt-in with approval.
+    const defStealth = JSON.parse((await run("node", [cli, "type", '{"tabId":1,"text":"hi"}', "--timeout", "5000"], { env })).stdout);
+    assert(defStealth.params.stealth === true, "default sends stealth:true");
+
+    // --debugger pre-approves the debugger path (no prompt): stealth:false
+    const dbg = JSON.parse((await run("node", [cli, "type", '{"tabId":1,"text":"hi"}', "--debugger", "--timeout", "5000"], { env })).stdout);
+    assert(dbg.params.stealth === false, "--debugger sends stealth:false");
+
+    // --no-stealth is an alias for --debugger
+    const noStealth = JSON.parse((await run("node", [cli, "type", '{"tabId":1,"text":"hi"}', "--no-stealth", "--timeout", "5000"], { env })).stdout);
+    assert(noStealth.params.stealth === false, "--no-stealth aliases --debugger");
+
+    // AI_BRIDGE_DEBUGGER=1 pre-approves the CDP-only pdf command
+    const pdfEnv = JSON.parse((await run("node", [cli, "pdf", '{"tabId":1}', "--timeout", "5000"], { env: { ...env, AI_BRIDGE_DEBUGGER: "1" } })).stdout);
+    assert(pdfEnv.echo === "pdf" && pdfEnv.params.stealth === false, "AI_BRIDGE_DEBUGGER=1 pre-approves pdf");
+
+    // pdf is CDP-only: with no TTY and no approval it must fail fast, not send
+    let pdfBlocked = false;
+    try {
+      await run("node", [cli, "pdf", '{"tabId":1}', "--timeout", "5000"], { env });
+    } catch (e) {
+      pdfBlocked = e.code && e.code !== 0 && /debugger/i.test(String(e.stderr || e.message));
+    }
+    assert(pdfBlocked, "pdf without TTY/approval exits non-zero without sending");
   } catch (e) {
     assert(false, `cli round-trip threw: ${e.message}`);
   } finally {
