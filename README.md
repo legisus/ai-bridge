@@ -72,7 +72,7 @@ it requires **approval**, resolved in this order:
 4. **Smoke test:**
    ```bash
    node server/cli.js ping
-   # {"pong":true,"version":"0.1.0"}
+   # {"pong":true,"version":"0.1.7"}
    ```
 
 ## Usage
@@ -97,6 +97,7 @@ bridge download '{"url":"https://.../file.pdf","filename":"file.pdf"}'   # uses 
 bridge pdf      '{"tabId":123}' --out page.pdf
 bridge screenshot '{"tabId":123}' --out page.png
 bridge selectTab '{"tabId":123}'                              # activate tab, don't focus its window
+bridge activateTab '{"tabId":123}'                            # activate tab AND bring its window to front
 bridge status                                                 # version + which tabs are attached
 bridge closeTab '{"tabId":123}'
 bridge detach   '{"tabId":123}'                               # release debugger + clear the tab indicator
@@ -105,6 +106,43 @@ bridge detachAll                                              # release every at
 
 For an AI agent, the contract is simple: every command is one shell invocation that
 prints JSON to stdout and exits non-zero on failure.
+
+## Agent mode — hand it a whole task
+
+Instead of driving the bridge command-by-command, you can hand it a complete task
+and let the built-in **token-saver agent** do the driving:
+
+```bash
+bridge agent "open https://example.com and report the page title and first heading"
+bridge agent "…" --timeout 600000 --verbose
+```
+
+It spawns headless Claude Code sessions (`claude -p`) and walks an escalation
+ladder: a cheap model attempts the task first, a strong model judges the evidence,
+and only on failure does a stronger model retry —
+
+```
+ops: Haiku 4.5  → judge (Fable 5) → pass? done
+ops: Sonnet 5   → judge (Fable 5) → pass? done
+ops: Fable 5    → judge (Fable 5) → final verdict
+```
+
+The judge only ever sees the task plus the ops session's short evidence report —
+never the full browsing transcript — so the expensive model's token spend stays
+minimal. The command prints the verdict, the evidence report, and a per-stage
+token/cost summary, and exits 0 only on a pass.
+
+Requirements & notes:
+
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code) must be
+  installed and logged in** — usage bills to your existing Claude subscription.
+- The agent pings the bridge before spending any model tokens, and fails fast if
+  the server or extension is down.
+- Give it a complete, self-contained task description: URLs, credentials context
+  ("I'm already logged in"), and what "done" looks like.
+- Default timeout is 10 minutes per stage (`--timeout` is in ms).
+- The ops sessions are confined to bridge CLI calls (`--allowedTools`), and a
+  recursion guard stops them from invoking `bridge agent` themselves.
 
 ## Concurrency
 
