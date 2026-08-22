@@ -389,7 +389,14 @@ async function handle(cmd, p) {
     }
 
     case "newTab": {
-      // active:false → opens in background, never steals the user's focus
+      // active:false → opens in background, never steals the user's focus.
+      // newWindow:true → its own (unfocused) window, so later activateTab calls
+      // never change the active tab of the user's / other automations' windows.
+      if (p.newWindow) {
+        const win = await chrome.windows.create({ url: p.url, focused: !!p.active });
+        const tab = (win.tabs && win.tabs[0]) || (await chrome.tabs.query({ windowId: win.id }))[0];
+        return { id: tab.id, windowId: win.id, newWindow: true };
+      }
       const tab = await chrome.tabs.create({ url: p.url, active: !!p.active });
       return { id: tab.id, windowId: tab.windowId };
     }

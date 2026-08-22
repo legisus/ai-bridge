@@ -82,6 +82,7 @@ bridge() { node /path/to/ai-bridge/server/cli.js "$@"; }
 
 bridge listTabs
 bridge newTab   '{"url":"https://example.com"}'               # opens in background
+bridge newTab   '{"url":"https://example.com","newWindow":true}'  # own unfocused window (isolates activateTab)
 bridge eval     '{"tabId":123,"code":"document.title"}'
 bridge eval     '{"tabId":123}' --file scrape.js              # long scripts from a file
 bridge click    '{"tabId":123,"x":420,"y":310}'               # trusted click at CSS px

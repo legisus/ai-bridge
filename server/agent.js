@@ -34,7 +34,7 @@ commands directly, like:
 
     node ${CLI_PATH} <cmd> [params-json] [--file js] [--out file]
 
-Commands: ping, listTabs, newTab {"url"}, navigate {"tabId","url"},
+Commands: ping, listTabs, newTab {"url", "newWindow"?}, navigate {"tabId","url"},
 eval {"tabId","code"}, click {"tabId","x","y"}, insertText {"tabId","text"},
 key {"tabId","key"}, screenshot {"tabId"} --out f.png, pdf, download,
 activateTab, closeTab, detach {"tabId"}.
