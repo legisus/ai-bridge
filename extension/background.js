@@ -397,7 +397,11 @@ async function handle(cmd, p) {
         const tab = (win.tabs && win.tabs[0]) || (await chrome.tabs.query({ windowId: win.id }))[0];
         return { id: tab.id, windowId: win.id, newWindow: true };
       }
-      const tab = await chrome.tabs.create({ url: p.url, active: !!p.active });
+      // windowId → open in that specific window (e.g. an automation's own
+      // window), not whichever window was focused last.
+      const opts = { url: p.url, active: !!p.active };
+      if (p.windowId != null) opts.windowId = p.windowId;
+      const tab = await chrome.tabs.create(opts);
       return { id: tab.id, windowId: tab.windowId };
     }
 

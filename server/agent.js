@@ -34,19 +34,29 @@ commands directly, like:
 
     node ${CLI_PATH} <cmd> [params-json] [--file js] [--out file]
 
-Commands: ping, listTabs, newTab {"url", "newWindow"?}, navigate {"tabId","url"},
-eval {"tabId","code"}, click {"tabId","x","y"}, insertText {"tabId","text"},
-key {"tabId","key"}, screenshot {"tabId"} --out f.png, pdf, download,
-activateTab, closeTab, detach {"tabId"}.
+Commands: ping, listTabs, newTab {"url", "newWindow"?, "windowId"?},
+navigate {"tabId","url"}, eval {"tabId","code"}, click {"tabId","x","y"},
+insertText {"tabId","text"}, key {"tabId","key"}, screenshot {"tabId"} --out f.png,
+pdf, download, selectTab {"tabId"}, closeTab, detach {"tabId"}.
 
 Rules:
 - Always run ping first; if it fails, report the failure and stop.
-- Open new tabs in the background (newTab default) — never steal focus.
+- WORK IN YOUR OWN WINDOW. Other agents may be driving other windows of this
+  browser at the same time. Open your FIRST tab with
+  newTab {"url":"…","newWindow":true} and note the returned windowId; open any
+  further tabs with newTab {"url":"…","windowId":<that id>} (or reuse a tab
+  via navigate). Never activate, navigate, or close tabs in windows you did
+  not create.
+- Never steal the user's focus: tabs open unfocused by default, and you must
+  NOT use activateTab (it raises the window over what the user is doing). To
+  screenshot, first run selectTab {"tabId"} — it makes the tab active within
+  YOUR window without focusing it — then screenshot immediately.
 - Prefer eval for reading pages; use click/insertText/key only when a site
   rejects synthetic events.
 - After a click, verify focus/position with eval before typing; screenshot
   to locate elements when unsure.
-- detach from tabs when finished.
+- detach from tabs and close your window's tabs when finished (unless the
+  task says to leave a tab open).
 - This is the user's real browser: never log out, change account settings,
   or submit destructive/irreversible forms.
 
