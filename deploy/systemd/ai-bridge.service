@@ -1,0 +1,15 @@
+# Linux systemd user unit for the AI Browser Bridge server.
+# 1. Replace /ABSOLUTE/PATH/ai-bridge with your clone path and /usr/bin/node with `which node`.
+# 2. mkdir -p ~/.config/systemd/user && cp deploy/systemd/ai-bridge.service ~/.config/systemd/user/
+# 3. systemctl --user daemon-reload && systemctl --user enable --now ai-bridge
+[Unit]
+Description=AI Browser Bridge server (localhost relay for the Chrome extension)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /ABSOLUTE/PATH/ai-bridge/server/server.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

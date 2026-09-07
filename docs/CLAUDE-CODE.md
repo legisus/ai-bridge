@@ -6,27 +6,30 @@ prints JSON to stdout and exits non-zero on failure — no SDK, no MCP server ne
 
 ## One-time setup
 
+New to the project? [INSTALL.md](INSTALL.md) is the full first-time walkthrough with
+troubleshooting and background-service templates. The short version:
+
 1. Clone and install:
    ```bash
-   git clone https://github.com/<you>/ai-bridge.git
+   git clone https://github.com/legisus/ai-bridge.git
    cd ai-bridge
    npm install
    ```
-2. Start the server (keep it running; a login item, `tmux` pane, or `launchd`/systemd
-   unit all work):
+2. Start the server (keep it running — templates for `launchd` and systemd are in
+   `deploy/`, see [INSTALL.md §7](INSTALL.md#7-keep-the-server-running)):
    ```bash
    npm start
    # first run prints: token generated at ~/.ai-browser-bridge/token
    ```
 3. Load the extension: `chrome://extensions` → enable **Developer mode** →
    **Load unpacked** → select the `extension/` folder.
-4. Open the extension's **Options** page, paste the token from
+4. On the extension card click **Details** → **Extension options**, paste the token from
    `~/.ai-browser-bridge/token`, and save. Optionally set a **host allowlist** so the
    agent can only touch domains you name.
 5. Verify:
    ```bash
    node server/cli.js ping
-   # {"pong":true,"version":"0.1.7"}
+   # {"pong":true,"version":"0.1.9"}
    ```
 
 ## Teach Claude Code about the bridge

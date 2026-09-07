@@ -6,7 +6,7 @@ Thanks for wanting to improve the bridge! It's a deliberately small codebase
 ## Dev setup
 
 ```bash
-git clone https://github.com/<you>/ai-bridge.git
+git clone https://github.com/legisus/ai-bridge.git
 cd ai-bridge
 npm install        # only dependency: ws
 ```

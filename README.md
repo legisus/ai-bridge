@@ -59,21 +59,29 @@ it requires **approval**, resolved in this order:
 
 ## Install
 
+Short version (full first-time walkthrough with troubleshooting, background
+service templates and Windows notes: **[docs/INSTALL.md](docs/INSTALL.md)**):
+
 1. **Server** (Node ≥ 18):
    ```bash
+   git clone https://github.com/legisus/ai-bridge.git && cd ai-bridge
    npm install
    npm start          # generates ~/.ai-browser-bridge/token on first run (chmod 600)
    ```
 2. **Extension:** open `chrome://extensions` → enable *Developer mode* → *Load unpacked* →
    select the `extension/` folder.
-3. **Provision:** open the extension's *Options* page, paste the token from
-   `~/.ai-browser-bridge/token`, save. The service worker connects within ~30 s
-   (or immediately after you press *Save*).
+3. **Provision:** on the extension card click *Details* → *Extension options*, paste the
+   token from `~/.ai-browser-bridge/token`, save. The service worker connects on save
+   (and retries every ~24 s on its own).
 4. **Smoke test:**
    ```bash
    node server/cli.js ping
-   # {"pong":true,"version":"0.1.7"}
+   # {"pong":true,"version":"0.1.9"}
    ```
+   `connect failed` = server not running; `extension not connected` = token not saved
+   or wrong — re-save Options, wait 30 s, retry.
+5. **Keep it running:** copy the template from `deploy/launchd/` (macOS) or
+   `deploy/systemd/` (Linux), fix the paths, load it. See INSTALL.md §7.
 
 ## Usage
 
@@ -205,7 +213,9 @@ npm test    # spins up the server, a simulated extension, and the real CLI; asse
 
 ```
 extension/    Manifest V3 extension (service worker + options page)
-server/       relay server (server.js) and CLI client (cli.js)
+server/       relay server (server.js), CLI client (cli.js), token-saver agent (agent.js)
+deploy/       launchd / systemd templates to run the server as a background service
+docs/         INSTALL.md (first-time setup) and CLAUDE-CODE.md (Claude Code integration)
 test/         protocol round-trip test with a simulated extension
 ```
 
