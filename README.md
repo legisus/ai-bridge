@@ -33,20 +33,22 @@ AI agent / your scripts          bridge server               Chrome extension
 - **Cross-platform.** macOS, Windows, Linux — no OS-level input scripting or
   accessibility APIs required.
 
-## Stealth by default, debugger on approval
+## Direct mode by default, debugger on approval
 
-By default every command runs in **stealth mode**: the bridge drives the tab
-*without* attaching `chrome.debugger`, so there's no CDP fingerprint and no
-"… is debugging this browser" banner. `eval` runs via `chrome.scripting` in the
-page's MAIN world; `click`/`type`/`insertText`/`key` are emulated with synthetic
-DOM events. This is what you want on sites that fight automation — at the cost of
-untrusted events (`isTrusted: false`) and MAIN-world eval being subject to the
-page's own CSP.
+By default every command runs in **direct mode**: the extension drives the tab with
+ordinary extension APIs and *never* attaches `chrome.debugger`, so there is no
+DevTools session and no "… is debugging this browser" banner. `eval` runs through
+`chrome.userScripts.execute()` in the page's MAIN world — Chrome's documented API
+for user-supplied code (enable it once with **Allow User Scripts** on the extension
+card, see [Install](#install)); `click`/`type`/`insertText`/`key` are emulated with
+synthetic DOM events. Direct mode is lighter and is enough for most reading,
+scraping and form work — at the cost of untrusted events (`isTrusted: false`) and
+active-tab-only screenshots.
 
-When you need the `chrome.debugger` route — trusted input, CSP-proof eval, `pdf`,
-or background-tab screenshots — request it per command with **`--debugger`**
-(alias `--no-stealth`). Because attaching the debugger shows the browser banner,
-it requires **approval**, resolved in this order:
+When you need the `chrome.debugger` route — trusted input for rich-text editors,
+`pdf`, or background-tab screenshots — request it per command with **`--debugger`**.
+Because attaching the debugger shows the browser banner, it requires **approval**,
+resolved in this order:
 
 1. `--debugger` flag on the call — pre-approved (works headless).
 2. `AI_BRIDGE_DEBUGGER=1` in the environment — pre-approved (works headless).
@@ -55,7 +57,8 @@ it requires **approval**, resolved in this order:
    rather than silently attaching or hanging.
 
 `pdf` and background-tab `screenshot` are CDP-only, so they always need approval.
-(`--stealth` still exists as a legacy no-op, since stealth is now the default.)
+(`--stealth` and `--no-stealth` from releases before 0.1.10 are still accepted as
+aliases of the default and of `--debugger`.)
 
 ## Install
 
@@ -70,18 +73,20 @@ service templates and Windows notes: **[docs/INSTALL.md](docs/INSTALL.md)**):
    ```
 2. **Extension:** open `chrome://extensions` → enable *Developer mode* → *Load unpacked* →
    select the `extension/` folder.
-3. **Provision:** on the extension card click *Details* → *Extension options*, paste the
-   token from `~/.ai-browser-bridge/token`, save. The service worker connects on save
-   (and retries every ~24 s on its own).
+3. **Provision:** `npm run register-host` registers a [native messaging host](docs/INSTALL.md#3-register-the-native-host)
+   so Chrome can start the server and fetch the token by itself — then reload the
+   extension and click *Details* → turn on **Allow User Scripts** (needed by `eval`
+   in direct mode; Chrome 138+). No native host? Paste the token from
+   `~/.ai-browser-bridge/token` into *Extension options* instead.
 4. **Smoke test:**
    ```bash
    node server/cli.js ping
-   # {"pong":true,"version":"0.1.9"}
+   # {"pong":true,"version":"0.1.10"}
    ```
    `connect failed` = server not running; `extension not connected` = token not saved
    or wrong — re-save Options, wait 30 s, retry.
-5. **Keep it running:** copy the template from `deploy/launchd/` (macOS) or
-   `deploy/systemd/` (Linux), fix the paths, load it. See INSTALL.md §7.
+5. **Keep it running:** not needed with the native host — Chrome starts the server
+   on demand. Otherwise copy a template from `deploy/`, fix the paths, load it.
 
 ## Usage
 
@@ -111,6 +116,7 @@ bridge status                                                 # version + which 
 bridge closeTab '{"tabId":123}'
 bridge detach   '{"tabId":123}'                               # release debugger + clear the tab indicator
 bridge detachAll                                              # release every attached tab in one call
+bridge reloadExtension                                        # reload the extension after a git pull (no chrome://extensions visit)
 ```
 
 For an AI agent, the contract is simple: every command is one shell invocation that
@@ -179,7 +185,7 @@ the error"* and the agent composes the CLI calls itself.
 
 ## Security model
 
-Read this before installing — the extension can act as *you* on any site you're logged into.
+Full policy: [PRIVACY.md](PRIVACY.md). Read this before installing — the extension can act as *you* on any site you're logged into.
 
 - The server binds **127.0.0.1 only**; nothing is reachable from the network.
 - Every client must present the **token** from `~/.ai-browser-bridge/token`
@@ -187,9 +193,9 @@ Read this before installing — the extension can act as *you* on any site you'r
 - Optional **host allowlist** (extension Options): restrict commands to named domains
   and their subdomains. Empty list = allow all — set it if you want defense in depth.
 - Every command is **logged** to `~/.ai-browser-bridge/bridge.log`.
-- Commands run in **stealth mode by default** (no debugger, no banner). The
+- Commands run in **direct mode by default** (no debugger, no banner). The
   `chrome.debugger` route is opt-in via `--debugger` and gated behind approval —
-  see [Stealth by default, debugger on approval](#stealth-by-default-debugger-on-approval).
+  see [Direct mode by default, debugger on approval](#direct-mode-by-default-debugger-on-approval).
 - Chrome shows its native **"… is debugging this browser"** banner whenever the
   debugger is attached — so whenever you *do* approve `--debugger`, you always see
   that trusted-input mode is active. Clear it with `detach` (one tab) or
@@ -213,10 +219,11 @@ npm test    # spins up the server, a simulated extension, and the real CLI; asse
 
 ```
 extension/    Manifest V3 extension (service worker + options page)
-server/       relay server (server.js), CLI client (cli.js), token-saver agent (agent.js)
+server/       relay server (server.js), CLI client (cli.js), token-saver agent (agent.js),
+              native messaging host (native-host.js) + its registrar (register-native-host.js)
 deploy/       launchd / systemd templates to run the server as a background service
 docs/         INSTALL.md (first-time setup) and CLAUDE-CODE.md (Claude Code integration)
-test/         protocol round-trip test with a simulated extension
+test/         protocol round-trip, agent ladder, and native-host tests
 ```
 
 ## Contributing

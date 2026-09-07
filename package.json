@@ -1,6 +1,6 @@
 {
   "name": "ai-browser-bridge",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Local bridge between an AI coding agent (or any local tool) and your logged-in Chrome: tabs, CSP-proof eval, trusted input, authenticated downloads, print-to-PDF. No cloud, localhost only.",
   "author": "Mykola Bielousov",
   "license": "MIT",
@@ -11,7 +11,8 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "node test/protocol.test.js && node test/agent.test.js"
+    "test": "node test/protocol.test.js && node test/agent.test.js && node test/native-host.test.js",
+    "register-host": "node server/register-native-host.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

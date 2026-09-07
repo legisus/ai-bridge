@@ -19,21 +19,21 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
-const TOKEN = fs.readFileSync(path.join(os.homedir(), ".ai-browser-bridge", "token"), "utf8").trim();
+const TOKEN = fs.readFileSync(require("./token").TOKEN_FILE, "utf8").trim();
 
 const argv = process.argv.slice(2);
 if (argv.length === 0) {
   console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms] [--debugger]");
   console.error('       bridge agent "task description" [--timeout ms] [--verbose]');
-  console.error("  Stealth is the DEFAULT: commands drive the tab without attaching");
-  console.error("  chrome.debugger (no CDP fingerprint, no debugging banner). eval runs");
-  console.error("  via page-CSP eval; click/type/insertText/key use synthetic input.");
-  console.error("  --debugger (alias --no-stealth): attach chrome.debugger for this call —");
+  console.error("  Direct mode is the DEFAULT: commands use ordinary extension APIs and");
+  console.error("  never attach chrome.debugger (no DevTools session, no debugging banner).");
+  console.error("  eval runs via chrome.userScripts (enable \"Allow User Scripts\" once on the");
+  console.error("  extension card); click/type/insertText/key use synthetic input.");
+  console.error("  --debugger: attach chrome.debugger for this call —");
   console.error("             trusted input + CSP-proof eval, at the cost of the debugging");
   console.error("             banner. Requires approval: pass this flag, set");
   console.error("             AI_BRIDGE_DEBUGGER=1, or confirm the interactive prompt.");
   console.error("  pdf and background-tab screenshots are CDP-only and always need approval.");
-  console.error("  --stealth: legacy no-op (stealth is already the default).");
   process.exit(2);
 }
 
@@ -52,13 +52,13 @@ for (let i = 1; i < argv.length; i++) {
   if (argv[i] === "--file") flags.file = argv[++i];
   else if (argv[i] === "--out") flags.out = argv[++i];
   else if (argv[i] === "--timeout") flags.timeout = Number(argv[++i]);
-  else if (argv[i] === "--stealth") flags.stealth = true;      // legacy no-op (stealth is the default)
-  else if (argv[i] === "--debugger" || argv[i] === "--no-stealth") flags.debugger = true;
+  else if (argv[i] === "--direct" || argv[i] === "--stealth") flags.direct = true;   // explicit (default anyway); --stealth = pre-0.1.10 alias
+  else if (argv[i] === "--debugger" || argv[i] === "--no-stealth") flags.debugger = true; // --no-stealth = pre-0.1.10 alias
   else params = JSON.parse(argv[i]);
 }
 if (flags.file) params.code = fs.readFileSync(flags.file, "utf8");
 
-// Commands with no stealth equivalent — Page.printToPDF is CDP-only, so pdf
+// Commands with no direct-mode equivalent — Page.printToPDF is CDP-only, so pdf
 // always needs the debugger (and thus approval).
 const CDP_ONLY = new Set(["pdf"]);
 
@@ -74,18 +74,18 @@ function promptApproval(command) {
   });
 }
 
-// Resolve stealth vs debugger before opening the socket. Stealth is the default;
-// the debugger is used only when the command needs it AND it has been approved.
-async function resolveStealth() {
-  if (flags.stealth && !flags.debugger) { params.stealth = true; return; } // explicit legacy opt-in
+// Resolve direct vs debugger mode before opening the socket. Direct is the
+// default; the debugger is used only when the command needs it AND it has been approved.
+async function resolveMode() {
+  if (flags.direct && !flags.debugger) { params.direct = true; return; } // explicit opt-in
   const needsDebugger = flags.debugger || CDP_ONLY.has(cmd);
-  if (!needsDebugger) { params.stealth = true; return; }
+  if (!needsDebugger) { params.direct = true; return; }
   // The debugger is wanted — require approval.
   if (flags.debugger || process.env.AI_BRIDGE_DEBUGGER === "1") {
-    params.stealth = false; return; // pre-approved via flag or env
+    params.direct = false; return; // pre-approved via flag or env
   }
   if (process.stdin.isTTY) {
-    if (await promptApproval(cmd)) { params.stealth = false; return; }
+    if (await promptApproval(cmd)) { params.direct = false; return; }
     console.error(`ERROR: chrome.debugger not approved for "${cmd}" — aborting.`);
     process.exit(5);
   }
@@ -127,4 +127,4 @@ function send() {
   ws.on("error", (e) => { console.error("connect failed:", e.message); process.exit(4); });
 }
 
-resolveStealth().then(send);
+resolveMode().then(send);

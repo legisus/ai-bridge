@@ -23,13 +23,15 @@ troubleshooting and background-service templates. The short version:
    ```
 3. Load the extension: `chrome://extensions` → enable **Developer mode** →
    **Load unpacked** → select the `extension/` folder.
-4. On the extension card click **Details** → **Extension options**, paste the token from
-   `~/.ai-browser-bridge/token`, and save. Optionally set a **host allowlist** so the
-   agent can only touch domains you name.
+4. `npm run register-host`, then reload the extension: it fetches the token through
+   Chrome's native messaging host and starts the server when needed. On the card click
+   **Details** and turn on **Allow User Scripts** (Chrome 138+; `eval` needs it).
+   Optionally set a **host allowlist** in **Extension options** so the agent can only
+   touch domains you name. (No native host? Paste `~/.ai-browser-bridge/token` there.)
 5. Verify:
    ```bash
    node server/cli.js ping
-   # {"pong":true,"version":"0.1.9"}
+   # {"pong":true,"version":"0.1.10"}
    ```
 
 ## Teach Claude Code about the bridge
@@ -61,10 +63,10 @@ A local bridge to my real, logged-in Chrome is available. Run commands as:
     node /path/to/ai-bridge/server/cli.js <cmd> [params-json] [--file js] [--out file] [--timeout ms]
 
 Each call prints JSON to stdout and exits non-zero on failure. Commands run in
-STEALTH mode by default (no chrome.debugger, no "is debugging" banner): eval uses
-MAIN-world scripting (subject to page CSP) and click/type/key are synthetic events.
-Add `--debugger` (alias `--no-stealth`) to attach chrome.debugger for trusted input,
-CSP-proof eval, `pdf`, or background-tab screenshots. `--debugger` requires approval:
+DIRECT mode by default (no chrome.debugger, no "is debugging" banner): eval runs via
+the User Scripts API in the page's MAIN world and click/type/key are synthetic events.
+Add `--debugger` to attach chrome.debugger for trusted input, `pdf`, or
+background-tab screenshots. `--debugger` requires approval:
 pass the flag, set `AI_BRIDGE_DEBUGGER=1`, or confirm the interactive prompt; with no
 TTY and no pre-approval the command fails (exit 5) instead of attaching. `pdf` and
 background-tab `screenshot` are CDP-only and always need `--debugger`. Commands:
@@ -73,7 +75,7 @@ background-tab `screenshot` are CDP-only and always need `--debugger`. Commands:
 - `listTabs` — all open tabs with id, url, title
 - `newTab '{"url":"https://…"}'` — opens in a BACKGROUND tab (never steals focus)
 - `navigate '{"tabId":N,"url":"https://…"}'`
-- `eval '{"tabId":N,"code":"…"}'` — JS eval (stealth: page-CSP; --debugger: CSP-proof); returns the value.
+- `eval '{"tabId":N,"code":"…"}'` — JS eval in the page; returns the value (add --debugger if a page refuses it).
   For long scripts use `eval '{"tabId":N}' --file script.js`
 - `click '{"tabId":N,"x":X,"y":Y}'` — click at viewport CSS px (--debugger for isTrusted:true);
   or `click '{"tabId":N,"selector":".btn"}'` to click an element by selector
@@ -82,7 +84,7 @@ background-tab `screenshot` are CDP-only and always need `--debugger`. Commands:
 - `key '{"tabId":N,"key":"Enter"}'` — key press
 - `waitFor '{"tabId":N,"selector":"#results"}'` — poll until an element appears (or `{"code":"…"}` for a JS condition)
 - `scroll '{"tabId":N,"bottom":true}'` — also `{selector}`, `{top}`, `{dx,dy}`
-- `screenshot '{"tabId":N}' --out page.png` — stealth needs the tab active; add `--debugger` for background tabs
+- `screenshot '{"tabId":N}' --out page.png` — direct mode needs the tab active; add `--debugger` for background tabs
 - `pdf '{"tabId":N}' --out page.pdf` — CDP-only, needs `--debugger`
 - `download '{"url":"…","filename":"f.pdf"}'` — uses my cookies; lands in ~/Downloads
 - `selectTab '{"tabId":N}'` — activate a tab without focusing its window
@@ -93,9 +95,9 @@ background-tab `screenshot` are CDP-only and always need `--debugger`. Commands:
 
 Rules:
 - Always `ping` first; if it fails, tell me to start the server / check the extension.
-- Stealth is the default and is fine for most work; only add `--debugger` when a site
-  rejects synthetic events (contenteditable/ProseMirror-class rich-text editors), the
-  page's CSP blocks stealth eval, or you need pdf/background-tab screenshots.
+- Direct mode is the default and is fine for most work; only add `--debugger` when a site
+  rejects synthetic events (contenteditable/ProseMirror-class rich-text editors) or you
+  need pdf/background-tab screenshots.
 - Open new tabs in the background (default) — do not steal my focus.
 - `detach` from any tab you drove with `--debugger` when finished so the banner goes away.
 - This is my real browser with my real sessions: never log out, change account

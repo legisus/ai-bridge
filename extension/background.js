@@ -1,20 +1,22 @@
 // AI Browser Bridge — extension service worker.
 // Maintains a WebSocket to the local bridge server and executes commands
-// against chrome.* APIs. Trusted input and CSP-proof eval go through
-// chrome.debugger (DevTools protocol), so they work on sites that reject
-// synthetic DOM events (webmail clients, rich-text editors, collaborative docs, ...).
+// against chrome.* APIs.
 //
-// Stealth mode (params.stealth === true, set by the CLI's --stealth flag):
-// never attaches chrome.debugger for that command. eval runs via
-// chrome.scripting in the page's MAIN world; click/type/insertText/key are
-// emulated with synthetic DOM events. This removes the CDP fingerprint and the
-// "…is debugging this browser" banner — the footprint anti-bot systems
-// (Cloudflare et al.) look for — at the cost of untrusted events (isTrusted:false,
-// same as AppleScript injection) and MAIN-world eval being subject to the page's
-// own CSP. Use it on sites that fight automation; keep the default CDP path for
-// CSP-hard pages and background screenshots/PDF.
+// Direct mode (params.direct === true — the CLI default): the command is
+// executed with ordinary extension APIs and never attaches chrome.debugger.
+// eval runs through chrome.userScripts.execute() in the page's MAIN world
+// (the documented API for running user-supplied code; the user enables it once
+// with the "Allow User Scripts" toggle on the extension card); click / type /
+// insertText / key are emulated with synthetic DOM events. No DevTools session,
+// no "…is debugging this browser" banner, less overhead — at the cost of
+// untrusted events (isTrusted:false) and active-tab-only screenshots.
+//
+// Debugger mode (params.direct === false — the CLI's --debugger, approved by
+// the user): trusted input and eval go through chrome.debugger (DevTools
+// protocol), which rich-text editors and CSP-strict apps require, plus pdf and
+// background-tab screenshots. Chrome shows its banner while it is attached.
 
-const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000 };
+const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "" };
 
 let ws = null;
 let attached = new Set(); // tabIds with debugger attached
@@ -30,19 +32,59 @@ async function config() {
 
 // ---------- connection ----------
 
+const NATIVE_HOST = "com.ai_bridge.host";
+let lastProvisionAttempt = 0;
+
+// Ask the native messaging host (server/native-host.js, registered with
+// `npm run register-host`) for the token and port. The host also starts the
+// relay server if it is not running. Silently a no-op when no host is
+// registered — the manual Options-page path keeps working.
+function provisionViaNativeHost(reason) {
+  const now = Date.now();
+  if (now - lastProvisionAttempt < 15000) return;   // throttle: once per 15 s
+  lastProvisionAttempt = now;
+  let port;
+  try { port = chrome.runtime.connectNative(NATIVE_HOST); } catch { return; }
+  port.onMessage.addListener(async (msg) => {
+    if (!msg || msg.type !== "hello" || !msg.token) return;
+    const cfg = await config();
+    const changed = cfg.token !== msg.token || cfg.port !== msg.port;
+    await chrome.storage.local.set({ token: msg.token, port: msg.port, provisionedBy: "native-host", provisionedAt: now });
+    try { port.disconnect(); } catch {}
+    if (changed || !ws) { try { ws && ws.close(); } catch {} ws = null; connect(); }
+  });
+  port.onDisconnect.addListener(() => {
+    // Reading lastError marks it handled. It is "Specified native messaging
+    // host not found." when nothing is registered — expected on a manual
+    // install; the Options-page path still works.
+    void chrome.runtime.lastError;
+  });
+}
+
+let connecting = false; // guards the async gap before `ws` is assigned
+
 async function connect() {
+  if (connecting) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  const cfg = await config();
-  if (!cfg.token) return; // not provisioned yet — set the token in Options
+  connecting = true;
+  let cfg;
+  try { cfg = await config(); } finally { connecting = false; }
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (!cfg.token) { provisionViaNativeHost("no token"); return; } // not provisioned yet — native host, or paste in Options
+  let sock;
   try {
-    ws = new WebSocket(`ws://127.0.0.1:${cfg.port}`);
+    sock = new WebSocket(`ws://127.0.0.1:${cfg.port}`);
   } catch (e) {
+    provisionViaNativeHost("socket error");
     return;
   }
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "auth", role: "extension", token: cfg.token }));
+  ws = sock;
+  let opened = false;
+  sock.onopen = () => {
+    opened = true;
+    sock.send(JSON.stringify({ type: "auth", role: "extension", token: cfg.token }));
   };
-  ws.onmessage = async (ev) => {
+  sock.onmessage = async (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type !== "command") return;
@@ -53,10 +95,25 @@ async function connect() {
     } catch (e) {
       reply = { type: "response", id: msg.id, ok: false, error: String(e && e.message || e) };
     }
-    try { ws.send(JSON.stringify(reply)); } catch {}
+    try { sock.send(JSON.stringify(reply)); } catch {}
   };
-  ws.onclose = () => { ws = null; setTimeout(connect, 1000); }; // quick reconnect while SW is alive; the alarm is the backstop
-  ws.onerror = () => { try { ws && ws.close(); } catch {} };
+  sock.onclose = () => {
+    // Only the socket we currently own may clear `ws` and schedule a retry.
+    // A superseded socket (the server closes the previous extension socket
+    // when a new one authenticates) must not knock out the live one.
+    if (ws !== sock) return;
+    ws = null;
+    if (!opened) {
+      // Never opened → server is down (or the token is stale). Chrome logs one
+      // ERR_CONNECTION_REFUSED for this attempt; don't add more by retrying
+      // blindly every second — let the native host start the server / refresh
+      // the token (its hello calls connect()), with the 24 s alarm as backstop.
+      provisionViaNativeHost("connect failed");
+      return;
+    }
+    setTimeout(connect, 1000); // server restarted or superseded us: quick reconnect while SW is alive
+  };
+  sock.onerror = () => { try { sock.close(); } catch {} };
 }
 
 chrome.alarms.create("reconnect", { periodInMinutes: 0.4 });
@@ -232,7 +289,7 @@ async function pageRun(tabId, fn, arg, noDebugger) {
     const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: fn, args: [arg] });
     return res && res.result;
   } catch (e) {
-    if (noDebugger) throw e; // stealth: never fall back to the debugger
+    if (noDebugger) throw e; // direct mode: never fall back to the debugger
     await dbgAttach(tabId);
     const r = await dbg(tabId, "Runtime.evaluate", { expression: `(${fn.toString()})(${JSON.stringify(arg)})`, returnByValue: true });
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
@@ -240,32 +297,67 @@ async function pageRun(tabId, fn, arg, noDebugger) {
   }
 }
 
-// ---------- stealth (no-debugger) helpers ----------
+// Chrome allows ~2 captureVisibleTab calls per second for the whole browser
+// (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND). Parallel automations trip that,
+// so direct screenshots go through a FIFO pacer that spaces calls ≥ 520 ms
+// apart — no call is wasted on a guaranteed quota error and callers are served
+// in order. The catch/retry below is only a safety net for edge timing.
+const CAPTURE_GAP_MS = 520;
+let captureQueue = Promise.resolve();
+let lastCaptureAt = 0;
+function pacedCapture(windowId) {
+  const run = async () => {
+    const wait = lastCaptureAt + CAPTURE_GAP_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        lastCaptureAt = Date.now();
+        return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+      } catch (e) {
+        if (!/MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/.test(String(e && e.message || e)) || attempt >= 3) throw e;
+        await new Promise((r) => setTimeout(r, CAPTURE_GAP_MS));
+      }
+    }
+  };
+  const p = captureQueue.then(run, run);
+  captureQueue = p.catch(() => {});
+  return p;
+}
+
+// ---------- direct-mode (no-debugger) helpers ----------
 // All of these use chrome.scripting only — they never attach the debugger, so
-// there is no CDP fingerprint and no banner. Injected functions must be
+// no DevTools session is opened and no banner is shown. Injected functions must be
 // self-contained (no closures over outer variables).
 
-// Evaluate an arbitrary code string in the page's MAIN world. Subject to the
-// page's own CSP (unsafe-eval) — throws on strict-CSP pages, where the caller
-// should drop --stealth and use the debugger path instead.
-async function stealthEval(tabId, code) {
+// Evaluate a user-supplied code string in the page's MAIN world through
+// chrome.userScripts.execute() — the documented API for user-provided code
+// (no eval, no remotely hosted code in the extension context). The user enables
+// it once via "Allow User Scripts" on the extension card (Chrome 138+) or
+// Developer mode (Chrome 135–137). Promises are awaited; the completion value
+// of the script is returned, like Runtime.evaluate.
+const USER_SCRIPTS_HELP = 'User Scripts API is not enabled for AI Browser Bridge: open chrome://extensions, click Details on the extension, turn on "Allow User Scripts" (Chrome 138+) or Developer mode (Chrome 135–137) — or add --debugger for this call';
+async function directEval(tabId, code) {
+  if (!chrome.userScripts || typeof chrome.userScripts.execute !== "function") throw new Error(USER_SCRIPTS_HELP);
+  let results;
   try {
-    const [res] = await chrome.scripting.executeScript({
+    results = await chrome.userScripts.execute({
       target: { tabId },
+      js: [{ code: String(code) }],
       world: "MAIN",
-      func: (c) => Promise.resolve((0, eval)(c)),
-      args: [code],
+      injectImmediately: true,
     });
-    return res && res.result;
   } catch (e) {
-    throw new Error(`stealth eval failed (page CSP may block eval; add --debugger for this page): ${e && e.message || e}`);
+    throw new Error(`direct eval failed: ${e && e.message || e}`);
   }
+  const res = results && results[0];
+  if (res && res.error) throw new Error(`direct eval: ${res.error.message || res.error}`);
+  return res && res.result;
 }
 
 // Run a fixed, self-contained fn(arg) via chrome.scripting (no debugger, no
 // eval — CSP-safe). Default ISOLATED world is enough: page listeners still
 // receive events dispatched here (one shared DOM); only event.isTrusted differs.
-async function stealthRun(tabId, fn, arg) {
+async function directRun(tabId, fn, arg) {
   const [res] = await chrome.scripting.executeScript({
     target: { tabId }, func: fn, args: [arg === undefined ? null : arg],
   });
@@ -275,7 +367,7 @@ async function stealthRun(tabId, fn, arg) {
 // Synthetic click on a selector's element (found + scrolled in-page) or the
 // element at viewport point (x,y). Dispatches the full pointer/mouse sequence
 // plus focus, so page handlers fire as they would for a real click.
-function __stealthClick(o) {
+function __directClick(o) {
   let el, x = o.x, y = o.y;
   if (o.selector) {
     el = document.querySelector(o.selector);
@@ -299,7 +391,7 @@ function __stealthClick(o) {
 
 // Insert text at the caret of the focused element (paste-equivalent), via
 // execCommand then a native-setter + input-event fallback.
-function __stealthInsert(o) {
+function __directInsert(o) {
   const el = document.activeElement;
   if (!el) return { error: "no active element to insert into" };
   const text = o.text || "";
@@ -325,7 +417,7 @@ function __stealthInsert(o) {
 const __KEYCODES = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, " ": 32, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Home: 36, End: 35 };
 
 // Synthetic key press (keydown/keypress/keyup) on the focused element.
-function __stealthKey(o) {
+function __directKey(o) {
   const el = document.activeElement || document.body;
   const key = o.key, code = o.code || key, m = o.modifiers || 0;
   const KC = o.keycodes;
@@ -345,7 +437,7 @@ function __stealthKey(o) {
 
 // Synthetic per-character typing — keydown + value update + input + keyup per
 // char, the sequence autocomplete / React widgets listen for.
-async function __stealthType(o) {
+async function __directType(o) {
   const el = document.activeElement;
   if (!el) return { error: "no active element to type into" };
   try { el.focus && el.focus(); } catch (e) {}
@@ -377,6 +469,13 @@ async function handle(cmd, p) {
   // Record activity so the idle sweep leaves actively-driven tabs attached.
   if (p && p.tabId != null) lastActivity.set(p.tabId, Date.now());
   switch (cmd) {
+    case "reloadExtension":
+      // Reload this extension so an updated extension/ folder takes effect
+      // (same as the reload icon on chrome://extensions). The socket drops;
+      // the new service worker reconnects within a second.
+      setTimeout(() => chrome.runtime.reload(), 50);
+      return { ok: true, reloading: true };
+
     case "ping":
       return { pong: true, version: chrome.runtime.getManifest().version };
 
@@ -433,10 +532,10 @@ async function handle(cmd, p) {
       return { ok: true };
 
     case "eval": {
-      // Runtime.evaluate via debugger: immune to page CSP, returns values.
-      // Stealth: MAIN-world scripting eval instead (no CDP; page CSP applies).
+      // Direct mode: chrome.userScripts.execute in the MAIN world (no CDP).
+      // Debugger mode: Runtime.evaluate (trusted context, works on every page).
       await assertAllowed(p.tabId);
-      if (p.stealth) return await stealthEval(p.tabId, p.code);
+      if (p.direct) return await directEval(p.tabId, p.code);
       await dbgAttach(p.tabId);
       const r = await dbg(p.tabId, "Runtime.evaluate", {
         expression: p.code,
@@ -453,10 +552,10 @@ async function handle(cmd, p) {
     case "click": {
       // Trusted click at viewport coordinates (CSS px), or at a CSS `selector`'s
       // center (resolved in-page — no screenshot/DPR pixel math needed).
-      // Stealth: synthetic pointer/mouse events instead of CDP Input.dispatch*.
+      // Direct mode: synthetic pointer/mouse events instead of CDP Input.dispatch*.
       await assertAllowed(p.tabId);
-      if (p.stealth) {
-        const out = await stealthRun(p.tabId, __stealthClick, { selector: p.selector, x: p.x, y: p.y });
+      if (p.direct) {
+        const out = await directRun(p.tabId, __directClick, { selector: p.selector, x: p.x, y: p.y });
         if (out && out.error) throw new Error(`click: ${out.error}`);
         return out;
       }
@@ -476,10 +575,10 @@ async function handle(cmd, p) {
 
     case "insertText": {
       // Trusted text insertion at the current caret (equivalent of a real paste).
-      // Stealth: execCommand/native-setter insertion instead of CDP Input.insertText.
+      // Direct mode: execCommand/native-setter insertion instead of CDP Input.insertText.
       await assertAllowed(p.tabId);
-      if (p.stealth) {
-        const out = await stealthRun(p.tabId, __stealthInsert, { text: p.text });
+      if (p.direct) {
+        const out = await directRun(p.tabId, __directInsert, { text: p.text });
         if (out && out.error) throw new Error(`insertText: ${out.error}`);
         return out;
       }
@@ -493,12 +592,12 @@ async function handle(cmd, p) {
       // Optional `commands` (e.g. ["paste"], ["selectAll"]) run the matching
       // editing command with the keyDown, so shortcuts like Cmd/Ctrl+V trigger
       // the browser's native paste instead of just delivering the raw key.
-      // Stealth: synthetic KeyboardEvents (keyCode/which set for legacy handlers)
+      // Direct mode: synthetic KeyboardEvents (keyCode/which set for legacy handlers)
       // instead of CDP Input.dispatchKeyEvent. `commands` (native editing ops)
-      // are CDP-only and are ignored in stealth.
+      // are CDP-only and are ignored in direct mode.
       await assertAllowed(p.tabId);
-      if (p.stealth) {
-        return await stealthRun(p.tabId, __stealthKey,
+      if (p.direct) {
+        return await directRun(p.tabId, __directKey,
           { key: p.key, code: p.code, modifiers: p.modifiers || 0, keycodes: __KEYCODES });
       }
       await dbgAttach(p.tabId);
@@ -520,12 +619,12 @@ async function handle(cmd, p) {
 
     case "screenshot": {
       await assertAllowed(p.tabId);
-      if (p.stealth) {
+      if (p.direct) {
         // No CDP: fall back to captureVisibleTab, which only shoots the ACTIVE
         // tab of its window. Background-tab capture is a CDP-only capability.
         const tab = await chrome.tabs.get(p.tabId);
-        if (!tab.active) throw new Error("stealth screenshot: tab must be active in its window (captureVisibleTab limitation) — call selectTab first, or add --debugger");
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+        if (!tab.active) throw new Error("direct screenshot: tab must be active in its window (captureVisibleTab limitation) — call selectTab first, or add --debugger");
+        const dataUrl = await pacedCapture(tab.windowId);
         return { base64: (dataUrl.split(",")[1]) || "" };
       }
       await dbgAttach(p.tabId);
@@ -535,7 +634,7 @@ async function handle(cmd, p) {
 
     case "pdf": {
       await assertAllowed(p.tabId);
-      if (p.stealth) throw new Error("stealth pdf: Page.printToPDF is CDP-only — add --debugger for this command");
+      if (p.direct) throw new Error("direct pdf: Page.printToPDF is CDP-only — add --debugger for this command");
       await dbgAttach(p.tabId);
       const r = await dbg(p.tabId, "Page.printToPDF", {
         printBackground: true,
@@ -580,10 +679,10 @@ async function handle(cmd, p) {
     case "type": {
       // Real per-character keystrokes — what autocomplete / React widgets listen
       // for, where insertText (a paste) is silently ignored.
-      // Stealth: synthetic per-char keydown/input/keyup instead of CDP.
+      // Direct mode: synthetic per-char keydown/input/keyup instead of CDP.
       await assertAllowed(p.tabId);
-      if (p.stealth) {
-        const out = await stealthRun(p.tabId, __stealthType, { text: p.text, delay: p.delay || 0 });
+      if (p.direct) {
+        const out = await directRun(p.tabId, __directType, { text: p.text, delay: p.delay || 0 });
         if (out && out.error) throw new Error(`type: ${out.error}`);
         return out;
       }
@@ -608,7 +707,7 @@ async function handle(cmd, p) {
         if (o.top) { window.scrollTo(0, 0); return { ok: true, y: 0 }; }
         if (o.bottom) { window.scrollTo(0, document.body.scrollHeight); return { ok: true, y: window.scrollY }; }
         window.scrollBy(o.dx || 0, o.dy || 0); return { ok: true, x: window.scrollX, y: window.scrollY };
-      }, { selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom }, p.stealth);
+      }, { selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom }, p.direct);
       if (out && out.error) throw new Error(`scroll: ${out.error}`);
       return out || { ok: true };
     }
@@ -624,15 +723,15 @@ async function handle(cmd, p) {
       while (Date.now() < start + timeout) {
         let ok = false;
         if (p.code) {
-          if (p.stealth) {
-            ok = !!(await stealthEval(p.tabId, `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`));
+          if (p.direct) {
+            ok = !!(await directEval(p.tabId, `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`));
           } else {
             await dbgAttach(p.tabId);
             const r = await dbg(p.tabId, "Runtime.evaluate", { expression: `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, returnByValue: true });
             ok = !!(r.result && r.result.value);
           }
         } else {
-          ok = !!(await pageRun(p.tabId, (sel) => !!document.querySelector(sel), p.selector || "", p.stealth));
+          ok = !!(await pageRun(p.tabId, (sel) => !!document.querySelector(sel), p.selector || "", p.direct));
         }
         if (ok) return { ok: true, waitedMs: Date.now() - start };
         await new Promise((r) => setTimeout(r, poll));
@@ -642,7 +741,7 @@ async function handle(cmd, p) {
 
     case "status": {
       const cfg = await config();
-      return { version: chrome.runtime.getManifest().version, attachedTabs: [...attached], indicator: cfg.indicator, idleDetachMs: cfg.idleDetachMs };
+      return { version: chrome.runtime.getManifest().version, extensionId: chrome.runtime.id, attachedTabs: [...attached], indicator: cfg.indicator, idleDetachMs: cfg.idleDetachMs, provisionedBy: cfg.provisionedBy || "manual" };
     }
 
     default:

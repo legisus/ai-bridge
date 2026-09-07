@@ -9,23 +9,9 @@
 
 const { WebSocketServer } = require("ws");
 const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const crypto = require("crypto");
+const { TOKEN_FILE, LOG_FILE, ensureToken } = require("./token");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
-const DIR = path.join(os.homedir(), ".ai-browser-bridge");
-const TOKEN_FILE = path.join(DIR, "token");
-const LOG_FILE = path.join(DIR, "bridge.log");
-
-function ensureToken() {
-  if (!fs.existsSync(DIR)) fs.mkdirSync(DIR, { mode: 0o700 });
-  if (!fs.existsSync(TOKEN_FILE)) {
-    fs.writeFileSync(TOKEN_FILE, crypto.randomBytes(24).toString("hex"), { mode: 0o600 });
-    console.log(`[bridge] token generated at ${TOKEN_FILE} — paste it into the extension's Options page`);
-  }
-  return fs.readFileSync(TOKEN_FILE, "utf8").trim();
-}
 
 function log(line) {
   const entry = `${new Date().toISOString()} ${line}\n`;
@@ -33,7 +19,8 @@ function log(line) {
   console.log(`[bridge] ${line}`);
 }
 
-const TOKEN = ensureToken();
+const { token: TOKEN, created } = ensureToken();
+if (created) console.log(`[bridge] token generated at ${TOKEN_FILE} — the extension picks it up via the native host (npm run register-host), or paste it into Options`);
 
 let extension = null;                 // the single extension socket
 const pending = new Map();            // request id -> cli socket

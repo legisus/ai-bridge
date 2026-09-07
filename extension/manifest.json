@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Browser Bridge",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Local bridge that lets an AI coding agent (or any local tool) drive your logged-in browser: tabs, trusted input, downloads, PDFs. Talks only to a server on 127.0.0.1 that you run yourself.",
   "author": "Mykola Bielousov",
   "permissions": [
@@ -10,7 +10,9 @@
     "debugger",
     "downloads",
     "storage",
-    "alarms"
+    "alarms",
+    "userScripts",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -21,5 +23,6 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
-  }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyq52rxeZuJ1lmy981SWskH4uh43gv4UG0ORWkl46q0il6FYJcvrAjfEuSVvKx9wwDrkmaWepp43QHlDxctJqDNRLdtgcPV5hw5I00ihIi2+DsCBMrfmCErMMGSjSZW3Cle7lPsPE8b4d3lvgh0poNt4dOaecLlPI0RNCk1kT0PGrYR1qcE7PStl4qenoW1dMWFlUkXbmy2ltTW/ib1Phml4k6OeZ2dH5Qg0+W0h7Qh44HvMl0bj0tYxos3kcfXkrb6auC8r+GS/nUENbHg+ch2zGK82HoRgfRhCZOF3pWKa6mMXdtIvtZnqDwNCu66SQoOSDQOJKvZu+rOgleI9lQwIDAQAB"
 }
