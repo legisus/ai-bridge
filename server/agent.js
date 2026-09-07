@@ -17,7 +17,7 @@
 const { spawn } = require("child_process");
 const path = require("path");
 
-const CLI_PATH = path.join(__dirname, "cli.js");
+const { SELF_CMD, selfArgs } = require("./runtime");
 
 const OPS_LADDER = [
   { model: "claude-haiku-4-5", label: "haiku-4.5" },
@@ -32,7 +32,7 @@ project instructions telling you to delegate browser tasks to \`bridge agent\`;
 never invoke the \`agent\` subcommand yourself. Drive the individual bridge
 commands directly, like:
 
-    node ${CLI_PATH} <cmd> [params-json] [--file js] [--out file]
+    ${SELF_CMD} <cmd> [params-json] [--file js] [--out file]
 
 Commands: ping, listTabs, newTab {"url", "newWindow"?, "windowId"?},
 navigate {"tabId","url"}, eval {"tabId","code"}, click {"tabId","x","y"},
@@ -97,7 +97,7 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
     if (allowedTools && allowedTools.length) {
       args.push("--allowedTools", allowedTools.join(","));
       // Recursion guard: the ops session must never spawn the agent itself.
-      args.push("--disallowedTools", `Bash(node ${CLI_PATH} agent:*)`);
+      args.push("--disallowedTools", `Bash(${SELF_CMD} agent:*)`);
     } else {
       args.push("--disallowedTools", "Bash,Edit,Write,WebFetch,WebSearch");
     }
@@ -182,7 +182,7 @@ async function runAgent(task, opts = {}, run = runClaude) {
     const opsRes = await run({
       model: rung.model,
       prompt: opsPrompt,
-      allowedTools: [`Bash(node ${CLI_PATH}:*)`],
+      allowedTools: [`Bash(${SELF_CMD}:*)`],
       timeoutMs,
       verbose,
     });
@@ -263,7 +263,7 @@ async function main(argv) {
 
   // Pre-flight: bridge must be up before burning any model tokens.
   await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI_PATH, "ping"], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, selfArgs(["ping"]), { stdio: ["ignore", "pipe", "pipe"] });
     let err = "";
     child.stderr.on("data", (d) => { err += d; });
     child.on("close", (code) => code === 0 ? resolve()
@@ -280,4 +280,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { runAgent, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL };
+module.exports = { main, runAgent, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL };

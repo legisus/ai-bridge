@@ -19,6 +19,7 @@ function log(line) {
   console.log(`[bridge] ${line}`);
 }
 
+function start() {
 const { token: TOKEN, created } = ensureToken();
 if (created) console.log(`[bridge] token generated at ${TOKEN_FILE} — the extension picks it up via the native host (npm run register-host), or paste it into Options`);
 
@@ -75,3 +76,7 @@ wss.on("connection", (sock) => {
 });
 
 log(`listening on ws://127.0.0.1:${PORT}`);
+}
+
+if (require.main === module) start();
+module.exports = { start };

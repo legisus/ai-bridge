@@ -19,9 +19,21 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
-const TOKEN = fs.readFileSync(require("./token").TOKEN_FILE, "utf8").trim();
+const { TOKEN_FILE } = require("./token");
 
-const argv = process.argv.slice(2);
+// Read lazily so usage/help work before the server ever ran, and a missing
+// token is a one-line explanation instead of a stack trace.
+function readToken() {
+  try { return fs.readFileSync(TOKEN_FILE, "utf8").trim(); }
+  catch {
+    console.error(`ERROR: no token at ${TOKEN_FILE} — start the server once (npm start / ai-bridge serve) or register the native host and reload the extension; it creates the token.`);
+    process.exit(6);
+  }
+}
+
+const { SELF_CMD } = require("./runtime");
+
+function main(argv) {
 if (argv.length === 0) {
   console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms] [--debugger]");
   console.error('       bridge agent "task description" [--timeout ms] [--verbose]');
@@ -39,9 +51,7 @@ if (argv.length === 0) {
 
 // `bridge agent "task"` — token-saver agent: cheap models operate, Fable judges.
 if (argv[0] === "agent") {
-  const { spawn } = require("child_process");
-  spawn(process.execPath, [path.join(__dirname, "agent.js"), ...argv.slice(1)], { stdio: "inherit" })
-    .on("close", (code) => process.exit(code));
+  require("./agent").main(argv.slice(1)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
   return;
 }
 
@@ -95,6 +105,7 @@ async function resolveMode() {
 }
 
 function send() {
+  const TOKEN = readToken();
   const id = crypto.randomBytes(8).toString("hex");
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
   const timer = setTimeout(() => { console.error("timeout"); process.exit(3); }, flags.timeout || 60000);
@@ -128,3 +139,7 @@ function send() {
 }
 
 resolveMode().then(send);
+}
+
+if (require.main === module) main(process.argv.slice(2));
+module.exports = { main };

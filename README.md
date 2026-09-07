@@ -63,7 +63,13 @@ aliases of the default and of `--debugger`.)
 ## Install
 
 Short version (full first-time walkthrough with troubleshooting, background
-service templates and Windows notes: **[docs/INSTALL.md](docs/INSTALL.md)**):
+service templates and Windows notes: **[docs/INSTALL.md](docs/INSTALL.md)**).
+On a Mac, the easiest path is the **menu-bar app**: download the `.dmg` from the
+[releases](https://github.com/legisus/ai-bridge/releases), drag to Applications,
+open — it registers the native host, starts the server and guides you through
+adding the extension ([details](docs/INSTALL.md#macos-app)). No Node.js? The
+single-file `ai-bridge` binary (server, native host and CLI in one executable) is
+on the same page: [Binary install](docs/INSTALL.md#binary-install-no-nodejs).
 
 1. **Server** (Node ≥ 18):
    ```bash
@@ -220,10 +226,13 @@ npm test    # spins up the server, a simulated extension, and the real CLI; asse
 ```
 extension/    Manifest V3 extension (service worker + options page)
 server/       relay server (server.js), CLI client (cli.js), token-saver agent (agent.js),
-              native messaging host (native-host.js) + its registrar (register-native-host.js)
+              native messaging host (native-host.js) + its registrar (register-native-host.js),
+              main.js = dispatcher for the single-executable build
+scripts/      build-sea.js — Node SEA build of the `ai-bridge` binary (npm run build:sea)
+macos/        menu-bar app (Swift/AppKit) + build-app.sh → .app and .dmg (npm run build:mac)
 deploy/       launchd / systemd templates to run the server as a background service
 docs/         INSTALL.md (first-time setup) and CLAUDE-CODE.md (Claude Code integration)
-test/         protocol round-trip, agent ladder, and native-host tests
+test/         protocol round-trip, agent ladder, native-host and binary tests
 ```
 
 ## Contributing

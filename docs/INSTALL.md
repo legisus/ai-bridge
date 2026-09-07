@@ -5,6 +5,20 @@ assumes no prior knowledge of the project. Read the
 [security model](../README.md#security-model) first: once installed, the
 extension can act as *you* on any site you are logged into.
 
+## Three ways to install
+
+- **macOS app (easiest)** — download `AI-Browser-Bridge-<version>-arm64.dmg`
+  from the [latest release](https://github.com/legisus/ai-bridge/releases/latest),
+  drag the app to Applications, open it. A menu-bar icon appears; it registers
+  the native host, starts the server, and its **Add to Chrome…** item walks you
+  through the extension. See [macOS app](#macos-app) at the end of this guide.
+- **Binary (no Node.js needed)** — one file, `ai-bridge`, that contains the
+  server, the native host and the CLI. See [Binary install](#binary-install-no-nodejs)
+  at the end of this guide. Attached to each
+  [release](https://github.com/legisus/ai-bridge/releases) for macOS Apple
+  Silicon; other platforms are built from source with `npm run build:sea`.
+- **From source** — the steps below. Needs Node.js 18+ and git.
+
 ## 0. Prerequisites
 
 - **Node.js 18 or newer** and **git**. Check with `node -v`.
@@ -101,7 +115,7 @@ If you get an error instead:
 |---|---|---|
 | `connect failed` | The server is not running. | Go back to step 2. |
 | `extension not connected` | Token not saved, wrong, or the service worker is asleep. | With the native host: press the reload icon on the extension card, wait 5 s, retry. Manual: re-check Options and press *Save*, wait 30 s, retry. |
-| `ENOENT … token` | The CLI cannot find the token file. | Run the server once (step 2) on this machine. |
+| `no token at …` | The server never ran on this machine, so no token exists. | Run the server once (step 2), or register the host and reload the extension. |
 | `User Scripts API is not enabled` | `eval` ran but the toggle from step 5 is off. | Details → **Allow User Scripts**, then retry. |
 
 ## 7. Keep the server running
@@ -195,3 +209,80 @@ node server/cli.js ping
 3. Stop and remove the service if you installed one (launchd: `launchctl unload …`
    and delete the plist; systemd: `systemctl --user disable --now ai-bridge`).
 4. Delete `~/.ai-browser-bridge/` (token, log, native-host wrapper) and the clone.
+
+## Binary install (no Node.js)
+
+The single-executable build bundles Node, the relay server, the native host and
+the CLI into one file. Nothing else to install.
+
+1. Download `ai-bridge-<platform>-<arch>` from the
+   [latest release](https://github.com/legisus/ai-bridge/releases/latest) and put
+   it somewhere permanent, for example:
+   ```bash
+   mkdir -p ~/.ai-browser-bridge/bin
+   mv ~/Downloads/ai-bridge-darwin-arm64 ~/.ai-browser-bridge/bin/ai-bridge
+   chmod +x ~/.ai-browser-bridge/bin/ai-bridge
+   ```
+   On macOS the first launch of an unsigned download is blocked by Gatekeeper.
+   Until releases are notarized, clear the quarantine flag once:
+   ```bash
+   xattr -d com.apple.quarantine ~/.ai-browser-bridge/bin/ai-bridge
+   ```
+2. Register the native host. The binary registers *itself* as the host, so keep
+   it at this path (re-run this after moving it):
+   ```bash
+   ~/.ai-browser-bridge/bin/ai-bridge register-host
+   ```
+3. Load the extension (step 4 above) and turn on **Allow User Scripts** (step 5).
+   You still need the `extension/` folder from the repository until the
+   extension is on the Chrome Web Store: download the source zip from the same
+   release page and unzip it somewhere permanent.
+4. Smoke test:
+   ```bash
+   ~/.ai-browser-bridge/bin/ai-bridge ping
+   # {"pong":true,"version":"0.1.10"}
+   ```
+   If it says `extension not connected`, reload the extension once; it asks the
+   host for the token and the host starts the server.
+
+Everything in this guide that says `node server/cli.js …` is `ai-bridge …` with
+the binary, including `ai-bridge agent "…"`. Subcommands reserved by the binary:
+`serve` (run the relay in the foreground), `host` (native host mode, what Chrome
+invokes), `register-host`.
+
+To build the binary yourself on another platform:
+```bash
+npm install && npm run build:sea      # → dist/ai-bridge-<platform>-<arch>
+npm test                              # includes the binary test once dist/ exists
+```
+
+## macOS app
+
+`AI Browser Bridge.app` is a menu-bar app wrapped around the same `ai-bridge`
+binary (inside the app at `Contents/MacOS/ai-bridge`) plus a copy of the
+extension folder. It has no Dock icon and no window, only a menu:
+
+- **Status line** — Connected / Server not running / Extension not connected,
+  refreshed every 5 seconds.
+- **Add to Chrome…** — opens the Chrome Web Store page once the extension is
+  published. Until then it opens `chrome://extensions`, reveals the bundled
+  extension folder in Finder, and shows the three Load-unpacked steps.
+- **Open Extension Options**, **Set up native host again** (forces
+  re-registration; on first launch the app registers only if nothing valid is
+  registered yet, so it never clobbers a source install).
+- **Copy CLI path** and **Copy CLAUDE.md snippet** — paste the snippet into
+  `~/.claude/CLAUDE.md` to teach Claude Code about the bridge.
+- **Open log**, **Start at login**, **Quit**.
+
+Install: open the `.dmg`, drag the app to **Applications**, eject, open the app
+from Applications. If you open it from the disk image it refuses and tells you
+to move it first, because the native host manifest must point at a permanent
+path. Until releases are notarized, macOS will say the app "cannot be opened
+because the developer cannot be verified": right-click the app → **Open** →
+**Open**, once.
+
+Build it yourself (needs the Xcode Command Line Tools):
+```bash
+npm run build:mac        # → dist/macos/AI Browser Bridge.app and the .dmg
+AI_BRIDGE_STORE_URL="https://chromewebstore.google.com/detail/<id>" npm run build:mac   # once published
+```

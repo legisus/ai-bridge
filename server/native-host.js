@@ -16,12 +16,11 @@
 
 const fs = require("fs");
 const net = require("net");
-const path = require("path");
 const { spawn } = require("child_process");
 const { LOG_FILE, SERVER_OUT, ensureToken } = require("./token");
+const { serverArgs } = require("./runtime");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
-const SERVER = path.join(__dirname, "server.js");
 const VERSION = require("../package.json").version;
 
 function log(line) {
@@ -63,7 +62,7 @@ function isListening(port) {
 async function ensureServer() {
   if (await isListening(PORT)) return { started: false, pid: null };
   const out = fs.openSync(SERVER_OUT, "a");
-  const child = spawn(process.execPath, [SERVER], {
+  const child = spawn(process.execPath, serverArgs(), {
     detached: true,
     stdio: ["ignore", out, out],
     env: { ...process.env, BRIDGE_PORT: String(PORT) },
@@ -96,7 +95,12 @@ async function hello() {
   }
 }
 
-process.stdin.on("data", onData);
-process.stdin.on("end", () => process.exit(0));
-process.stdin.on("close", () => process.exit(0));
-hello(); // Chrome opens the port; we speak first so the extension needs no request.
+function main() {
+  process.stdin.on("data", onData);
+  process.stdin.on("end", () => process.exit(0));
+  process.stdin.on("close", () => process.exit(0));
+  hello(); // Chrome opens the port; we speak first so the extension needs no request.
+}
+
+if (require.main === module) main();
+module.exports = { main };

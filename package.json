@@ -11,8 +11,10 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "node test/protocol.test.js && node test/agent.test.js && node test/native-host.test.js",
-    "register-host": "node server/register-native-host.js"
+    "test": "node test/protocol.test.js && node test/agent.test.js && node test/native-host.test.js && node test/sea.test.js",
+    "register-host": "node server/register-native-host.js",
+    "build:sea": "node scripts/build-sea.js",
+    "build:mac": "bash macos/build-app.sh"
   },
   "dependencies": {
     "ws": "^8.18.0"
@@ -27,5 +29,9 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
   }
 }

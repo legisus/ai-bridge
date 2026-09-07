@@ -15,19 +15,24 @@ const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
+const { isSea } = require("./runtime");
+
 const HOST_NAME = "com.ai_bridge.host";
-const ROOT = path.resolve(__dirname, "..");
-const DEFAULT_ID = fs.readFileSync(path.join(ROOT, "extension", "EXTENSION_ID"), "utf8").trim();
+// The single-executable build embeds the id at build time (__EXTENSION_ID__,
+// see scripts/build-sea.js); from source it is read from the repo.
+const DEFAULT_ID = typeof __EXTENSION_ID__ !== "undefined" ? __EXTENSION_ID__
+  : fs.readFileSync(path.join(__dirname, "..", "extension", "EXTENSION_ID"), "utf8").trim();
 const STATE_DIR = process.env.AI_BRIDGE_HOME || path.join(os.homedir(), ".ai-browser-bridge");
 
-const argv = process.argv.slice(2);
-const ids = [DEFAULT_ID];
-let unregister = false, printOnly = false;
-for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === "--extension-id") ids.push(argv[++i]);
-  else if (argv[i] === "--unregister") unregister = true;
-  else if (argv[i] === "--print") printOnly = true;
-  else { console.error(`unknown flag ${argv[i]}`); process.exit(2); }
+let ids, unregister, printOnly;
+function parse(argv) {
+  ids = [DEFAULT_ID]; unregister = false; printOnly = false;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--extension-id") ids.push(argv[++i]);
+    else if (argv[i] === "--unregister") unregister = true;
+    else if (argv[i] === "--print") printOnly = true;
+    else { console.error(`unknown flag ${argv[i]}`); process.exit(2); }
+  }
 }
 
 // Where each Chromium-based browser looks for user-level host manifests.
@@ -69,9 +74,16 @@ function nodePath() {
   return process.execPath;
 }
 
-// The manifest's "path" must be an executable. Wrap node + the host script so
+// The manifest's "path" must be an executable that Chrome can run with no
+// arguments of ours (it passes only the caller's origin). The single-executable
+// build IS that executable — it enters host mode when argv[2] is a
+// chrome-extension:// origin. From source, wrap node + the host script so
 // Chrome's minimal environment (no PATH lookups) still finds the right node.
+function hostExecutablePath() {
+  return path.join(STATE_DIR, process.platform === "win32" ? "native-host.cmd" : "native-host.sh");
+}
 function writeWrapper() {
+  if (isSea) return process.execPath;
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   const host = path.join(__dirname, "native-host.js");
   if (process.platform === "win32") {
@@ -94,8 +106,9 @@ function manifestJson(wrapper) {
   }, null, 2) + "\n";
 }
 
-function main() {
-  if (printOnly) { console.log(manifestJson(path.join(STATE_DIR, process.platform === "win32" ? "native-host.cmd" : "native-host.sh"))); return; }
+function main(argv) {
+  parse(argv || []);
+  if (printOnly) { console.log(manifestJson(isSea ? process.execPath : hostExecutablePath())); return; }
   const wrapper = unregister ? null : writeWrapper();
   const json = unregister ? null : manifestJson(wrapper);
 
@@ -135,10 +148,11 @@ function main() {
     done++;
   }
   if (!unregister) {
-    console.log(`host executable: ${wrapper}`);
+    console.log(`host executable: ${wrapper}${isSea ? "  (this binary — keep it at this path, or re-run register-host after moving it)" : ""}`);
     console.log(`allowed extension ids: ${ids.join(", ")}`);
     console.log("Now (re)load the extension at chrome://extensions — it will fetch the token by itself.");
   } else if (!done) console.log("nothing to remove");
 }
 
-main();
+if (require.main === module) main(process.argv.slice(2));
+module.exports = { main };
