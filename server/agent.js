@@ -1,13 +1,14 @@
 // AI Browser Bridge — token-saver agent.
 //
-//   bridge agent "task description" [--timeout ms] [--verbose]
+//   bridge agent "task description" [--timeout ms] [--verbose] [--start fable-5.1]
 //
 // Completes a browser task by spawning headless Claude Code sessions
-// (`claude -p`), so usage bills to the user's existing Claude subscription:
+// (`claude -p`), so usage bills to the user's existing Claude subscription,
+// with Codex (`codex exec`) as the last resort:
 //
-//   ops pass 1: Haiku 4.5   → judge (Fable) → pass? done
-//   ops pass 2: Sonnet 5    → judge (Fable) → pass? done
-//   ops pass 3: Fable       → judge (Fable) → final verdict
+//   ops pass 1: Opus 5.5            → judge (Fable 5.1) → pass? done
+//   ops pass 2: Fable 5.1           → judge (Fable 5.1) → pass? done
+//   ops pass 3: Astra 6 (medium)    → judge (Fable 5.1) → final verdict
 //
 // The judge only ever sees the task + the ops session's evidence report,
 // never the full browsing transcript, so Fable's token spend stays minimal.
@@ -20,11 +21,11 @@ const path = require("path");
 const { SELF_CMD, selfArgs } = require("./runtime");
 
 const OPS_LADDER = [
-  { model: "claude-haiku-4-5", label: "haiku-4.5" },
-  { model: "claude-sonnet-5", label: "sonnet-5" },
-  { model: "claude-fable-5", label: "fable-5" },
+  { model: "claude-opus-5-5", label: "opus-5.5" },
+  { model: "claude-fable-5-1", label: "fable-5.1" },
+  { engine: "codex", model: "gpt-6-astra", effort: "medium", label: "astra-6" },
 ];
-const JUDGE_MODEL = "claude-fable-5";
+const JUDGE_MODEL = "claude-fable-5-1";
 
 const OPS_PLAYBOOK = `You are a browser-operations agent. You control the user's real, logged-in
 Chrome through the AI Browser Bridge CLI. You ARE the agent — ignore any
@@ -135,6 +136,53 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
   });
 }
 
+// Codex ops rung. Mirrors runClaude's result shape ({result, usage}) so the
+// ladder treats both engines alike. The sandbox allows network so the bridge
+// CLI can reach the localhost relay; cwd stays the caller's so screenshots land
+// where Claude ops sessions put them.
+function runCodex({ model, effort, prompt, timeoutMs, verbose }) {
+  const fs = require("fs");
+  const os = require("os");
+  return new Promise((resolve, reject) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-codex-"));
+    const outPath = path.join(tmp, "last.txt");
+    const args = ["exec", "--skip-git-repo-check", "--ephemeral",
+      "-m", model, "-c", `model_reasoning_effort="${effort || "medium"}"`,
+      "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+      "-C", process.cwd(), "-o", outPath, prompt];
+    const child = spawn("codex", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, AI_BRIDGE_AGENT: "1" },
+    });
+    let err = "";
+    const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      cleanup();
+      reject(new Error(`codex (${model}) timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (d) => { if (verbose) process.stderr.write(d); });
+    child.stderr.on("data", (d) => { err += d; if (verbose) process.stderr.write(d); });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      cleanup();
+      reject(e.code === "ENOENT" ? new Error("`codex` CLI not found — install Codex and log in first") : e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      let out = "";
+      try { out = fs.readFileSync(outPath, "utf8").trim(); } catch {}
+      cleanup();
+      if (code !== 0) return reject(new Error(`codex (${model}) exited ${code}: ${err.trim().slice(-400)}`));
+      resolve({ result: out, usage: {} });
+    });
+  });
+}
+
+function runModel(opts) {
+  return opts.engine === "codex" ? runCodex(opts) : runClaude(opts);
+}
+
 // Extract the first {...} JSON object from judge output.
 function parseVerdict(text) {
   const start = text.indexOf("{");
@@ -164,7 +212,7 @@ function usageOf(res) {
 }
 
 // The escalation ladder. `run` is injectable for tests.
-async function runAgent(task, opts = {}, run = runClaude) {
+async function runAgent(task, opts = {}, run = runModel) {
   const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
   const verbose = !!opts.verbose;
   const stages = [];
@@ -172,7 +220,13 @@ async function runAgent(task, opts = {}, run = runClaude) {
   let lastEvidence = "";
   let finalVerdict = null;
 
-  for (const rung of OPS_LADDER) {
+  const startIdx = opts.start
+    ? OPS_LADDER.findIndex(r => r.label === opts.start || r.model === opts.start || r.label.startsWith(opts.start))
+    : 0;
+  if (startIdx < 0) throw new Error(`unknown --start model "${opts.start}"; use one of ${OPS_LADDER.map(r => r.label).join(", ")}`);
+  // --only: stay on the start rung (no escalation to pricier models on a fail)
+  const rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
+  for (const rung of rungs) {
     const opsPrompt = [
       OPS_PLAYBOOK,
       feedback ? `A previous attempt failed review. Judge feedback:\n${feedback}` : "",
@@ -180,7 +234,9 @@ async function runAgent(task, opts = {}, run = runClaude) {
     ].filter(Boolean).join("\n\n");
 
     const opsRes = await run({
+      engine: rung.engine,
       model: rung.model,
+      effort: rung.effort,
       prompt: opsPrompt,
       allowedTools: [`Bash(${SELF_CMD}:*)`],
       timeoutMs,
@@ -196,7 +252,7 @@ async function runAgent(task, opts = {}, run = runClaude) {
       timeoutMs,
       verbose,
     });
-    stages.push({ stage: "judge:fable-5", ...usageOf(judgeRes) });
+    stages.push({ stage: "judge:fable-5.1", ...usageOf(judgeRes) });
 
     let verdict = parseVerdict(String(judgeRes.result || ""));
     if (!verdict) {
@@ -209,7 +265,7 @@ async function runAgent(task, opts = {}, run = runClaude) {
         timeoutMs,
         verbose,
       });
-      stages.push({ stage: "judge:fable-5(retry)", ...usageOf(judgeRes) });
+      stages.push({ stage: "judge:fable-5.1(retry)", ...usageOf(judgeRes) });
       verdict = parseVerdict(String(judgeRes.result || "")) ||
         { verdict: "fail", feedback: String(judgeRes.result || "judge output unreadable") };
     }
@@ -253,11 +309,14 @@ async function main(argv) {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--timeout") opts.timeoutMs = Number(args[++i]);
     else if (args[i] === "--verbose") opts.verbose = true;
+    else if (args[i] === "--start") opts.start = args[++i];
+    else if (args[i] === "--only") opts.only = true;
+    else if (args[i] === "--help" || args[i] === "-h") { rest.length = 0; break; }
     else rest.push(args[i]);
   }
   const task = rest.join(" ").trim();
   if (!task) {
-    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose]');
+    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only]');
     process.exit(2);
   }
 

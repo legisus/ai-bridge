@@ -16,8 +16,8 @@ const assert = (cond, name) => {
 function mockRun(judgeVerdicts) {
   const calls = [];
   let judgeIdx = 0;
-  const run = async ({ model, prompt }) => {
-    calls.push({ model, prompt });
+  const run = async ({ engine, model, effort, prompt }) => {
+    calls.push({ engine, model, effort, prompt });
     if (model === JUDGE_MODEL && prompt.includes("strict verifier")) {
       const v = judgeVerdicts[judgeIdx++];
       return { result: v, usage: { input_tokens: 100, output_tokens: 20 }, total_cost_usd: 0.01 };
@@ -45,26 +45,26 @@ function mockRun(judgeVerdicts) {
   assert(extractEvidence("no marker at all") === "no marker at all",
     "extractEvidence: falls back to full text");
 
-  // 3) first-pass success: haiku ops + one judge call, no escalation
+  // 3) first-pass success: opus ops + one judge call, no escalation
   {
     const m = mockRun(['{"verdict":"pass","feedback":"done"}']);
     const r = await runAgent("test task", {}, m.run);
     assert(r.verdict.verdict === "pass", "ladder: pass on first rung");
-    assert(m.calls.length === 2, "ladder: exactly 2 calls (haiku ops + judge)");
-    assert(m.calls[0].model === "claude-haiku-4-5", "ladder: first ops model is haiku");
+    assert(m.calls.length === 2, "ladder: exactly 2 calls (opus ops + judge)");
+    assert(m.calls[0].model === "claude-opus-5-5", "ladder: first ops model is opus 5.5");
     assert(m.calls[1].model === JUDGE_MODEL, "ladder: judge is fable");
   }
 
-  // 4) escalation: haiku fails -> sonnet passes; feedback forwarded
+  // 4) escalation: opus fails -> fable passes; feedback forwarded
   {
     const m = mockRun(['{"verdict":"fail","feedback":"wrong tab"}', '{"verdict":"pass","feedback":"ok"}']);
     const r = await runAgent("test task", {}, m.run);
     assert(r.verdict.verdict === "pass", "escalation: pass on second rung");
-    assert(m.calls[2].model === "claude-sonnet-5", "escalation: second ops model is sonnet");
+    assert(m.calls[2].model === "claude-fable-5-1", "escalation: second ops model is fable 5.1");
     assert(m.calls[2].prompt.includes("wrong tab"), "escalation: judge feedback forwarded to retry");
   }
 
-  // 5) full ladder exhausted: all three fail -> final verdict fail, fable was last ops rung
+  // 5) full ladder exhausted: all three fail -> final verdict fail, codex astra was last ops rung
   {
     const m = mockRun([
       '{"verdict":"fail","feedback":"a"}',
@@ -75,14 +75,16 @@ function mockRun(judgeVerdicts) {
     assert(r.verdict.verdict === "fail", "exhausted: final verdict is fail");
     const opsModels = m.calls.filter((c) => !c.prompt.includes("strict verifier")).map((c) => c.model);
     assert(JSON.stringify(opsModels) === JSON.stringify(OPS_LADDER.map((r2) => r2.model)),
-      "exhausted: ops models ran in ladder order haiku->sonnet->fable");
+      "exhausted: ops models ran in ladder order opus->fable->astra");
+    const last = m.calls.filter((c) => !c.prompt.includes("strict verifier")).pop();
+    assert(last.engine === "codex" && last.effort === "medium", "exhausted: last rung is codex at medium effort");
   }
 
   // 6) malformed judge JSON: one re-ask, then treated as fail
   {
     const m = mockRun(["not json at all", "still not json", '{"verdict":"pass","feedback":"ok"}']);
     const r = await runAgent("test task", {}, m.run);
-    // first judge call garbage -> retry also garbage -> fail -> escalate to sonnet -> judge passes
+    // first judge call garbage -> retry also garbage -> fail -> escalate to fable -> judge passes
     assert(r.verdict.verdict === "pass", "malformed judge: recovers via escalation");
     const judgeCalls = m.calls.filter((c) => c.prompt.includes("strict verifier"));
     assert(judgeCalls[1].prompt.includes("not valid JSON"), "malformed judge: re-ask prompt sent");
