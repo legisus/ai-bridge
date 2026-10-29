@@ -36,9 +36,20 @@ troubleshooting and background-service templates. The short version:
 
 ## Teach Claude Code about the bridge
 
-Add a section like this to the `CLAUDE.md` of any project where you want Claude Code
-to use the browser (or to `~/.claude/CLAUDE.md` to enable it everywhere). Adjust the
-path to where you cloned the repo.
+The quick way — one command appends the block below to `~/.claude/CLAUDE.md` with
+your machine's CLI path already filled in, and does nothing if the block is there:
+
+```bash
+npm run claude-md                        # same as: node server/cli.js claude-md
+node server/cli.js claude-md --project   # ./CLAUDE.md of the current project instead
+node server/cli.js claude-md --print     # print the block, write nothing
+```
+
+(Pasting a long block into a terminal is where a stray quote turns into a zsh
+"parse error" — the command sidesteps that.) By hand: add a section like this to the
+`CLAUDE.md` of any project where you want Claude Code to use the browser (or to
+`~/.claude/CLAUDE.md` to enable it everywhere), adjusting the path to where you cloned
+the repo.
 
 ```markdown
 ## Browser control (AI Browser Bridge)
@@ -46,9 +57,10 @@ path to where you cloned the repo.
 **Token saver — default for browser tasks:** for any multi-step browser task, do NOT
 drive the bridge command-by-command from this session. Delegate the whole task to the
 bridge's built-in agent, which runs the mechanical steps on cheap models and uses the
-strongest model only to judge the result (Haiku 4.5 → judge → Sonnet 5 → judge →
-Fable 5 → judge, stops at the first pass; bills to my existing Claude subscription via
-headless `claude -p`):
+strongest model only to judge the result (Opus 5.5 → judge → Fable 5.1 → judge →
+Codex Astra 6 → judge, stops at the first pass; bills to my existing Claude subscription
+via headless `claude -p`; the Codex rung needs the `codex` CLI and is skipped with an
+error otherwise):
 
     node /path/to/ai-bridge/server/cli.js agent "task description" [--timeout ms] [--verbose]
 

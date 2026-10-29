@@ -143,9 +143,9 @@ ladder: a cheap model attempts the task first, a strong model judges the evidenc
 and only on failure does a stronger model retry —
 
 ```
-ops: Haiku 4.5  → judge (Fable 5) → pass? done
-ops: Sonnet 5   → judge (Fable 5) → pass? done
-ops: Fable 5    → judge (Fable 5) → final verdict
+ops: Opus 5.5       → judge (Fable 5.1) → pass? done
+ops: Fable 5.1      → judge (Fable 5.1) → pass? done
+ops: Codex Astra 6  → judge (Fable 5.1) → final verdict   (needs the `codex` CLI; skipped with an error otherwise)
 ```
 
 The judge only ever sees the task plus the ops session's short evidence report —
@@ -184,9 +184,17 @@ and one extension. The rule that keeps concurrency safe:
 
 ## Use from Claude Code
 
-See **[docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md)** for a copy-paste `CLAUDE.md`
-block that teaches Claude Code every command, plus permission and troubleshooting
-notes. Once added, you can ask things like *"open the dashboard tab and screenshot
+One command writes the `CLAUDE.md` block that teaches Claude Code every command,
+with this machine's CLI path filled in (no pasting):
+
+```bash
+npm run claude-md            # appends to ~/.claude/CLAUDE.md — or: node server/cli.js claude-md
+node server/cli.js claude-md --project   # ./CLAUDE.md of the current project only
+node server/cli.js claude-md --print     # just show the block
+```
+
+See **[docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md)** for the block itself, plus
+permission and troubleshooting notes. Once added, you can ask things like *"open the dashboard tab and screenshot
 the error"* and the agent composes the CLI calls itself.
 
 ## Security model

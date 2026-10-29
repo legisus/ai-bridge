@@ -37,6 +37,7 @@ function main(argv) {
 if (argv.length === 0) {
   console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms] [--debugger]");
   console.error('       bridge agent "task description" [--timeout ms] [--verbose]');
+  console.error("       bridge claude-md [--project] [--print]   # teach Claude Code the bridge (writes CLAUDE.md)");
   console.error("  Direct mode is the DEFAULT: commands use ordinary extension APIs and");
   console.error("  never attach chrome.debugger (no DevTools session, no debugging banner).");
   console.error("  eval runs via chrome.userScripts (enable \"Allow User Scripts\" once on the");
@@ -48,6 +49,9 @@ if (argv.length === 0) {
   console.error("  pdf and background-tab screenshots are CDP-only and always need approval.");
   process.exit(2);
 }
+
+// `bridge claude-md` — append the CLAUDE.md block (with this CLI's path) for Claude Code.
+if (argv[0] === "claude-md") { require("./claude-md").main(argv.slice(1)); return; }
 
 // `bridge agent "task"` — token-saver agent: cheap models operate, Fable judges.
 if (argv[0] === "agent") {
