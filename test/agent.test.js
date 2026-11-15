@@ -3,8 +3,13 @@
 // parsing, and evidence extraction. Uses an injected mock runner — no real
 // claude CLI, no network.
 
-const { runAgent, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL } =
+const fs = require("fs");
+const os = require("os");
+// Journal/trace files go to a temp state dir, never the real ~/.ai-browser-bridge.
+process.env.AI_BRIDGE_HOME = fs.mkdtempSync(require("path").join(os.tmpdir(), "ai-bridge-agent-"));
+const { runAgent, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL } =
   require("../server/agent.js");
+const journal = require("../server/journal.js");
 
 let failures = 0;
 const assert = (cond, name) => {
@@ -16,8 +21,8 @@ const assert = (cond, name) => {
 function mockRun(judgeVerdicts) {
   const calls = [];
   let judgeIdx = 0;
-  const run = async ({ engine, model, effort, prompt }) => {
-    calls.push({ engine, model, effort, prompt });
+  const run = async ({ engine, model, effort, prompt, env }) => {
+    calls.push({ engine, model, effort, prompt, env });
     if (model === JUDGE_MODEL && prompt.includes("strict verifier")) {
       const v = judgeVerdicts[judgeIdx++];
       return { result: v, usage: { input_tokens: 100, output_tokens: 20 }, total_cost_usd: 0.01 };
@@ -88,6 +93,31 @@ function mockRun(judgeVerdicts) {
     assert(r.verdict.verdict === "pass", "malformed judge: recovers via escalation");
     const judgeCalls = m.calls.filter((c) => c.prompt.includes("strict verifier"));
     assert(judgeCalls[1].prompt.includes("not valid JSON"), "malformed judge: re-ask prompt sent");
+  }
+
+  // 8) journal: run id + job flow to the ops env, the run is journaled with a job signature
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"done"}']);
+    const r = await runAgent("invoice trip 123", { job: "toll-invoices", runId: "testrun0001" }, m.run);
+    assert(r.runId === "testrun0001" && r.job === "toll-invoices", "journal: runId/job returned");
+    assert(m.calls[0].env && m.calls[0].env.AI_BRIDGE_RUN_ID === "testrun0001" && m.calls[0].env.AI_BRIDGE_JOB === "toll-invoices",
+      "journal: ops rung gets AI_BRIDGE_RUN_ID/AI_BRIDGE_JOB");
+    assert(r.record.signature === "job:toll-invoices" && r.record.verdict === "pass" && r.record.mode === "regular",
+      "journal: record has job signature + verdict");
+    assert(Math.abs(r.record.costUsd - 0.06) < 1e-9 && r.record.inputTokens === 5100 && r.record.outputTokens === 820,
+      "journal: cost/tokens summed over ops + judge");
+    const rows = journal.summarize(journal.readJournal({}));
+    assert(rows.some((x) => x.signature === "job:toll-invoices" && x.runs === 1), "journal: appended to journal.jsonl");
+  }
+
+  // 9) journal: auto signature uses domains from the run's trace
+  {
+    journal.appendTrace("testrun0002", { cmd: "newTab", params: { url: "https://www.kbb.com/x" }, ok: true });
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    const r = await runAgent("Get KBB value for 9GYW724", { runId: "testrun0002", noJournal: true }, m.run);
+    assert(r.record.signature === "auto:kbb.com|get kbb value for #gyw#" && r.journalFile === null,
+      "journal: auto signature from trace domains; noJournal skips the write");
+    assert(m.calls[0].env.AI_BRIDGE_JOB === undefined, "journal: no AI_BRIDGE_JOB without --job");
   }
 
   // 7) recursion guard: agent.js refuses to start when spawned by the agent

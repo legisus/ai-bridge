@@ -85,6 +85,10 @@ const assert = (cond, name) => {
     const scrolled = JSON.parse((await run("node", [cli, "scroll", '{"tabId":1,"bottom":true}', "--timeout", "5000"], { env })).stdout);
     assert(scrolled.params.bottom === true, "cli scroll forwards params");
 
+    // economy-mode: `snapshot` is sent as an eval carrying the DOM-digest script
+    const snap = JSON.parse((await run("node", [cli, "snapshot", '{"tabId":1,"maxText":50}', "--timeout", "5000"], { env })).stdout);
+    assert(snap === "Example Domain", "cli snapshot round-trips as eval");
+
     // v0.1.7: no-debugger mode is the default; the debugger is opt-in with approval. (v0.1.10: wire field renamed stealth → direct.)
     const defDirect = JSON.parse((await run("node", [cli, "type", '{"tabId":1,"text":"hi"}', "--timeout", "5000"], { env })).stdout);
     assert(defDirect.params.direct === true, "default sends direct:true");

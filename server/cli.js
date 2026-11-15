@@ -9,6 +9,8 @@
 //   bridge eval '{"tabId":123,"code":"document.title"}'
 //   bridge pdf '{"tabId":123}' --out page.pdf
 //   bridge download '{"url":"https://...","filename":"cert.pdf"}'
+//   bridge snapshot '{"tabId":123}'                                 # DOM digest (text + interactive elements)
+//   bridge journal [--days 30] [--job name] [--json]                # agent run journal (economy-mode candidates)
 //
 // Prints the JSON result on stdout; exits non-zero on error.
 
@@ -36,7 +38,9 @@ const { SELF_CMD } = require("./runtime");
 function main(argv) {
 if (argv.length === 0) {
   console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms] [--debugger]");
-  console.error('       bridge agent "task description" [--timeout ms] [--verbose]');
+  console.error('       bridge agent "task description" [--timeout ms] [--verbose] [--job name]');
+  console.error("       bridge snapshot '{\"tabId\":N}' [--debugger]   # DOM digest: text + interactive elements with selectors");
+  console.error("       bridge journal [--days N] [--job name] [--json] | --trace <runId>");
   console.error("       bridge claude-md [--project] [--print]   # teach Claude Code the bridge (writes CLAUDE.md)");
   console.error("  Direct mode is the DEFAULT: commands use ordinary extension APIs and");
   console.error("  never attach chrome.debugger (no DevTools session, no debugging banner).");
@@ -59,7 +63,10 @@ if (argv[0] === "agent") {
   return;
 }
 
-const cmd = argv[0];
+// `bridge journal` — runs grouped by job signature; `--trace <runId>` dumps one run's commands.
+if (argv[0] === "journal") { require("./journal").main(argv.slice(1)); return; }
+
+let cmd = argv[0];
 let params = {};
 const flags = {};
 for (let i = 1; i < argv.length; i++) {
@@ -71,6 +78,16 @@ for (let i = 1; i < argv.length; i++) {
   else params = JSON.parse(argv[i]);
 }
 if (flags.file) params.code = fs.readFileSync(flags.file, "utf8");
+
+// `bridge snapshot` is an eval of the bundled DOM-digest script — no extension
+// update needed, and models get selectors instead of pixels.
+if (cmd === "snapshot") { params = require("./snapshot").buildEvalParams(params); cmd = "eval"; }
+
+// Set by `bridge agent` for its child model processes: the server traces every
+// command of the run to ~/.ai-browser-bridge/traces/<runId>.jsonl.
+const meta = {};
+if (process.env.AI_BRIDGE_RUN_ID) meta.runId = process.env.AI_BRIDGE_RUN_ID;
+if (process.env.AI_BRIDGE_JOB) meta.job = process.env.AI_BRIDGE_JOB;
 
 // Commands with no direct-mode equivalent — Page.printToPDF is CDP-only, so pdf
 // always needs the debugger (and thus approval).
@@ -118,7 +135,7 @@ function send() {
   ws.on("message", (data) => {
     const msg = JSON.parse(data);
     if (msg.type === "auth" && msg.ok) {
-      ws.send(JSON.stringify({ type: "request", id, cmd, params }));
+      ws.send(JSON.stringify({ type: "request", id, cmd, params, ...(meta.runId ? { meta } : {}) }));
       return;
     }
     if (msg.type === "response" && msg.id === id) {

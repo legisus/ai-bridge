@@ -1,6 +1,6 @@
 // AI Browser Bridge — token-saver agent.
 //
-//   bridge agent "task description" [--timeout ms] [--verbose] [--start fable-5.1]
+//   bridge agent "task description" [--timeout ms] [--verbose] [--start fable-5.1] [--job name]
 //
 // Completes a browser task by spawning headless Claude Code sessions
 // (`claude -p`), so usage bills to the user's existing Claude subscription,
@@ -12,13 +12,20 @@
 //
 // The judge only ever sees the task + the ops session's evidence report,
 // never the full browsing transcript, so Fable's token spend stays minimal.
+//
+// Every run gets a run id. Child processes receive AI_BRIDGE_RUN_ID/AI_BRIDGE_JOB,
+// the CLI forwards them, and the server traces each bridge command to
+// traces/<runId>.jsonl; the run itself is appended to journal.jsonl
+// (`bridge journal`). See docs/ECONOMY-MODE.md.
 
 "use strict";
 
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const path = require("path");
 
 const { SELF_CMD, selfArgs } = require("./runtime");
+const journal = require("./journal");
 
 const OPS_LADDER = [
   { model: "claude-opus-5-5", label: "opus-5.5" },
@@ -36,7 +43,8 @@ commands directly, like:
     ${SELF_CMD} <cmd> [params-json] [--file js] [--out file]
 
 Commands: ping, listTabs, newTab {"url", "newWindow"?, "windowId"?},
-navigate {"tabId","url"}, eval {"tabId","code"}, click {"tabId","x","y"},
+navigate {"tabId","url"}, snapshot {"tabId", "maxText"?, "root"?},
+eval {"tabId","code"}, waitFor {"tabId","selector"}, click {"tabId","selector"} or {"tabId","x","y"},
 insertText {"tabId","text"}, key {"tabId","key"}, screenshot {"tabId"} --out f.png,
 pdf, download, selectTab {"tabId"}, closeTab, detach {"tabId"}.
 
@@ -52,10 +60,14 @@ Rules:
   NOT use activateTab (it raises the window over what the user is doing). To
   screenshot, first run selectTab {"tabId"} — it makes the tab active within
   YOUR window without focusing it — then screenshot immediately.
-- Prefer eval for reading pages; use click/insertText/key only when a site
-  rejects synthetic events.
-- After a click, verify focus/position with eval before typing; screenshot
-  to locate elements when unsure.
+- READ PAGES WITH snapshot, NOT SCREENSHOTS. snapshot returns the visible
+  text plus every interactive element with a label, state and a CSS selector
+  you can pass straight to click {"selector"} / waitFor / eval. It costs a
+  fraction of a screenshot's tokens. Use eval for anything the digest lacks.
+  Take a screenshot only when the digest cannot explain what you see (canvas,
+  image-only content, layout questions).
+- After a click, re-run snapshot (or eval) to verify focus/position before
+  typing — page layouts shift while loading.
 - detach from tabs and close your window's tabs when finished (unless the
   task says to leave a tab open).
 - This is the user's real browser: never log out, change account settings,
@@ -92,7 +104,7 @@ Reply with ONLY a JSON object, no other text:
 
 // Spawn `claude -p` and resolve with the parsed --output-format json result.
 // Injectable via deps for testing.
-function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
+function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env }) {
   return new Promise((resolve, reject) => {
     const args = ["-p", prompt, "--model", model, "--output-format", "json"];
     if (allowedTools && allowedTools.length) {
@@ -107,7 +119,7 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
     // no matter how the ops model spells the command.
     const child = spawn("claude", args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, AI_BRIDGE_AGENT: "1" },
+      env: { ...process.env, AI_BRIDGE_AGENT: "1", ...(env || {}) },
     });
     let out = "";
     let err = "";
@@ -140,7 +152,7 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
 // ladder treats both engines alike. The sandbox allows network so the bridge
 // CLI can reach the localhost relay; cwd stays the caller's so screenshots land
 // where Claude ops sessions put them.
-function runCodex({ model, effort, prompt, timeoutMs, verbose }) {
+function runCodex({ model, effort, prompt, timeoutMs, verbose, env }) {
   const fs = require("fs");
   const os = require("os");
   return new Promise((resolve, reject) => {
@@ -152,7 +164,7 @@ function runCodex({ model, effort, prompt, timeoutMs, verbose }) {
       "-C", process.cwd(), "-o", outPath, prompt];
     const child = spawn("codex", args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, AI_BRIDGE_AGENT: "1" },
+      env: { ...process.env, AI_BRIDGE_AGENT: "1", ...(env || {}) },
     });
     let err = "";
     const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
@@ -215,6 +227,12 @@ function usageOf(res) {
 async function runAgent(task, opts = {}, run = runModel) {
   const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
   const verbose = !!opts.verbose;
+  const runId = opts.runId || crypto.randomBytes(6).toString("hex");
+  const job = opts.job ? String(opts.job).trim() : null;
+  // Child model processes inherit these; the CLI tags every bridge command
+  // with them and the server writes traces/<runId>.jsonl.
+  const childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}) };
+  const startedAt = new Date().toISOString();
   const stages = [];
   let feedback = "";
   let lastEvidence = "";
@@ -241,6 +259,7 @@ async function runAgent(task, opts = {}, run = runModel) {
       allowedTools: [`Bash(${SELF_CMD}:*)`],
       timeoutMs,
       verbose,
+      env: childEnv,
     });
     lastEvidence = extractEvidence(String(opsRes.result || ""));
     stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
@@ -275,7 +294,28 @@ async function runAgent(task, opts = {}, run = runModel) {
     feedback = verdict.feedback;
   }
 
-  return { verdict: finalVerdict, evidence: lastEvidence, stages };
+  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: "regular" });
+  let journalFile = null;
+  if (!opts.noJournal) {
+    try { journalFile = journal.appendJournal(record); }
+    catch (e) { if (verbose) console.error(`[agent] journal write failed: ${e.message}`); }
+  }
+  return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, record, journalFile };
+}
+
+// One journal.jsonl line for a finished run. Domains come from the run's trace
+// (newTab/navigate URLs), so auto signatures group by site even without --job.
+function journalRecord({ runId, job, task, startedAt, stages, verdict, mode }) {
+  const domains = journal.domainsFromTrace(journal.readTrace(runId));
+  const sum = (k) => stages.reduce((n, s) => n + (Number(s[k]) || 0), 0);
+  return {
+    runId, job, signature: journal.signatureOf({ job, task, domains }), task,
+    startedAt, endedAt: new Date().toISOString(), mode,
+    verdict: verdict ? verdict.verdict : "fail",
+    stages: stages.map((s) => ({ stage: s.stage, input: s.input, output: s.output, costUsd: s.costUsd })),
+    costUsd: sum("costUsd"), inputTokens: sum("input"), outputTokens: sum("output"),
+    domains, trace: journal.traceFile(runId),
+  };
 }
 
 function printReport({ verdict, evidence, stages }) {
@@ -295,6 +335,13 @@ function printReport({ verdict, evidence, stages }) {
   if (cost > 0) console.log(`${"total".padEnd(22)} ${"".padStart(26)}  $${cost.toFixed(4)}`);
 }
 
+function printJournalLine({ runId, job, journalFile, record }) {
+  const cmds = journal.readTrace(runId).length;
+  console.log(`run ${runId}${job ? ` job=${job}` : ""}: ${cmds} bridge command(s) traced` +
+    (record && record.domains.length ? ` on ${record.domains.join(", ")}` : "") +
+    (journalFile ? `; journaled (bridge journal --trace ${runId})` : ""));
+}
+
 async function main(argv) {
   if (process.env.AI_BRIDGE_AGENT === "1") {
     console.error(
@@ -311,12 +358,13 @@ async function main(argv) {
     else if (args[i] === "--verbose") opts.verbose = true;
     else if (args[i] === "--start") opts.start = args[++i];
     else if (args[i] === "--only") opts.only = true;
+    else if (args[i] === "--job") opts.job = args[++i];
     else if (args[i] === "--help" || args[i] === "-h") { rest.length = 0; break; }
     else rest.push(args[i]);
   }
   const task = rest.join(" ").trim();
   if (!task) {
-    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only]');
+    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name]');
     process.exit(2);
   }
 
@@ -332,6 +380,7 @@ async function main(argv) {
 
   const report = await runAgent(task, opts);
   printReport(report);
+  printJournalLine(report);
   process.exit(report.verdict.verdict === "pass" ? 0 : 1);
 }
 
@@ -339,4 +388,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL };
+module.exports = { main, runAgent, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL };

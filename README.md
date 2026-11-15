@@ -164,6 +164,29 @@ Requirements & notes:
 - Default timeout is 10 minutes per stage (`--timeout` is in ms).
 - The ops sessions are confined to bridge CLI calls (`--allowedTools`), and a
   recursion guard stops them from invoking `bridge agent` themselves.
+- Tag recurring jobs with `--job <name>` (e.g. from cron or a bot) so the journal
+  can group them.
+
+### Journal, traces and `snapshot` (economy mode, step 1)
+
+Every agent run is journaled, and every bridge command it issues is traced, so
+you can see which jobs repeat and what they cost — the first step towards
+replaying repeated jobs as token-free recipes (see
+[docs/ECONOMY-MODE.md](docs/ECONOMY-MODE.md)):
+
+```bash
+bridge agent "…" --job toll-invoices     # tag the run; AI_BRIDGE_RUN_ID/AI_BRIDGE_JOB flow to the ops models
+bridge journal                           # runs grouped by job, pass rate, $, tokens; * = economy candidate
+bridge journal --days 7 --job kbb --json
+bridge journal --trace <runId>           # every bridge command of one run (cmd, params, ok, ms)
+bridge snapshot '{"tabId":123}'          # DOM digest: text + interactive elements with CSS selectors
+```
+
+Files live under `~/.ai-browser-bridge/`: `journal.jsonl` (one line per run) and
+`traces/<runId>.jsonl` (one line per command; screenshot pixels are omitted, long
+results previewed). `snapshot` replaces most screenshots in the ops playbook: a
+few KB of labelled elements with selectors you can pass straight to
+`click {"selector"}` / `waitFor`, instead of an image the model has to guess at.
 
 ## Concurrency
 
@@ -234,6 +257,7 @@ npm test    # spins up the server, a simulated extension, and the real CLI; asse
 ```
 extension/    Manifest V3 extension (service worker + options page)
 server/       relay server (server.js), CLI client (cli.js), token-saver agent (agent.js),
+              run journal + command traces (journal.js), DOM digest (snapshot.js),
               native messaging host (native-host.js) + its registrar (register-native-host.js),
               main.js = dispatcher for the single-executable build
 scripts/      build-sea.js — Node SEA build of the `ai-bridge` binary (npm run build:sea)
