@@ -79,6 +79,28 @@ bridge jobs                              # per-job mode / risk / audit progress 
 bridge jobs set <job> --mode audit|economy|regular --risk read|write --audits 3 --canary 5
 ```
 
+## Automatic mode selection
+
+Nothing has to be tagged. For every `bridge agent "task"`:
+
+1. **Match** (`jobs.findJobForTask`): hostnames in the task (`hostsIn`) must
+   be shared with the job's canonical task; word Jaccard ≥ 0.2 → match,
+   ≥ 0.08 → *uncertain* → `claude-haiku-5-5` classifier (`classifyPrompt`,
+   confidence ≥ 0.7 required); without hostnames the bars are 0.6 / 0.3.
+   Remembered wordings (`taskVariants`) count only for exact matches.
+2. **Verify a new wording once**: an economy job matched by a wording the
+   judge has not seen keeps the judge for that run; on pass the wording is
+   remembered and later runs are free. If the judge rejects, it is treated as
+   a *mismatch* (wrong job, not a broken recipe): no state change, the task
+   runs through the ladder with no job.
+3. **Learn** (`autoLearn`): after a passing regular run, if the job (tagged or
+   matched) has `AUTO_PROPOSE_PASSES` = 3 passes and no recipe, or an unmatched
+   task's auto signature (domains from the trace + digit-normalised text) has
+   3 passes, one proposal call creates the recipe (and the job
+   `auto-<site>-<hash>` when needed) → audit. A job flagged for repair is
+   repaired from a plain regular pass as well.
+4. Opt-outs: `--job none`, `--no-auto`; `--job <name>` forces a job.
+
 ## State machine
 
 ```

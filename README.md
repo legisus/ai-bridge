@@ -188,23 +188,36 @@ results previewed). `snapshot` replaces most screenshots in the ops playbook: a
 few KB of labelled elements with selectors you can pass straight to
 `click {"selector"}` / `waitFor`, instead of an image the model has to guess at.
 
-Once a job has a few passing runs, turn it into a **recipe** — a deterministic
-replay with assertions that costs zero tokens:
+**The bridge decides on its own.** You keep calling `bridge agent "task"`; it
+works out whether this is a job it already knows and which mode to run it in:
+
+1. **Recognise.** The task text is matched to known jobs (shared hostname plus
+   word overlap; a cheap Haiku call settles borderline cases). `--job <name>`
+   forces a job, `--job none` or `--no-auto` opts out.
+2. **Learn.** The third passing model run of the same task (same sites, same
+   wording pattern) triggers one Opus call that turns the three traces into a
+   **recipe** — a deterministic replay with assertions. A job is created
+   (`auto-<site>-<hash>`, or your `--job` name) and goes to *audit*.
+3. **Audit → economy.** In audit the recipe runs and the judge verifies its
+   evidence (judge tokens only). Three passes on a read-only job switch it to
+   *economy*: recipe only, no model. A new wording of a known job is verified
+   once, then it is free too. Every 5th economy run is a judge canary.
+4. **Fall back and repair.** A failing recipe step (selector gone, login page)
+   or a judge rejection falls back to the model ladder so the task still
+   completes; the recipe is repaired from that run's trace and the job returns
+   to audit. If a heuristic match was wrong, the judge catches it on the first
+   run and the task runs as a one-off with no penalty to the job.
 
 ```bash
-bridge recipe propose toll-roads-pull     # one model call reads the last 3 traces → recipes/<job>.json; job → AUDIT
-bridge agent "…" --job toll-roads-pull    # audit: recipe runs, the judge verifies; 3 passes (risk=read) → ECONOMY
-bridge agent "…" --job toll-roads-pull    # economy: recipe only, no model; a judge canary every 5th run
-bridge jobs                               # mode / risk / audit progress per job
-bridge recipe run toll-roads-pull         # replay by hand
+bridge agent "pull my Toll Roads transactions for the last 7 days as JSON"   # that's all
+bridge jobs                               # mode / risk / audit progress per job (* = auto-created)
+bridge recipe show|run <job>              # inspect or replay a recipe by hand
+bridge recipe propose <job>               # learn now instead of waiting for 3 passes
 ```
 
-If a recipe step fails (selector gone, login page, judge disagrees), that run
-falls back to the model ladder so the job still completes, the recipe is
-repaired from the fallback's trace, and the job returns to audit. Jobs whose
-recipes write to the outside world (`risk: write`) stay in audit — recipe plus
-judge every time — unless you allow economy with `bridge jobs set <job> --risk read`.
-Details: [docs/ECONOMY-MODE.md](docs/ECONOMY-MODE.md).
+Jobs whose recipes write to the outside world (`risk: write`) stay in audit —
+recipe plus judge every time — unless you allow economy with
+`bridge jobs set <job> --risk read`. Details: [docs/ECONOMY-MODE.md](docs/ECONOMY-MODE.md).
 
 ## Concurrency
 

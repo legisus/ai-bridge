@@ -188,6 +188,82 @@ function mockRun(judgeVerdicts) {
     assert(r.mode === "regular" && recipeCalls.length === 0, "fallback: repair-needed job runs regular until repaired");
   }
 
+  // 11) automatic mode: untagged tasks are matched to jobs, verified once per wording, learned after 3 passes
+  {
+    const jobs = require("../server/jobs.js");
+    const { MATCH_MODEL } = require("../server/agent.js");
+    const tollTask = "Toll Roads transactions pull (read-only): on secure.thetollroads.com Find a Transaction, set From = 7 days ago and To = today, click VIEW, return every row as JSON plus the row count.";
+    const recipe = { job: "tr", version: 1, risk: "read", task: tollTask, steps: [{ do: "newTab", url: "u" }], output: "rows" };
+    const deps = {
+      loadRecipe: (j) => (j === "tr" ? recipe : null),
+      runRecipe: async () => ({ ok: true, evidence: "EVIDENCE REPORT\nFinal state: 3 rows", steps: [], output: [1, 2, 3] }),
+      propose: async ({ job, task, traces }) => ({ job, version: 1, risk: "read", task, steps: [], _usage: { input: 1, output: 1 }, _n: traces.length }),
+    };
+    jobs.putJob({ job: "tr", mode: "economy", risk: "read", auditPasses: 3, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, task: tollTask, taskVariants: [], history: [] });
+
+    // a) similar wording with the same host → matched; economy but judged once (new wording)
+    const reworded = "Please open https://secure.thetollroads.com/accounts/statements/transaction, Find a Transaction for the last 7 days (From = today-7, To = today), click VIEW and return the rows as JSON with the row count.";
+    let m = mockRun(['{"verdict":"pass","feedback":"rows ok"}']);
+    let r = await runAgent(reworded, { runId: "auto0000001" }, m.run, deps);
+    assert(r.autoMatch && r.autoMatch.job === "tr" && !r.autoMatch.exact, "auto: untagged task matched to job by host + words");
+    assert(r.mode === "economy" && m.calls.length === 1 && m.calls[0].model === JUDGE_MODEL, "auto: new wording in economy is judged exactly once");
+    assert(jobs.getJob("tr").taskVariants.length === 1, "auto: passing wording remembered as a variant");
+
+    // b) same wording again → exact → pure economy, no model
+    m = mockRun([]);
+    r = await runAgent(reworded, { runId: "auto0000002" }, m.run, deps);
+    assert(r.autoMatch.exact === true && r.mode === "economy" && m.calls.length === 0, "auto: known wording runs free");
+
+    // c) uncertain wording → classifier (MATCH_MODEL) decides; it says yes → judged economy run
+    const vague = "toll roads: what did I pay on secure.thetollroads.com recently? json please";
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    const baseRun = m.run;
+    const calls = m.calls;
+    const run2 = async (o) => (o.model === MATCH_MODEL ? (calls.push(o), { result: '{"job":"tr","confidence":0.9,"why":"same pull"}', usage: { input_tokens: 800, output_tokens: 20 }, total_cost_usd: 0.001 }) : baseRun(o));
+    r = await runAgent(vague, { runId: "auto0000003" }, run2, deps);
+    assert(r.autoMatch && r.autoMatch.byModel && r.autoMatch.job === "tr", "auto: classifier settles an uncertain match");
+    assert(calls[0].model === MATCH_MODEL && r.stages[0].stage === `match:${MATCH_MODEL}` && r.mode === "economy", "auto: match stage recorded, recipe used");
+
+    // d) classifier says none → regular ladder, no job
+    const run3 = async (o) => (o.model === MATCH_MODEL ? { result: '{"job":null,"confidence":0.2}', usage: {} } : baseRun(o));
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("toll roads: add a vehicle 9ABC123 on secure.thetollroads.com and return the result as JSON", { runId: "auto0000004" }, async (o) => (o.model === MATCH_MODEL ? { result: '{"job":null}', usage: {} } : m.run(o)), deps);
+    assert(!r.autoMatch && r.mode === "regular" && r.job === null, "auto: classifier 'none' → regular run without a job");
+
+    // e) matched but the judge rejects the recipe evidence for this task → mismatch: one-off run, job not penalised
+    const before = jobs.getJob("tr");
+    m = mockRun(['{"verdict":"fail","feedback":"task wants vehicles, not transactions"}', '{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("Open https://secure.thetollroads.com/accounts/statements/transaction, Find a Transaction, click VIEW, return the rows as JSON with the row count, then ALSO list my vehicles", { runId: "auto0000005" }, m.run, deps);
+    assert(r.mismatch === true && r.job === null && r.mode === "regular" && r.verdict.verdict === "pass", "auto: judge-fail on heuristic match = mismatch, task completed by the ladder");
+    const after = jobs.getJob("tr");
+    assert(after.mode === "economy" && !after.repairNeeded && after.auditPasses === before.auditPasses, "auto: mismatched job keeps its state");
+    assert(!m.calls[1].env.AI_BRIDGE_JOB, "auto: fallback ops run is not traced under the mismatched job");
+
+    // f) --no-auto / --job none skip matching
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent(reworded, { runId: "auto0000006", noAuto: true }, m.run, deps);
+    assert(!r.autoMatch && r.mode === "regular", "auto: --no-auto runs regular");
+    r = await runAgent(reworded, { runId: "auto0000007", job: "none" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(!r.autoMatch && r.job === null, "auto: --job none runs regular without a job");
+
+    // g) auto-learn: an unknown task passing 3× (same domains + wording) gets a job + recipe automatically
+    const journal = require("../server/journal.js");
+    const kbbTask = "Open https://www.kbb.com/ and get the trade-in value for VIN 1C4RJKAG7P8753841 with 42000 miles, ZIP 90732";
+    for (const id of ["learn000001", "learn000002", "learn000003"]) {
+      journal.appendTrace(id, { cmd: "newTab", params: { url: "https://www.kbb.com/" }, ok: true, result: { id: 1 } });
+      m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+      r = await runAgent(kbbTask.replace("42000", id === "learn000002" ? "43000" : "42000"), { runId: id }, m.run, deps);
+    }
+    assert(r.learned && r.learned.created && /^auto-kbb-[0-9a-f]{6}$/.test(r.learned.job), `auto-learn: job created on the 3rd pass (${r.learned && r.learned.job})`);
+    assert(r.learned.recipe._n === 3 && r.stages.some((s) => s.stage.startsWith("learn:")), "auto-learn: recipe proposed from all 3 traces, stage recorded");
+    const aj = jobs.getJob(r.learned.job);
+    assert(aj.auto === true && aj.mode === "audit" && aj.recipeVersion === 1 && aj.taskVariants.length >= 1, "auto-learn: job is auto, in audit, with variants");
+    // the 4th run of the same task now matches the new job and uses its recipe in audit
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent(kbbTask, { runId: "learn000004" }, m.run, { ...deps, loadRecipe: (j) => (j === aj.job ? { job: j, version: 1, risk: "read", steps: [], task: kbbTask } : deps.loadRecipe(j)) });
+    assert(r.autoMatch && r.autoMatch.job === aj.job && r.mode === "audit", "auto-learn: next run is recognised and audited with the new recipe");
+  }
+
   // 7) recursion guard: agent.js refuses to start when spawned by the agent
   {
     const { execFile } = require("child_process");

@@ -30,6 +30,8 @@ const recipes = require("./recipe");
 const jobs = require("./jobs");
 
 const RECIPE_MODEL = process.env.AI_BRIDGE_RECIPE_MODEL || "claude-opus-5-5";
+// Cheap classifier that settles "is this the same job?" when word overlap is inconclusive.
+const MATCH_MODEL = process.env.AI_BRIDGE_MATCH_MODEL || "claude-haiku-5-5";
 
 const OPS_LADDER = [
   { model: "claude-opus-5-5", label: "opus-5.5" },
@@ -238,10 +240,6 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
   const verbose = !!opts.verbose;
   const runId = opts.runId || crypto.randomBytes(6).toString("hex");
-  const job = opts.job ? String(opts.job).trim() : null;
-  // Child model processes inherit these; the CLI tags every bridge command
-  // with them and the server writes traces/<runId>.jsonl.
-  const childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}) };
   const startedAt = new Date().toISOString();
   const stages = [];
   let feedback = "";
@@ -250,8 +248,30 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
 
   const D = {
     runRecipe: recipes.runRecipe, loadRecipe: recipes.loadRecipe, getJob: jobs.getJob, putJob: jobs.putJob,
+    loadJobs: jobs.loadJobs, readJournal: journal.readJournal, readTrace: journal.readTrace,
     propose: proposeRecipe, ...deps,
   };
+
+  // ---- which job is this? explicit --job, or matched from the task text -------
+  const auto = !opts.noAuto && opts.job !== "none";
+  let job = opts.job && opts.job !== "none" ? String(opts.job).trim() : null;
+  let autoMatch = null;
+  if (!job && auto) {
+    const found = jobs.findJobForTask(task, D.loadJobs());
+    if (found.match) autoMatch = found.match;
+    else if (found.uncertain.length) {
+      const res = await run({ model: MATCH_MODEL, prompt: jobs.classifyPrompt(task, found.uncertain), allowedTools: [], timeoutMs, verbose });
+      stages.push({ stage: `match:${MATCH_MODEL}`, ...usageOf(res) });
+      const obj = recipes.extractJson(String(res.result || ""));
+      if (obj && obj.job && found.uncertain.some((u) => u.job === obj.job) && (obj.confidence == null || obj.confidence >= 0.7)) {
+        autoMatch = { job: obj.job, score: Number(obj.confidence) || 0, exact: false, byModel: true, why: obj.why };
+      }
+    }
+    if (autoMatch) job = autoMatch.job;
+  }
+  // Child model processes inherit these; the CLI tags every bridge command
+  // with them and the server writes traces/<runId>.jsonl.
+  let childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}) };
 
   const judge = async (evidence) => {
     let judgeRes = await run({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose });
@@ -275,8 +295,13 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   let state = job ? D.getJob(job) : null;
   const recipe = job && state && state.mode !== "regular" && !state.repairNeeded ? D.loadRecipe(job) : null;
   const planned = jobs.plan(state, !!recipe);
+  // A wording this job has not been judged with yet is verified once, even in
+  // economy mode; after a pass it is remembered and later runs are free.
+  const newPhrasing = !!autoMatch && !autoMatch.exact;
+  if (planned.mode === "economy" && newPhrasing && !planned.judge) { planned.judge = true; planned.phrasing = true; }
   let mode = planned.mode;
   let fellBack = false;
+  let mismatch = false;
   let recipeResult = null;
 
   if (mode !== "regular") {
@@ -288,8 +313,16 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       if (planned.judge) {
         const v = await judge(lastEvidence);
         if (v.verdict === "pass") {
-          finalVerdict = { verdict: "pass", feedback: `${mode}${planned.canary ? " canary" : ""}: ${v.feedback}` };
+          finalVerdict = { verdict: "pass", feedback: `${mode}${planned.canary ? " canary" : planned.phrasing ? " (new wording verified)" : ""}: ${v.feedback}` };
           state = jobs.transition(state, { kind: "recipe-pass", canary: planned.canary });
+          state = rememberVariant(state, task);
+        } else if (newPhrasing) {
+          // The task was only matched to this job heuristically and the judge
+          // says the recipe's result does not satisfy it: wrong job, not a
+          // broken recipe. No penalty for the job; run the task on its own.
+          mismatch = true; fellBack = true; job = null; state = null;
+          childEnv = { AI_BRIDGE_RUN_ID: runId };
+          feedback = `A recipe for a similar job (${autoMatch.job}) ran first but its result does not satisfy this task: ${v.feedback}`;
         } else {
           fellBack = true; feedback = `The deterministic recipe for this job ran but the judge rejected its evidence: ${v.feedback}`;
           state = jobs.transition(state, { kind: "judge-fail", error: v.feedback });
@@ -342,11 +375,12 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       feedback = verdict.feedback;
     }
     if (state) state = jobs.transition(state, { kind: finalVerdict.verdict === "pass" ? "regular-pass" : "regular-fail" });
+    if (state && finalVerdict.verdict === "pass") state = rememberVariant(state, task);
   }
 
   // ---- repair a broken recipe from this (successful) fallback run -------------
   let repaired = null;
-  if (fellBack && finalVerdict.verdict === "pass" && !opts.noRepair) {
+  if (fellBack && !mismatch && finalVerdict.verdict === "pass" && !opts.noRepair) {
     try {
       repaired = await D.propose({
         job, task, previous: recipe, failure: recipeResult.failure,
@@ -360,7 +394,22 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     }
   }
 
-  const journalMode = mode === "regular" ? "regular" : fellBack ? `${mode}-fallback` : mode;
+  const journalMode = mismatch ? "regular" : mode === "regular" ? "regular" : fellBack ? `${mode}-fallback` : mode;
+
+  // ---- learn: enough passing model runs of the same task → propose a recipe ----
+  // (and repair a flagged recipe from a plain regular pass). The bridge decides
+  // on its own; nobody has to tag jobs or run `recipe propose`.
+  let learned = null;
+  if (auto && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
+    try {
+      learned = await autoLearn({ job, state, task, runId, startedAt, stages, D, run, timeoutMs, verbose });
+      if (learned && learned.recipe) {
+        job = learned.job; state = learned.state;
+        stages.push({ stage: `learn:${RECIPE_MODEL}`, ...(learned.recipe._usage || { input: 0, output: 0 }) });
+      }
+    } catch (e) { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
+  }
+
   if (state) {
     try {
       D.putJob(jobs.pushHistory(state, { runId, mode: journalMode, verdict: finalVerdict.verdict, canary: planned.canary || undefined,
@@ -374,7 +423,50 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     try { journalFile = journal.appendJournal(record); }
     catch (e) { if (verbose) console.error(`[agent] journal write failed: ${e.message}`); }
   }
-  return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, mode: journalMode, state, repaired, record, journalFile };
+  return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, mode: journalMode, state, repaired, record, journalFile,
+    autoMatch, mismatch, learned };
+}
+
+// Remember a task wording that passed a judge together with this job.
+function rememberVariant(state, task) {
+  const v = jobs.normalizeVariant(task);
+  const list = Array.isArray(state.taskVariants) ? state.taskVariants : [];
+  if (list.includes(v) || jobs.normalizeVariant(state.task) === v) return state;
+  return { ...state, task: state.task || task, taskVariants: [...list.slice(-19), v] };
+}
+
+// After a passing regular run: if this job (tagged, matched, or recognised by
+// signature) has AUTO_PROPOSE_PASSES passes and no recipe, learn one; if its
+// recipe is flagged for repair, repair it. Returns {job, state, recipe} or null.
+async function autoLearn({ job, state, task, runId, startedAt, stages, D, run, timeoutMs, verbose }) {
+  const thisTrace = D.readTrace(runId);
+  if (!thisTrace.length) return null;
+  const all = D.readJournal({ days: 60 });
+  const passes = (recs) => recs.filter((r) => r.verdict === "pass" && (r.mode || "regular") === "regular");
+
+  if (job) {
+    const current = D.loadRecipe(job);
+    if (current && !(state && state.repairNeeded)) return null;                   // already has a working recipe
+    const prior = passes(all.filter((r) => r.job === job && r.runId !== runId));
+    if (!current && prior.length + 1 < jobs.AUTO_PROPOSE_PASSES) return null;
+    const traces = [thisTrace, ...prior.slice(-2).map((r) => D.readTrace(r.runId)).filter((t) => t.length)];
+    const failure = state && state.repairNeeded ? { step: -1, do: "unknown", error: state.lastFailure || "recipe failed on a previous run" } : undefined;
+    const recipe = await D.propose({ job, task: state && state.task || task, traces, previous: current || undefined, failure, run, timeoutMs, verbose });
+    let st = jobs.transition({ ...(state || D.getJob(job)), risk: (state && state.risk) || recipe.risk, task: (state && state.task) || task }, { kind: "repaired", version: recipe.version });
+    return { job, state: st, recipe, created: false };
+  }
+
+  // Untagged, unmatched task: same auto signature (domains + normalized text) seen enough times?
+  const domains = journal.domainsFromTrace(thisTrace);
+  const signature = journal.signatureOf({ task, domains });
+  const prior = passes(all.filter((r) => !r.job && r.signature === signature && r.runId !== runId));
+  if (prior.length + 1 < jobs.AUTO_PROPOSE_PASSES) return null;
+  const name = jobs.autoJobName(task, domains, signature);
+  const traces = [thisTrace, ...prior.slice(-2).map((r) => D.readTrace(r.runId)).filter((t) => t.length)];
+  const recipe = await D.propose({ job: name, task, traces, run, timeoutMs, verbose });
+  let st = jobs.transition({ ...D.getJob(name), auto: true, signature, task, risk: recipe.risk,
+    taskVariants: [...new Set(prior.map((r) => jobs.normalizeVariant(r.task)))] }, { kind: "repaired", version: recipe.version });
+  return { job: name, state: st, recipe, created: true };
 }
 
 // Ask a model to turn successful traces (or a failed recipe + fallback trace)
@@ -429,8 +521,18 @@ function printReport({ verdict, evidence, stages }) {
   if (cost > 0) console.log(`${"total".padEnd(22)} ${"".padStart(26)}  $${cost.toFixed(4)}`);
 }
 
-function printJournalLine({ runId, job, journalFile, record, mode, state, repaired }) {
+function printJournalLine({ runId, job, journalFile, record, mode, state, repaired, autoMatch, mismatch, learned }) {
   const cmds = journal.readTrace(runId).length;
+  if (autoMatch) {
+    console.log(mismatch
+      ? `task looked like job ${autoMatch.job} but the judge disagreed — ran as a one-off (job not penalised)`
+      : `task recognised as job ${autoMatch.job}${autoMatch.exact ? " (known wording)" : autoMatch.byModel ? ` (classifier, ${autoMatch.why || "similar"})` : ` (similarity ${autoMatch.score.toFixed(2)})`}`);
+  }
+  if (learned && learned.recipe) {
+    console.log(learned.created
+      ? `learned: this task has passed ${jobs.AUTO_PROPOSE_PASSES}× → job ${learned.job} created with recipe v${learned.recipe.version} (risk ${learned.recipe.risk}); next runs are audited, then free`
+      : `learned: recipe v${learned.recipe.version} for job ${learned.job} → audit`);
+  } else if (learned && learned.error) console.log(`learn: recipe proposal failed: ${learned.error}`);
   if (job && state) {
     console.log(`job ${job}: ran in ${mode} mode → now ${state.mode}` +
       (state.mode === "audit" ? ` (${state.auditPasses || 0}/${state.auditRequired} audit passes${state.repairNeeded ? ", REPAIR NEEDED" : ""})` : "") +
@@ -461,12 +563,13 @@ async function main(argv) {
     else if (args[i] === "--job") opts.job = args[++i];
     else if (args[i] === "--params") opts.params = JSON.parse(args[++i]);
     else if (args[i] === "--no-repair") opts.noRepair = true;
+    else if (args[i] === "--no-auto") opts.noAuto = true;
     else if (args[i] === "--help" || args[i] === "-h") { rest.length = 0; break; }
     else rest.push(args[i]);
   }
   const task = rest.join(" ").trim();
   if (!task) {
-    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name] [--params json] [--no-repair]');
+    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name|none] [--params json] [--no-repair] [--no-auto]');
     process.exit(2);
   }
 
@@ -490,4 +593,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, proposeRecipe, runModel, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL };
+module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };

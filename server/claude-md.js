@@ -32,9 +32,9 @@ is not installed):
 
 It prints a verdict, an evidence report and a per-stage token/cost summary; exits 0 on
 pass. Give it a complete, self-contained task description (URLs, what "done" looks
-like). Pass \`--job <name>\` for a recurring task so \`${cmd} journal\` can group its
-runs (economy-mode candidates); \`${cmd} journal --trace <runId>\` lists one run's
-bridge commands. Only fall back to direct command-by-command driving (below) for one-off single
+like). The agent recognises recurring tasks by itself, learns a deterministic recipe
+after 3 passes and then replays it for free (economy mode) — no tagging needed;
+\`${cmd} jobs\` shows the per-job mode, \`${cmd} journal\` the run history. Only fall back to direct command-by-command driving (below) for one-off single
 commands (a quick \`ping\`, one \`eval\`, one \`screenshot\`) or when I explicitly ask you
 to drive the browser yourself.
 
