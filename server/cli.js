@@ -81,11 +81,15 @@ if (flags.file) params.code = fs.readFileSync(flags.file, "utf8");
 
 // `bridge snapshot` is an eval of the bundled DOM-digest script — no extension
 // update needed, and models get selectors instead of pixels.
-if (cmd === "snapshot") { params = require("./snapshot").buildEvalParams(params); cmd = "eval"; }
+const meta = {};
+if (cmd === "snapshot") {
+  meta.as = { cmd: "snapshot", params };          // trace it as `snapshot`, not as a 10 KB eval
+  params = require("./snapshot").buildEvalParams(params);
+  cmd = "eval";
+}
 
 // Set by `bridge agent` for its child model processes: the server traces every
 // command of the run to ~/.ai-browser-bridge/traces/<runId>.jsonl.
-const meta = {};
 if (process.env.AI_BRIDGE_RUN_ID) meta.runId = process.env.AI_BRIDGE_RUN_ID;
 if (process.env.AI_BRIDGE_JOB) meta.job = process.env.AI_BRIDGE_JOB;
 

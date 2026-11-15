@@ -70,9 +70,11 @@ wss.on("connection", (sock) => {
       pending.delete(msg.id);
       if (!req) return;
       if (req.meta && req.meta.runId) {
+        const as = req.meta.as && typeof req.meta.as === "object" ? req.meta.as : null; // e.g. snapshot sent as eval
         appendTrace(req.meta.runId, {
           ts: new Date(req.t0).toISOString(), job: req.meta.job || undefined,
-          cmd: req.cmd, params: req.params, ok: !!msg.ok, error: msg.ok ? undefined : msg.error,
+          cmd: as && as.cmd ? String(as.cmd) : req.cmd, params: as ? as.params : req.params,
+          ok: !!msg.ok, error: msg.ok ? undefined : msg.error,
           ms: Date.now() - req.t0, result: msg.ok ? msg.result : undefined,
         });
       }
