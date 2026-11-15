@@ -26,6 +26,10 @@ const path = require("path");
 
 const { SELF_CMD, selfArgs } = require("./runtime");
 const journal = require("./journal");
+const recipes = require("./recipe");
+const jobs = require("./jobs");
+
+const RECIPE_MODEL = process.env.AI_BRIDGE_RECIPE_MODEL || "claude-opus-5-5";
 
 const OPS_LADDER = [
   { model: "claude-opus-5-5", label: "opus-5.5" },
@@ -223,8 +227,14 @@ function usageOf(res) {
   };
 }
 
-// The escalation ladder. `run` is injectable for tests.
-async function runAgent(task, opts = {}, run = runModel) {
+// The escalation ladder. `run` is injectable for tests; `deps` lets tests
+// stub the recipe runner / job store.
+//
+// With --job and a recipe in audit or economy mode, the recipe runs first
+// (zero tokens). Audit: the judge verifies its evidence. Economy: no judge
+// except a periodic canary. Any recipe or judge failure falls back to the
+// regular model ladder for this run and the recipe is repaired afterwards.
+async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
   const verbose = !!opts.verbose;
   const runId = opts.runId || crypto.randomBytes(6).toString("hex");
@@ -238,74 +248,157 @@ async function runAgent(task, opts = {}, run = runModel) {
   let lastEvidence = "";
   let finalVerdict = null;
 
-  const startIdx = opts.start
-    ? OPS_LADDER.findIndex(r => r.label === opts.start || r.model === opts.start || r.label.startsWith(opts.start))
-    : 0;
-  if (startIdx < 0) throw new Error(`unknown --start model "${opts.start}"; use one of ${OPS_LADDER.map(r => r.label).join(", ")}`);
-  // --only: stay on the start rung (no escalation to pricier models on a fail)
-  const rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
-  for (const rung of rungs) {
-    const opsPrompt = [
-      OPS_PLAYBOOK,
-      feedback ? `A previous attempt failed review. Judge feedback:\n${feedback}` : "",
-      `TASK:\n${task}`,
-    ].filter(Boolean).join("\n\n");
+  const D = {
+    runRecipe: recipes.runRecipe, loadRecipe: recipes.loadRecipe, getJob: jobs.getJob, putJob: jobs.putJob,
+    propose: proposeRecipe, ...deps,
+  };
 
-    const opsRes = await run({
-      engine: rung.engine,
-      model: rung.model,
-      effort: rung.effort,
-      prompt: opsPrompt,
-      allowedTools: [`Bash(${SELF_CMD}:*)`],
-      timeoutMs,
-      verbose,
-      env: childEnv,
-    });
-    lastEvidence = extractEvidence(String(opsRes.result || ""));
-    stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
-
-    let judgeRes = await run({
-      model: JUDGE_MODEL,
-      prompt: judgePrompt(task, lastEvidence),
-      allowedTools: [],
-      timeoutMs,
-      verbose,
-    });
+  const judge = async (evidence) => {
+    let judgeRes = await run({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose });
     stages.push({ stage: "judge:fable-5.1", ...usageOf(judgeRes) });
-
     let verdict = parseVerdict(String(judgeRes.result || ""));
     if (!verdict) {
       // one re-ask on malformed JSON
       judgeRes = await run({
         model: JUDGE_MODEL,
-        prompt: judgePrompt(task, lastEvidence) +
-          "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
-        allowedTools: [],
-        timeoutMs,
-        verbose,
+        prompt: judgePrompt(task, evidence) + "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
+        allowedTools: [], timeoutMs, verbose,
       });
       stages.push({ stage: "judge:fable-5.1(retry)", ...usageOf(judgeRes) });
       verdict = parseVerdict(String(judgeRes.result || "")) ||
         { verdict: "fail", feedback: String(judgeRes.result || "judge output unreadable") };
     }
+    return verdict;
+  };
 
-    finalVerdict = verdict;
-    if (verdict.verdict === "pass") break;
-    feedback = verdict.feedback;
+  // ---- economy / audit path -------------------------------------------------
+  let state = job ? D.getJob(job) : null;
+  const recipe = job && state && state.mode !== "regular" && !state.repairNeeded ? D.loadRecipe(job) : null;
+  const planned = jobs.plan(state, !!recipe);
+  let mode = planned.mode;
+  let fellBack = false;
+  let recipeResult = null;
+
+  if (mode !== "regular") {
+    const t0 = Date.now();
+    recipeResult = await D.runRecipe(recipe, { params: opts.params || {}, env: childEnv, verbose });
+    stages.push({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
+    if (recipeResult.ok) {
+      lastEvidence = recipeResult.evidence;
+      if (planned.judge) {
+        const v = await judge(lastEvidence);
+        if (v.verdict === "pass") {
+          finalVerdict = { verdict: "pass", feedback: `${mode}${planned.canary ? " canary" : ""}: ${v.feedback}` };
+          state = jobs.transition(state, { kind: "recipe-pass", canary: planned.canary });
+        } else {
+          fellBack = true; feedback = `The deterministic recipe for this job ran but the judge rejected its evidence: ${v.feedback}`;
+          state = jobs.transition(state, { kind: "judge-fail", error: v.feedback });
+          recipeResult.failure = { step: -1, do: "judge", error: v.feedback };
+        }
+      } else {
+        finalVerdict = { verdict: "pass", feedback: "economy: recipe assertions passed (no model involved)" };
+        state = jobs.transition(state, { kind: "recipe-pass" });
+      }
+    } else {
+      fellBack = true;
+      const f = recipeResult.failure;
+      feedback = `The deterministic recipe for this job failed at step ${f.step + 1} (${f.do}): ${f.error}. Complete the task yourself.`;
+      state = jobs.transition(state, { kind: "recipe-fail", error: f.error });
+    }
+    if (fellBack && verbose) console.error(`[agent] ${mode} mode failed → falling back to the model ladder`);
   }
 
-  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: "regular" });
+  // ---- regular ladder -------------------------------------------------------
+  if (mode === "regular" || fellBack) {
+    const startIdx = opts.start
+      ? OPS_LADDER.findIndex(r => r.label === opts.start || r.model === opts.start || r.label.startsWith(opts.start))
+      : 0;
+    if (startIdx < 0) throw new Error(`unknown --start model "${opts.start}"; use one of ${OPS_LADDER.map(r => r.label).join(", ")}`);
+    // --only: stay on the start rung (no escalation to pricier models on a fail)
+    const rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
+    for (const rung of rungs) {
+      const opsPrompt = [
+        OPS_PLAYBOOK,
+        feedback ? `A previous attempt failed review. Judge feedback:\n${feedback}` : "",
+        `TASK:\n${task}`,
+      ].filter(Boolean).join("\n\n");
+
+      const opsRes = await run({
+        engine: rung.engine,
+        model: rung.model,
+        effort: rung.effort,
+        prompt: opsPrompt,
+        allowedTools: [`Bash(${SELF_CMD}:*)`],
+        timeoutMs,
+        verbose,
+        env: childEnv,
+      });
+      lastEvidence = extractEvidence(String(opsRes.result || ""));
+      stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
+
+      const verdict = await judge(lastEvidence);
+      finalVerdict = verdict;
+      if (verdict.verdict === "pass") break;
+      feedback = verdict.feedback;
+    }
+    if (state) state = jobs.transition(state, { kind: finalVerdict.verdict === "pass" ? "regular-pass" : "regular-fail" });
+  }
+
+  // ---- repair a broken recipe from this (successful) fallback run -------------
+  let repaired = null;
+  if (fellBack && finalVerdict.verdict === "pass" && !opts.noRepair) {
+    try {
+      repaired = await D.propose({
+        job, task, previous: recipe, failure: recipeResult.failure,
+        traces: [journal.readTrace(runId)], run, timeoutMs, verbose,
+      });
+      state = jobs.transition(state, { kind: "repaired", version: repaired.version });
+      stages.push({ stage: `repair:${RECIPE_MODEL}`, ...(repaired._usage || { input: 0, output: 0 }) });
+    } catch (e) {
+      if (verbose) console.error(`[agent] recipe repair failed: ${e.message}`);
+      repaired = { error: e.message };
+    }
+  }
+
+  const journalMode = mode === "regular" ? "regular" : fellBack ? `${mode}-fallback` : mode;
+  if (state) {
+    try {
+      D.putJob(jobs.pushHistory(state, { runId, mode: journalMode, verdict: finalVerdict.verdict, canary: planned.canary || undefined,
+        repaired: repaired && repaired.version ? repaired.version : undefined }));
+    } catch (e) { if (verbose) console.error(`[agent] job state write failed: ${e.message}`); }
+  }
+
+  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence });
   let journalFile = null;
   if (!opts.noJournal) {
     try { journalFile = journal.appendJournal(record); }
     catch (e) { if (verbose) console.error(`[agent] journal write failed: ${e.message}`); }
   }
-  return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, record, journalFile };
+  return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, mode: journalMode, state, repaired, record, journalFile };
+}
+
+// Ask a model to turn successful traces (or a failed recipe + fallback trace)
+// into a recipe; validate and save it. Returns the saved recipe.
+async function proposeRecipe({ job, task, traces, previous, failure, run = runModel, model = RECIPE_MODEL, timeoutMs = 10 * 60 * 1000, verbose = false }) {
+  if (!recipes.safeJob(job)) throw new Error(`invalid job name "${job}"`);
+  if (!traces || !traces.length || traces.every((t) => !t.length)) throw new Error("no traces to learn from");
+  const prompt = recipes.proposalPrompt({ job, task, traces, previous, failure });
+  const res = await run({ model, prompt, allowedTools: [], timeoutMs, verbose });
+  const obj = recipes.extractJson(String(res.result || ""));
+  if (!obj) throw new Error(`recipe model returned no JSON: ${String(res.result || "").slice(0, 300)}`);
+  obj.job = job;
+  if (!obj.task) obj.task = task;
+  if (!obj.risk) obj.risk = recipes.inferRisk(obj);
+  const errs = recipes.validateRecipe(obj);
+  if (errs.length) throw new Error(`recipe invalid: ${errs.join("; ")}`);
+  const saved = recipes.saveRecipe(obj);
+  saved._usage = usageOf(res);
+  return saved;
 }
 
 // One journal.jsonl line for a finished run. Domains come from the run's trace
 // (newTab/navigate URLs), so auto signatures group by site even without --job.
-function journalRecord({ runId, job, task, startedAt, stages, verdict, mode }) {
+function journalRecord({ runId, job, task, startedAt, stages, verdict, mode, evidence }) {
   const domains = journal.domainsFromTrace(journal.readTrace(runId));
   const sum = (k) => stages.reduce((n, s) => n + (Number(s[k]) || 0), 0);
   return {
@@ -315,6 +408,7 @@ function journalRecord({ runId, job, task, startedAt, stages, verdict, mode }) {
     stages: stages.map((s) => ({ stage: s.stage, input: s.input, output: s.output, costUsd: s.costUsd })),
     costUsd: sum("costUsd"), inputTokens: sum("input"), outputTokens: sum("output"),
     domains, trace: journal.traceFile(runId),
+    evidence: evidence ? String(evidence).slice(0, 4000) : undefined,
   };
 }
 
@@ -335,8 +429,14 @@ function printReport({ verdict, evidence, stages }) {
   if (cost > 0) console.log(`${"total".padEnd(22)} ${"".padStart(26)}  $${cost.toFixed(4)}`);
 }
 
-function printJournalLine({ runId, job, journalFile, record }) {
+function printJournalLine({ runId, job, journalFile, record, mode, state, repaired }) {
   const cmds = journal.readTrace(runId).length;
+  if (job && state) {
+    console.log(`job ${job}: ran in ${mode} mode → now ${state.mode}` +
+      (state.mode === "audit" ? ` (${state.auditPasses || 0}/${state.auditRequired} audit passes${state.repairNeeded ? ", REPAIR NEEDED" : ""})` : "") +
+      (state.mode === "economy" ? ` (canary in ${(state.canaryEvery || 5) - (state.runsSinceCanary || 0)} runs)` : "") +
+      (repaired && repaired.version ? `; recipe repaired → v${repaired.version}` : repaired && repaired.error ? `; repair failed: ${repaired.error}` : ""));
+  }
   console.log(`run ${runId}${job ? ` job=${job}` : ""}: ${cmds} bridge command(s) traced` +
     (record && record.domains.length ? ` on ${record.domains.join(", ")}` : "") +
     (journalFile ? `; journaled (bridge journal --trace ${runId})` : ""));
@@ -359,12 +459,14 @@ async function main(argv) {
     else if (args[i] === "--start") opts.start = args[++i];
     else if (args[i] === "--only") opts.only = true;
     else if (args[i] === "--job") opts.job = args[++i];
+    else if (args[i] === "--params") opts.params = JSON.parse(args[++i]);
+    else if (args[i] === "--no-repair") opts.noRepair = true;
     else if (args[i] === "--help" || args[i] === "-h") { rest.length = 0; break; }
     else rest.push(args[i]);
   }
   const task = rest.join(" ").trim();
   if (!task) {
-    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name]');
+    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name] [--params json] [--no-repair]');
     process.exit(2);
   }
 
@@ -388,4 +490,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL };
+module.exports = { main, runAgent, proposeRecipe, runModel, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL };

@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+// Unit tests for recipes (templating, validation, runner with a mocked bridge)
+// and the per-job state machine. Temp AI_BRIDGE_HOME; no browser, no models.
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+process.env.AI_BRIDGE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-recipe-"));
+const R = require("../server/recipe.js");
+const J = require("../server/jobs.js");
+
+let failures = 0;
+const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}`); if (!cond) failures++; };
+
+(async () => {
+  // ---- templating
+  const now = new Date(2026, 10, 15, 12); // 2026-11-15 local
+  assert(R.render("{{date:-7:MM/DD/YYYY}}..{{date:0:YYYY-MM-DD}}", {}, now) === "11/08/2026..2026-11-15", "render: date offsets + formats");
+  assert(R.render("tab {{tab}} n={{len:rows}} p={{params.days}} j={{json:rows}}", { tab: 7, rows: [1, 2], params: { days: 7 } }, now) ===
+    "tab 7 n=2 p=7 j=[1,2]", "render: vars, len, json, params");
+  assert(R.render("{{date:-{{params.days}}:M/D/YYYY}}", { params: { days: 10 } }, now) === "11/5/2026", "render: nested template resolves inner first");
+  assert(R.render("keep {{unknown}}", {}, now) === "keep {{unknown}}", "render: unknown var left as-is");
+  assert(R.renderDeep({ a: ["{{tab}}"], b: { c: "{{tab}}" } }, { tab: 3 }).a[0] === "3", "renderDeep: arrays + objects");
+
+  // ---- validation
+  const good = { job: "toll", steps: [{ do: "newTab", url: "https://x" }, { do: "assert", code: "1" }, { do: "poll", code: "rows", save: "rows" }], output: "rows", risk: "read" };
+  assert(R.validateRecipe(good).length === 0, "validate: good recipe");
+  const bad = { job: "bad job!", steps: [{ do: "click" }, { do: "eval" }, { nope: 1 }], risk: "maybe", output: 3 };
+  const errs = R.validateRecipe(bad);
+  assert(errs.length === 6, `validate: 6 errors on a bad recipe (got ${errs.length}: ${errs.join("; ")})`);
+  assert(R.inferRisk(good) === "read" && R.inferRisk({ steps: [{ do: "click", selector: "x" }] }) === "write", "inferRisk: click => write");
+  assert(R.safeJob("../x") === null && R.safeJob("toll-roads.pull_1") === "toll-roads.pull_1", "safeJob");
+
+  // ---- storage + versions
+  const s1 = R.saveRecipe({ ...good });
+  const s2 = R.saveRecipe({ ...good, steps: good.steps.slice(0, 2) });
+  assert(s1.version === 1 && s2.version === 2 && R.loadRecipe("toll").version === 2, "saveRecipe: versions bump, current = latest");
+  assert(fs.existsSync(R.recipeFile("toll", 1)) && fs.existsSync(R.recipeFile("toll", 2)), "saveRecipe: immutable version files kept");
+
+  // ---- runner with a mocked bridge
+  function mockExec(script) {
+    const calls = [];
+    const exec = async (cmd, params) => {
+      calls.push({ cmd, params });
+      const h = script[cmd];
+      const r = typeof h === "function" ? h(params, calls) : h;
+      if (r instanceof Error) return { ok: false, error: r.message, ms: 1 };
+      return { ok: true, result: r === undefined ? { ok: true } : r, ms: 1 };
+    };
+    return { exec, calls };
+  }
+  const recipe = {
+    job: "toll", version: 3, risk: "read", task: "pull tolls", params: { days: 7 }, output: "rows",
+    evidence: "Pulled {{len:rows}} rows {{date:-{{params.days}}:MM/DD/YYYY}}..{{date:0:MM/DD/YYYY}}",
+    steps: [
+      { do: "newTab", url: "https://site/tx" },
+      { do: "waitFor", selector: "#btn-view", timeoutMs: 100 },
+      { do: "assert", code: "!location.href.includes('/login')", message: "LOGIN REQUIRED" },
+      { do: "eval", code: "setDates('{{date:-{{params.days}}:MM/DD/YYYY}}')", save: "set" },
+      { do: "click", selector: "#btn-view" },
+      { do: "poll", code: "rows()", timeoutMs: 3000, intervalMs: 10, save: "rows" },
+      { do: "eval", code: "optional thing", optional: true },
+    ],
+  };
+  {
+    let polls = 0;
+    const m = mockExec({
+      newTab: { id: 42, windowId: 9 },
+      eval: (p) => p.code.startsWith("!location") ? true : p.code.startsWith("setDates") ? "11/08/2026 set" : p.code === "rows()" ? (++polls < 3 ? [] : [{ a: 1 }, { a: 2 }]) : new Error("nope"),
+    });
+    const r = await R.runRecipe(recipe, { exec: m.exec, now, params: { days: 7 } });
+    assert(r.ok === true, "run: ok");
+    assert(m.calls[0].cmd === "newTab" && m.calls[0].params.newWindow === true, "run: newTab defaults to its own window");
+    assert(m.calls[1].params.tabId === 42 && m.calls[4].cmd === "click" && m.calls[4].params.tabId === 42, "run: tabId flows from newTab to later steps");
+    assert(m.calls[3].params.code === "setDates('11/08/2026')", "run: nested date template rendered in eval code");
+    assert(polls === 3 && Array.isArray(r.output) && r.output.length === 2, "run: poll retried until non-empty, output saved");
+    assert(r.steps[6].ok && r.steps[6].skipped, "run: optional step failure is skipped");
+    assert(m.calls[m.calls.length - 1].cmd === "closeTab", "run: tab closed at the end");
+    assert(r.evidence.includes("EVIDENCE REPORT") && r.evidence.includes("Pulled 2 rows 11/08/2026..11/15/2026") && r.evidence.includes('Output (rows): [{"a":1},{"a":2}]'),
+      "run: evidence report with rendered summary + output");
+  }
+  {
+    // assert failure -> abort, digest captured, tab closed
+    const m = mockExec({ newTab: { id: 5 }, eval: (p) => p.code.startsWith("!location") ? false : "x", snapshot: { url: "https://site/login", elements: [] } });
+    const r = await R.runRecipe(recipe, { exec: m.exec, now });
+    assert(r.ok === false && r.failure.step === 2 && r.failure.error === "LOGIN REQUIRED", "run: assert fails with its message");
+    assert(r.failure.digest && r.failure.digest.url === "https://site/login", "run: digest captured at failure");
+    assert(r.steps.length === 3 && m.calls.some((c) => c.cmd === "closeTab"), "run: stops at the failing step, closes tab");
+    assert(r.evidence.includes("Blockers: LOGIN REQUIRED"), "run: evidence names the blocker");
+  }
+  {
+    // poll timeout
+    const m = mockExec({ newTab: { id: 5 }, eval: (p) => p.code === "rows()" ? [] : true, snapshot: {} });
+    const r = await R.runRecipe({ ...recipe, steps: [recipe.steps[0], { ...recipe.steps[5], timeoutMs: 30 }] }, { exec: m.exec, now });
+    assert(r.ok === false && /poll timed out/.test(r.failure.error), "run: poll times out");
+  }
+
+  // ---- proposal prompt + JSON extraction
+  const prompt = R.proposalPrompt({ job: "toll", task: "pull", traces: [[{ cmd: "newTab", params: { url: "u" }, ok: true, result: { id: 1 } }]] });
+  assert(prompt.includes("RECIPE FORMAT") && prompt.includes("SUCCESSFUL RUN 1") && prompt.includes('"cmd":"newTab"'), "proposalPrompt: spec + traces");
+  const rp = R.proposalPrompt({ job: "toll", task: "pull", traces: [[]], previous: { version: 2, steps: [] }, failure: { step: 1, do: "click", error: "no el", digest: { url: "x" } } });
+  assert(rp.includes("PREVIOUS RECIPE (v2)") && rp.includes("FAILURE: step 2 (click): no el") && rp.includes("REPAIRED"), "proposalPrompt: repair variant");
+  assert(R.extractJson('here\n```json\n{"job":"x","steps":[]}\n```').job === "x" && R.extractJson("noise {\"a\":1} tail").a === 1 && R.extractJson("none") === null, "extractJson");
+  assert(R.compactTrace([{ cmd: "eval", params: { code: "x".repeat(5000) }, ok: true }], { maxEntryChars: 100 }).length <= 102, "compactTrace caps entries");
+
+  // ---- job state machine
+  let st = J.getJob("toll");
+  assert(st.mode === "regular" && st.auditRequired === 3 && st.canaryEvery === 5, "jobs: defaults");
+  assert(J.plan(st, true).mode === "regular", "plan: regular mode ignores recipe");
+  st = J.transition({ ...st, risk: "read" }, { kind: "repaired", version: 1 });
+  assert(st.mode === "audit" && st.auditPasses === 0 && st.recipeVersion === 1, "transition: repaired -> audit");
+  assert(J.plan(st, true).mode === "audit" && J.plan(st, true).judge === true && J.plan(st, false).mode === "regular", "plan: audit judges; no recipe -> regular");
+  st = J.transition(st, { kind: "recipe-pass" }); st = J.transition(st, { kind: "recipe-pass" });
+  assert(st.mode === "audit" && st.auditPasses === 2, "transition: 2 audit passes stay in audit");
+  st = J.transition(st, { kind: "recipe-pass" });
+  assert(st.mode === "economy" && st.runsSinceCanary === 0, "transition: 3rd pass with risk=read -> economy");
+  let w = J.transition({ ...J.getJob("w"), mode: "audit", auditPasses: 2, risk: "write" }, { kind: "recipe-pass" });
+  assert(w.mode === "audit" && w.auditPasses === 3, "transition: risk=write never leaves audit");
+  let p = J.plan(st, true);
+  assert(p.mode === "economy" && p.judge === false, "plan: economy, no judge");
+  for (let i = 0; i < 4; i++) st = J.transition(st, { kind: "recipe-pass" });
+  p = J.plan(st, true);
+  assert(st.runsSinceCanary === 4 && p.judge === true && p.canary === true, "plan: 5th economy run is a judge canary");
+  st = J.transition(st, { kind: "recipe-pass", canary: true });
+  assert(st.runsSinceCanary === 0, "transition: canary pass resets counter");
+  st = J.transition(st, { kind: "recipe-fail", error: "boom" });
+  assert(st.mode === "audit" && st.repairNeeded === true && st.auditPasses === 0 && st.lastFailure === "boom", "transition: recipe-fail -> audit + repair needed");
+  st = J.transition(st, { kind: "repaired", version: 2 });
+  assert(st.repairNeeded === false && st.recipeVersion === 2, "transition: repaired clears flag");
+  J.putJob(J.pushHistory(st, { event: "test" }));
+  const back = J.getJob("toll");
+  assert(back.mode === "audit" && back.history.length === 1 && fs.existsSync(J.JOBS_FILE), "jobs: persisted + reloaded");
+  assert(J.formatTable(J.loadJobs()).includes("toll") && J.formatTable(J.loadJobs()).includes("0/3"), "jobs: table");
+
+  console.log(failures === 0 ? "\nAll recipe tests passed." : `\n${failures} test(s) FAILED.`);
+  process.exit(failures ? 1 : 0);
+})();

@@ -167,7 +167,7 @@ Requirements & notes:
 - Tag recurring jobs with `--job <name>` (e.g. from cron or a bot) so the journal
   can group them.
 
-### Journal, traces and `snapshot` (economy mode, step 1)
+### Economy mode: journal, recipes, audit → economy
 
 Every agent run is journaled, and every bridge command it issues is traced, so
 you can see which jobs repeat and what they cost — the first step towards
@@ -187,6 +187,24 @@ Files live under `~/.ai-browser-bridge/`: `journal.jsonl` (one line per run) and
 results previewed). `snapshot` replaces most screenshots in the ops playbook: a
 few KB of labelled elements with selectors you can pass straight to
 `click {"selector"}` / `waitFor`, instead of an image the model has to guess at.
+
+Once a job has a few passing runs, turn it into a **recipe** — a deterministic
+replay with assertions that costs zero tokens:
+
+```bash
+bridge recipe propose toll-roads-pull     # one model call reads the last 3 traces → recipes/<job>.json; job → AUDIT
+bridge agent "…" --job toll-roads-pull    # audit: recipe runs, the judge verifies; 3 passes (risk=read) → ECONOMY
+bridge agent "…" --job toll-roads-pull    # economy: recipe only, no model; a judge canary every 5th run
+bridge jobs                               # mode / risk / audit progress per job
+bridge recipe run toll-roads-pull         # replay by hand
+```
+
+If a recipe step fails (selector gone, login page, judge disagrees), that run
+falls back to the model ladder so the job still completes, the recipe is
+repaired from the fallback's trace, and the job returns to audit. Jobs whose
+recipes write to the outside world (`risk: write`) stay in audit — recipe plus
+judge every time — unless you allow economy with `bridge jobs set <job> --risk read`.
+Details: [docs/ECONOMY-MODE.md](docs/ECONOMY-MODE.md).
 
 ## Concurrency
 
@@ -258,6 +276,7 @@ npm test    # spins up the server, a simulated extension, and the real CLI; asse
 extension/    Manifest V3 extension (service worker + options page)
 server/       relay server (server.js), CLI client (cli.js), token-saver agent (agent.js),
               run journal + command traces (journal.js), DOM digest (snapshot.js),
+              recipes + runner (recipe.js, recipe-cli.js), per-job economy state (jobs.js),
               native messaging host (native-host.js) + its registrar (register-native-host.js),
               main.js = dispatcher for the single-executable build
 scripts/      build-sea.js — Node SEA build of the `ai-bridge` binary (npm run build:sea)

@@ -41,6 +41,8 @@ if (argv.length === 0) {
   console.error('       bridge agent "task description" [--timeout ms] [--verbose] [--job name]');
   console.error("       bridge snapshot '{\"tabId\":N}' [--debugger]   # DOM digest: text + interactive elements with selectors");
   console.error("       bridge journal [--days N] [--job name] [--json] | --trace <runId>");
+  console.error("       bridge recipe propose|run|show <job> | validate|import <file>   # economy mode recipes");
+  console.error("       bridge jobs [set <job> --mode regular|audit|economy --risk read|write] | reset <job>");
   console.error("       bridge claude-md [--project] [--print]   # teach Claude Code the bridge (writes CLAUDE.md)");
   console.error("  Direct mode is the DEFAULT: commands use ordinary extension APIs and");
   console.error("  never attach chrome.debugger (no DevTools session, no debugging banner).");
@@ -65,6 +67,12 @@ if (argv[0] === "agent") {
 
 // `bridge journal` — runs grouped by job signature; `--trace <runId>` dumps one run's commands.
 if (argv[0] === "journal") { require("./journal").main(argv.slice(1)); return; }
+// `bridge recipe …` / `bridge jobs …` — economy mode: deterministic replays + per-job state.
+if (argv[0] === "recipe") {
+  require("./recipe-cli").main(argv.slice(1)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
+  return;
+}
+if (argv[0] === "jobs") { require("./jobs").main(argv.slice(1)); return; }
 
 let cmd = argv[0];
 let params = {};

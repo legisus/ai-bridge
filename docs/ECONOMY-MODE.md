@@ -11,9 +11,9 @@ recipe breaks, to repair it.
 |---|---|---|---|
 | Journal | `bridge agent` + server | none | **this PR** |
 | Snapshot (DOM digest instead of screenshots) | `bridge snapshot` | cheaper ops | **this PR** |
-| Recipe runner | `bridge recipe run <job>` | none | next PR |
-| Recipe proposal from traces | one model call, offline | one call per job | next PR |
-| Audit / economy state machine | `bridge agent --job <name>` | judge only, then none | next PR |
+| Recipe runner | `bridge recipe run <job>` | none | **this PR** |
+| Recipe proposal from traces | `bridge recipe propose <job>` | one call per job (~$0.30) | **this PR** |
+| Audit / economy state machine | `bridge agent --job <name>` | judge only, then none | **this PR** |
 
 ## Journal (this PR)
 
@@ -52,7 +52,34 @@ roots and same-origin iframes. It is implemented as a direct-mode `eval`, so it
 needs no extension update. The ops playbook now tells models to use it first
 and screenshot only when the digest is insufficient.
 
-## State machine (next PR)
+## Recipes
+
+`~/.ai-browser-bridge/recipes/<job>.json` (current) + `<job>.v<N>.json` (every
+version). A recipe is JSON: `job`, `task`, `risk` (`read`|`write`), `params`
+(templates allowed, e.g. `{"fromDate":"{{date:-7:MM/DD/YYYY}}"}`), `steps`,
+`output` (saved variable returned as the result), `evidence` (one-line summary
+template). Steps are bridge commands (`newTab`, `navigate`, `waitFor`, `click`,
+`insertText`, `key`, `eval`, `snapshot`, `closeTab`, …) plus `assert` (fail the
+run if a JS expression is falsy, with a message such as `LOGIN REQUIRED`),
+`poll` (repeat an expression until truthy/non-empty) and `sleep`. `save` stores
+a step's result for `{{var}}`, `{{json:var}}`, `{{len:var}}`; `{{tab}}` is the
+first opened tab and the default `tabId`; `optional: true` steps may fail.
+
+The runner (`server/recipe.js`) executes through the bridge CLI under the run's
+`AI_BRIDGE_RUN_ID`, so recipe runs are traced like model runs. It produces an
+EVIDENCE REPORT in the same format as the ops models, so the judge can verify
+it unchanged. On a failing step it captures a `snapshot` digest of the tab and
+closes the tab.
+
+```bash
+bridge recipe propose <job> [--runs 3]   # learn from the job's last 3 passing regular runs (claude-opus-5-5)
+bridge recipe run <job> [--params json]  # replay by hand, zero tokens
+bridge recipe show <job> | validate <file> | import <file>
+bridge jobs                              # per-job mode / risk / audit progress / canary countdown
+bridge jobs set <job> --mode audit|economy|regular --risk read|write --audits 3 --canary 5
+```
+
+## State machine
 
 ```
 regular ──(≥3 passes in 30 d)──► candidate ──(recipe proposed)──► audit
@@ -73,3 +100,22 @@ Protections in economy mode:
 
 State lives in `~/.ai-browser-bridge/jobs.json`; recipes in
 `~/.ai-browser-bridge/recipes/<job>.json`, versioned on every repair.
+
+What `bridge agent "…" --job X` does per mode (`server/agent.js`):
+
+| job mode | what runs | tokens | on failure |
+|---|---|---|---|
+| regular (or no recipe / repair needed) | model ladder + judge | as before | ladder escalates |
+| audit | recipe, then judge on its evidence | judge only | fallback to the ladder, recipe repaired from this run's trace, back to audit |
+| economy | recipe only; judge every `canaryEvery`-th run | none (canary: judge) | same fallback + repair |
+
+Journal `mode` values: `regular`, `audit`, `economy`, `audit-fallback`,
+`economy-fallback`. The repair step is one model call (`--no-repair` to skip).
+
+## First jobs (2026-11-15)
+
+- `toll-roads-pull` — Toll Roads "Find a Transaction" for the last 7 days, read-only.
+  3 regular runs (~$0.67 each) → recipe v1 proposed ($0.29) → v2 with relative
+  date params → audit.
+- `mcw-memberships-pull` — Mister Car Wash membership list (Default Chrome
+  profile), read-only.

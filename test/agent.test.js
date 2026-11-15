@@ -120,6 +120,74 @@ function mockRun(judgeVerdicts) {
     assert(m.calls[0].env.AI_BRIDGE_JOB === undefined, "journal: no AI_BRIDGE_JOB without --job");
   }
 
+  // 10) economy mode paths: audit -> economy, economy without judge, fallback + repair
+  {
+    const jobs = require("../server/jobs.js");
+    const recipe = { job: "toll", version: 2, risk: "read", task: "pull", steps: [{ do: "newTab", url: "u" }], output: "rows" };
+    let recipeOk = true;
+    const recipeCalls = [];
+    const deps = {
+      loadRecipe: () => recipe,
+      runRecipe: async (r, o) => {
+        recipeCalls.push({ version: r.version, env: o.env });
+        return recipeOk
+          ? { ok: true, evidence: "EVIDENCE REPORT\nTask: pull\nFinal state: 3 rows", steps: [], output: [1, 2, 3] }
+          : { ok: false, evidence: "EVIDENCE REPORT\nBlockers: LOGIN REQUIRED", steps: [], failure: { step: 2, do: "assert", error: "LOGIN REQUIRED", digest: { url: "x" } } };
+      },
+      propose: async ({ job, previous, failure, traces }) => ({ job, version: (previous.version || 0) + 1, steps: [], _usage: { input: 1, output: 1 }, _failure: failure, _traces: traces }),
+    };
+    // seed: job in audit with the recipe
+    jobs.putJob({ job: "toll", mode: "audit", risk: "read", auditPasses: 0, auditRequired: 3, canaryEvery: 3, runsSinceCanary: 0, recipeVersion: 2, history: [] });
+
+    // audit pass #1: recipe + judge, no ops model
+    let m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    let r = await runAgent("pull", { job: "toll", runId: "eco00000001" }, m.run, deps);
+    assert(r.mode === "audit" && r.verdict.verdict === "pass", "economy: audit run passes via recipe + judge");
+    assert(m.calls.length === 1 && m.calls[0].model === JUDGE_MODEL, "economy: audit spends only the judge call");
+    assert(recipeCalls[0].env.AI_BRIDGE_RUN_ID === "eco00000001" && recipeCalls[0].env.AI_BRIDGE_JOB === "toll", "economy: recipe run is traced under the run id");
+    assert(r.stages[0].stage === "recipe:toll@v2" && r.stages[0].costUsd === 0, "economy: recipe stage costs 0");
+    assert(jobs.getJob("toll").auditPasses === 1 && jobs.getJob("toll").mode === "audit", "economy: audit pass counted");
+
+    // audit passes #2, #3 -> economy
+    for (const id of ["eco00000002", "eco00000003"]) await runAgent("pull", { job: "toll", runId: id }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(jobs.getJob("toll").mode === "economy", "economy: third audit pass switches to economy");
+
+    // economy run: no model at all
+    m = mockRun([]);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000004" }, m.run, deps);
+    assert(r.mode === "economy" && r.verdict.verdict === "pass" && m.calls.length === 0 && r.record.costUsd === 0, "economy: run with zero model calls");
+
+    // second economy run, then the 3rd is a canary (canaryEvery=3) -> judge called once
+    await runAgent("pull", { job: "toll", runId: "eco00000005" }, mockRun([]).run, deps);
+    m = mockRun(['{"verdict":"pass","feedback":"still fine"}']);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000006" }, m.run, deps);
+    assert(m.calls.length === 1 && /canary/.test(r.stages[0].stage) && r.verdict.feedback.includes("canary"), "economy: periodic canary judges the recipe evidence");
+    assert(jobs.getJob("toll").runsSinceCanary === 0, "economy: canary resets the counter");
+
+    // recipe failure -> fallback to the ladder (ops opus + judge), state back to audit, recipe repaired
+    recipeOk = false;
+    m = mockRun(['{"verdict":"pass","feedback":"done by model"}']);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000007" }, m.run, deps);
+    assert(r.mode === "economy-fallback" && r.verdict.verdict === "pass", "fallback: economy failure completes via the ladder");
+    assert(m.calls[0].model === "claude-opus-5-5" && m.calls[0].prompt.includes("LOGIN REQUIRED"), "fallback: ops model told why the recipe failed");
+    assert(r.repaired && r.repaired.version === 3 && r.repaired._failure.error === "LOGIN REQUIRED", "fallback: recipe repaired from the failure + fallback trace");
+    const st = jobs.getJob("toll");
+    assert(st.mode === "audit" && st.auditPasses === 0 && st.repairNeeded === false && st.recipeVersion === 3, "fallback: job back in audit with the repaired recipe");
+    assert(r.stages.some((s) => s.stage.startsWith("repair:")), "fallback: repair stage reported");
+
+    // judge rejects recipe evidence in audit -> fallback too; --no-repair skips repair
+    recipeOk = true;
+    m = mockRun(['{"verdict":"fail","feedback":"rows look stale"}', '{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000008", noRepair: true }, m.run, deps);
+    assert(r.mode === "audit-fallback" && r.verdict.verdict === "pass" && r.repaired === null, "fallback: judge-fail in audit falls back; --no-repair");
+    assert(jobs.getJob("toll").repairNeeded === true, "fallback: repair still flagged when skipped");
+
+    // repairNeeded -> next run goes regular (no recipe attempt)
+    recipeCalls.length = 0;
+    r = await runAgent("pull", { job: "toll", runId: "eco00000009" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(r.mode === "regular" && recipeCalls.length === 0, "fallback: repair-needed job runs regular until repaired");
+  }
+
   // 7) recursion guard: agent.js refuses to start when spawned by the agent
   {
     const { execFile } = require("child_process");
