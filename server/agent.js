@@ -1,6 +1,6 @@
 // AI Browser Bridge — token-saver agent.
 //
-//   bridge agent "task description" [--timeout ms] [--verbose] [--start fable-5.1]
+//   bridge agent "task description" [--timeout ms] [--verbose] [--start fable-5.1] [--job name]
 //
 // Completes a browser task by spawning headless Claude Code sessions
 // (`claude -p`), so usage bills to the user's existing Claude subscription,
@@ -12,13 +12,26 @@
 //
 // The judge only ever sees the task + the ops session's evidence report,
 // never the full browsing transcript, so Fable's token spend stays minimal.
+//
+// Every run gets a run id. Child processes receive AI_BRIDGE_RUN_ID/AI_BRIDGE_JOB,
+// the CLI forwards them, and the server traces each bridge command to
+// traces/<runId>.jsonl; the run itself is appended to journal.jsonl
+// (`bridge journal`). See docs/ECONOMY-MODE.md.
 
 "use strict";
 
-const { spawn } = require("child_process");
+const { spawn, exec: shellExec } = require("child_process");
+const crypto = require("crypto");
 const path = require("path");
 
 const { SELF_CMD, selfArgs } = require("./runtime");
+const journal = require("./journal");
+const recipes = require("./recipe");
+const jobs = require("./jobs");
+
+const RECIPE_MODEL = process.env.AI_BRIDGE_RECIPE_MODEL || "claude-opus-5-5";
+// Cheap classifier that settles "is this the same job?" when word overlap is inconclusive.
+const MATCH_MODEL = process.env.AI_BRIDGE_MATCH_MODEL || "claude-haiku-5-5";
 
 const OPS_LADDER = [
   { model: "claude-opus-5-5", label: "opus-5.5" },
@@ -36,7 +49,8 @@ commands directly, like:
     ${SELF_CMD} <cmd> [params-json] [--file js] [--out file]
 
 Commands: ping, listTabs, newTab {"url", "newWindow"?, "windowId"?},
-navigate {"tabId","url"}, eval {"tabId","code"}, click {"tabId","x","y"},
+navigate {"tabId","url"}, snapshot {"tabId", "maxText"?, "root"?},
+eval {"tabId","code"}, waitFor {"tabId","selector"}, click {"tabId","selector"} or {"tabId","x","y"},
 insertText {"tabId","text"}, key {"tabId","key"}, screenshot {"tabId"} --out f.png,
 pdf, download, selectTab {"tabId"}, closeTab, detach {"tabId"}.
 
@@ -52,10 +66,14 @@ Rules:
   NOT use activateTab (it raises the window over what the user is doing). To
   screenshot, first run selectTab {"tabId"} — it makes the tab active within
   YOUR window without focusing it — then screenshot immediately.
-- Prefer eval for reading pages; use click/insertText/key only when a site
-  rejects synthetic events.
-- After a click, verify focus/position with eval before typing; screenshot
-  to locate elements when unsure.
+- READ PAGES WITH snapshot, NOT SCREENSHOTS. snapshot returns the visible
+  text plus every interactive element with a label, state and a CSS selector
+  you can pass straight to click {"selector"} / waitFor / eval. It costs a
+  fraction of a screenshot's tokens. Use eval for anything the digest lacks.
+  Take a screenshot only when the digest cannot explain what you see (canvas,
+  image-only content, layout questions).
+- After a click, re-run snapshot (or eval) to verify focus/position before
+  typing — page layouts shift while loading.
 - detach from tabs and close your window's tabs when finished (unless the
   task says to leave a tab open).
 - This is the user's real browser: never log out, change account settings,
@@ -92,7 +110,7 @@ Reply with ONLY a JSON object, no other text:
 
 // Spawn `claude -p` and resolve with the parsed --output-format json result.
 // Injectable via deps for testing.
-function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
+function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env }) {
   return new Promise((resolve, reject) => {
     const args = ["-p", prompt, "--model", model, "--output-format", "json"];
     if (allowedTools && allowedTools.length) {
@@ -107,7 +125,7 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
     // no matter how the ops model spells the command.
     const child = spawn("claude", args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, AI_BRIDGE_AGENT: "1" },
+      env: { ...process.env, AI_BRIDGE_AGENT: "1", ...(env || {}) },
     });
     let out = "";
     let err = "";
@@ -140,7 +158,7 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose }) {
 // ladder treats both engines alike. The sandbox allows network so the bridge
 // CLI can reach the localhost relay; cwd stays the caller's so screenshots land
 // where Claude ops sessions put them.
-function runCodex({ model, effort, prompt, timeoutMs, verbose }) {
+function runCodex({ model, effort, prompt, timeoutMs, verbose, env }) {
   const fs = require("fs");
   const os = require("os");
   return new Promise((resolve, reject) => {
@@ -152,7 +170,7 @@ function runCodex({ model, effort, prompt, timeoutMs, verbose }) {
       "-C", process.cwd(), "-o", outPath, prompt];
     const child = spawn("codex", args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, AI_BRIDGE_AGENT: "1" },
+      env: { ...process.env, AI_BRIDGE_AGENT: "1", ...(env || {}) },
     });
     let err = "";
     const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
@@ -211,71 +229,323 @@ function usageOf(res) {
   };
 }
 
-// The escalation ladder. `run` is injectable for tests.
-async function runAgent(task, opts = {}, run = runModel) {
+// The escalation ladder. `run` is injectable for tests; `deps` lets tests
+// stub the recipe runner / job store.
+//
+// With --job and a recipe in audit or economy mode, the recipe runs first
+// (zero tokens). Audit: the judge verifies its evidence. Economy: no judge
+// except a periodic canary. Any recipe or judge failure falls back to the
+// regular model ladder for this run and the recipe is repaired afterwards.
+async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
   const verbose = !!opts.verbose;
+  const runId = opts.runId || crypto.randomBytes(6).toString("hex");
+  const startedAt = new Date().toISOString();
   const stages = [];
   let feedback = "";
   let lastEvidence = "";
   let finalVerdict = null;
 
-  const startIdx = opts.start
-    ? OPS_LADDER.findIndex(r => r.label === opts.start || r.model === opts.start || r.label.startsWith(opts.start))
-    : 0;
-  if (startIdx < 0) throw new Error(`unknown --start model "${opts.start}"; use one of ${OPS_LADDER.map(r => r.label).join(", ")}`);
-  // --only: stay on the start rung (no escalation to pricier models on a fail)
-  const rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
-  for (const rung of rungs) {
-    const opsPrompt = [
-      OPS_PLAYBOOK,
-      feedback ? `A previous attempt failed review. Judge feedback:\n${feedback}` : "",
-      `TASK:\n${task}`,
-    ].filter(Boolean).join("\n\n");
+  const D = {
+    runRecipe: recipes.runRecipe, loadRecipe: recipes.loadRecipe, getJob: jobs.getJob, putJob: jobs.putJob,
+    loadJobs: jobs.loadJobs, readJournal: journal.readJournal, readTrace: journal.readTrace,
+    propose: proposeRecipe, runLogin: runLoginCmd, ...deps,
+  };
+  let blocker = null; // "auth" when the site wants a login nobody here can give
 
-    const opsRes = await run({
-      engine: rung.engine,
-      model: rung.model,
-      effort: rung.effort,
-      prompt: opsPrompt,
-      allowedTools: [`Bash(${SELF_CMD}:*)`],
-      timeoutMs,
-      verbose,
-    });
-    lastEvidence = extractEvidence(String(opsRes.result || ""));
-    stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
+  // ---- which job is this? explicit --job, or matched from the task text -------
+  const auto = !opts.noAuto && opts.job !== "none";
+  let job = opts.job && opts.job !== "none" ? String(opts.job).trim() : null;
+  let autoMatch = null;
+  if (!job && auto) {
+    const found = jobs.findJobForTask(task, D.loadJobs());
+    if (found.match) autoMatch = found.match;
+    else if (found.uncertain.length) {
+      const res = await run({ model: MATCH_MODEL, prompt: jobs.classifyPrompt(task, found.uncertain), allowedTools: [], timeoutMs, verbose });
+      stages.push({ stage: `match:${MATCH_MODEL}`, ...usageOf(res) });
+      const obj = recipes.extractJson(String(res.result || ""));
+      if (obj && obj.job && found.uncertain.some((u) => u.job === obj.job) && (obj.confidence == null || obj.confidence >= 0.7)) {
+        autoMatch = { job: obj.job, score: Number(obj.confidence) || 0, exact: false, byModel: true, why: obj.why };
+      }
+    }
+    if (autoMatch) job = autoMatch.job;
+  }
+  // Child model processes inherit these; the CLI tags every bridge command
+  // with them and the server writes traces/<runId>.jsonl.
+  let childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}) };
 
-    let judgeRes = await run({
-      model: JUDGE_MODEL,
-      prompt: judgePrompt(task, lastEvidence),
-      allowedTools: [],
-      timeoutMs,
-      verbose,
-    });
+  const judge = async (evidence) => {
+    let judgeRes = await run({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose });
     stages.push({ stage: "judge:fable-5.1", ...usageOf(judgeRes) });
-
     let verdict = parseVerdict(String(judgeRes.result || ""));
     if (!verdict) {
       // one re-ask on malformed JSON
       judgeRes = await run({
         model: JUDGE_MODEL,
-        prompt: judgePrompt(task, lastEvidence) +
-          "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
-        allowedTools: [],
-        timeoutMs,
-        verbose,
+        prompt: judgePrompt(task, evidence) + "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
+        allowedTools: [], timeoutMs, verbose,
       });
       stages.push({ stage: "judge:fable-5.1(retry)", ...usageOf(judgeRes) });
       verdict = parseVerdict(String(judgeRes.result || "")) ||
         { verdict: "fail", feedback: String(judgeRes.result || "judge output unreadable") };
     }
+    return verdict;
+  };
 
-    finalVerdict = verdict;
-    if (verdict.verdict === "pass") break;
-    feedback = verdict.feedback;
+  // ---- economy / audit path -------------------------------------------------
+  let state = job ? D.getJob(job) : null;
+  const recipe = job && state && state.mode !== "regular" && !state.repairNeeded ? D.loadRecipe(job) : null;
+  const planned = jobs.plan(state, !!recipe);
+  // A wording this job has not been judged with yet is verified once, even in
+  // economy mode; after a pass it is remembered and later runs are free.
+  const newPhrasing = !!autoMatch && !autoMatch.exact;
+  if (planned.mode === "economy" && newPhrasing && !planned.judge) { planned.judge = true; planned.phrasing = true; }
+  let mode = planned.mode;
+  let fellBack = false;
+  let mismatch = false;
+  let recipeResult = null;
+
+  if (mode !== "regular") {
+    const t0 = Date.now();
+    recipeResult = await D.runRecipe(recipe, { params: opts.params || {}, env: childEnv, verbose });
+    stages.push({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
+    // Session expired? Run the job's login hook (if any) and replay once. A
+    // model cannot log in either, so without a hook this run ends here.
+    if (!recipeResult.ok && recipeResult.failure.kind === "auth") {
+      if (state.loginCmd) {
+        const t1 = Date.now();
+        const login = await D.runLogin(state.loginCmd, { timeoutMs: 5 * 60 * 1000, verbose });
+        stages.push({ stage: "login-hook", input: 0, output: 0, costUsd: 0, ms: Date.now() - t1, ok: login.ok });
+        if (login.ok) {
+          recipeResult = await D.runRecipe(recipe, { params: opts.params || {}, env: childEnv, verbose });
+          stages.push({ stage: `recipe:${job}@v${recipe.version}(after login)`, input: 0, output: 0, costUsd: 0 });
+        } else if (verbose) console.error(`[agent] login hook failed: ${login.error}`);
+      }
+      if (!recipeResult.ok && recipeResult.failure.kind === "auth") {
+        blocker = "auth";
+        lastEvidence = recipeResult.evidence;
+        finalVerdict = { verdict: "fail", feedback: `LOGIN REQUIRED on ${(recipe.steps.find((st) => st.url) || {}).url || job}: the session expired and ${state.loginCmd ? "the login hook did not restore it" : "the job has no login hook (bridge jobs set " + job + " --login-cmd \"…\")"}. Not escalated to models (they cannot log in either); recipe left unchanged.` };
+        state = jobs.transition(state, { kind: "auth-fail", error: recipeResult.failure.error });
+      }
+    }
+    if (blocker) { /* skip the rest of the recipe handling */ }
+    else if (recipeResult.ok) {
+      lastEvidence = recipeResult.evidence;
+      if (planned.judge) {
+        const v = await judge(lastEvidence);
+        if (v.verdict === "pass") {
+          finalVerdict = { verdict: "pass", feedback: `${mode}${planned.canary ? " canary" : planned.phrasing ? " (new wording verified)" : ""}: ${v.feedback}` };
+          state = jobs.transition(state, { kind: "recipe-pass", canary: planned.canary });
+          state = rememberVariant(state, task);
+        } else if (newPhrasing) {
+          // The task was only matched to this job heuristically and the judge
+          // says the recipe's result does not satisfy it: wrong job, not a
+          // broken recipe. No penalty for the job; run the task on its own.
+          mismatch = true; fellBack = true; job = null; state = null;
+          childEnv = { AI_BRIDGE_RUN_ID: runId };
+          feedback = `A recipe for a similar job (${autoMatch.job}) ran first but its result does not satisfy this task: ${v.feedback}`;
+        } else {
+          fellBack = true; feedback = `The deterministic recipe for this job ran but the judge rejected its evidence: ${v.feedback}`;
+          state = jobs.transition(state, { kind: "judge-fail", error: v.feedback });
+          recipeResult.failure = { step: -1, do: "judge", error: v.feedback };
+        }
+      } else {
+        finalVerdict = { verdict: "pass", feedback: "economy: recipe assertions passed (no model involved)" };
+        state = jobs.transition(state, { kind: "recipe-pass" });
+      }
+    } else {
+      fellBack = true;
+      const f = recipeResult.failure;
+      feedback = `The deterministic recipe for this job failed at step ${f.step + 1} (${f.do}): ${f.error}. Complete the task yourself.`;
+      state = jobs.transition(state, { kind: "recipe-fail", error: f.error });
+    }
+    if (fellBack && verbose) console.error(`[agent] ${mode} mode failed → falling back to the model ladder`);
   }
 
-  return { verdict: finalVerdict, evidence: lastEvidence, stages };
+  // ---- regular ladder -------------------------------------------------------
+  if (!blocker && (mode === "regular" || fellBack)) {
+    const startIdx = opts.start
+      ? OPS_LADDER.findIndex(r => r.label === opts.start || r.model === opts.start || r.label.startsWith(opts.start))
+      : 0;
+    if (startIdx < 0) throw new Error(`unknown --start model "${opts.start}"; use one of ${OPS_LADDER.map(r => r.label).join(", ")}`);
+    // --only: stay on the start rung (no escalation to pricier models on a fail)
+    const rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
+    for (const rung of rungs) {
+      const opsPrompt = [
+        OPS_PLAYBOOK,
+        feedback ? `A previous attempt failed review. Judge feedback:\n${feedback}` : "",
+        `TASK:\n${task}`,
+      ].filter(Boolean).join("\n\n");
+
+      const opsRes = await run({
+        engine: rung.engine,
+        model: rung.model,
+        effort: rung.effort,
+        prompt: opsPrompt,
+        allowedTools: [`Bash(${SELF_CMD}:*)`],
+        timeoutMs,
+        verbose,
+        env: childEnv,
+      });
+      lastEvidence = extractEvidence(String(opsRes.result || ""));
+      stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
+
+      const verdict = await judge(lastEvidence);
+      finalVerdict = verdict;
+      if (verdict.verdict === "pass") break;
+      feedback = verdict.feedback;
+      // A login wall stops every rung the same way: do not pay for the next ones.
+      const blockLine = /^Blockers:\s*(.+)$/im.exec(lastEvidence);
+      if (blockLine && recipes.isAuthFailure(blockLine[1]) && !/\bnone\b/i.test(blockLine[1].slice(0, 12))) {
+        blocker = "auth";
+        finalVerdict = { verdict: "fail", feedback: `LOGIN REQUIRED: ${blockLine[1].trim().slice(0, 200)} — not escalated (models cannot log in).` };
+        break;
+      }
+    }
+    if (state) state = jobs.transition(state, { kind: finalVerdict.verdict === "pass" ? "regular-pass" : "regular-fail" });
+    if (state && finalVerdict.verdict === "pass") state = rememberVariant(state, task);
+  }
+
+  // ---- repair a broken recipe from this (successful) fallback run -------------
+  let repaired = null;
+  if (fellBack && !mismatch && finalVerdict.verdict === "pass" && !opts.noRepair) {
+    try {
+      repaired = await D.propose({
+        job, task, previous: recipe, failure: recipeResult.failure,
+        traces: [journal.readTrace(runId)], run, timeoutMs, verbose,
+      });
+      state = jobs.transition(state, { kind: "repaired", version: repaired.version });
+      stages.push({ stage: `repair:${RECIPE_MODEL}`, ...(repaired._usage || { input: 0, output: 0 }) });
+    } catch (e) {
+      if (verbose) console.error(`[agent] recipe repair failed: ${e.message}`);
+      repaired = { error: e.message };
+    }
+  }
+
+  const journalMode = mismatch ? "regular" : mode === "regular" ? "regular" : fellBack ? `${mode}-fallback` : mode;
+  if (blocker) finalVerdict.blocker = blocker;
+
+  // ---- learn: enough passing model runs of the same task → propose a recipe ----
+  // (and repair a flagged recipe from a plain regular pass). The bridge decides
+  // on its own; nobody has to tag jobs or run `recipe propose`.
+  let learned = null;
+  if (auto && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
+    try {
+      learned = await autoLearn({ job, state, task, runId, startedAt, stages, D, run, timeoutMs, verbose });
+      if (learned && learned.recipe) {
+        job = learned.job; state = learned.state;
+        stages.push({ stage: `learn:${RECIPE_MODEL}`, ...(learned.recipe._usage || { input: 0, output: 0 }) });
+      }
+    } catch (e) { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
+  }
+
+  if (state) {
+    try {
+      D.putJob(jobs.pushHistory(state, { runId, mode: journalMode, verdict: finalVerdict.verdict, canary: planned.canary || undefined,
+        repaired: repaired && repaired.version ? repaired.version : undefined }));
+    } catch (e) { if (verbose) console.error(`[agent] job state write failed: ${e.message}`); }
+  }
+
+  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence });
+  if (blocker) record.blocker = blocker;
+  let journalFile = null;
+  if (!opts.noJournal) {
+    try { journalFile = journal.appendJournal(record); }
+    catch (e) { if (verbose) console.error(`[agent] journal write failed: ${e.message}`); }
+  }
+  return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, mode: journalMode, state, repaired, record, journalFile,
+    autoMatch, mismatch, learned, blocker };
+}
+
+// Per-job login hook: a shell command (bridge jobs set <job> --login-cmd "…")
+// that restores the site session in the user's Chrome, e.g. by driving the
+// login form with stored credentials. Resolves {ok, error?, output}.
+function runLoginCmd(cmd, { timeoutMs = 5 * 60 * 1000, verbose = false } = {}) {
+  return new Promise((resolve) => {
+    if (verbose) console.error(`[agent] running login hook: ${cmd}`);
+    shellExec(cmd, { timeout: timeoutMs, env: { ...process.env, AI_BRIDGE_AGENT: "1" }, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (verbose && (stdout || stderr)) console.error(String(stdout || "") + String(stderr || ""));
+      if (err) return resolve({ ok: false, error: (String(stderr || "").trim() || err.message).slice(-400), output: String(stdout || "") });
+      resolve({ ok: true, output: String(stdout || "") });
+    });
+  });
+}
+
+// Remember a task wording that passed a judge together with this job.
+function rememberVariant(state, task) {
+  const v = jobs.normalizeVariant(task);
+  const list = Array.isArray(state.taskVariants) ? state.taskVariants : [];
+  if (list.includes(v) || jobs.normalizeVariant(state.task) === v) return state;
+  return { ...state, task: state.task || task, taskVariants: [...list.slice(-19), v] };
+}
+
+// After a passing regular run: if this job (tagged, matched, or recognised by
+// signature) has AUTO_PROPOSE_PASSES passes and no recipe, learn one; if its
+// recipe is flagged for repair, repair it. Returns {job, state, recipe} or null.
+async function autoLearn({ job, state, task, runId, startedAt, stages, D, run, timeoutMs, verbose }) {
+  const thisTrace = D.readTrace(runId);
+  if (!thisTrace.length) return null;
+  const all = D.readJournal({ days: 60 });
+  const passes = (recs) => recs.filter((r) => r.verdict === "pass" && (r.mode || "regular") === "regular");
+
+  if (job) {
+    const current = D.loadRecipe(job);
+    if (current && !(state && state.repairNeeded)) return null;                   // already has a working recipe
+    const prior = passes(all.filter((r) => r.job === job && r.runId !== runId));
+    if (!current && prior.length + 1 < jobs.AUTO_PROPOSE_PASSES) return null;
+    const traces = [thisTrace, ...prior.slice(-2).map((r) => D.readTrace(r.runId)).filter((t) => t.length)];
+    const failure = state && state.repairNeeded ? { step: -1, do: "unknown", error: state.lastFailure || "recipe failed on a previous run" } : undefined;
+    const recipe = await D.propose({ job, task: state && state.task || task, traces, previous: current || undefined, failure, run, timeoutMs, verbose });
+    let st = jobs.transition({ ...(state || D.getJob(job)), risk: (state && state.risk) || recipe.risk, task: (state && state.task) || task }, { kind: "repaired", version: recipe.version });
+    return { job, state: st, recipe, created: false };
+  }
+
+  // Untagged, unmatched task: same auto signature (domains + normalized text) seen enough times?
+  const domains = journal.domainsFromTrace(thisTrace);
+  const signature = journal.signatureOf({ task, domains });
+  const prior = passes(all.filter((r) => !r.job && r.signature === signature && r.runId !== runId));
+  if (prior.length + 1 < jobs.AUTO_PROPOSE_PASSES) return null;
+  const name = jobs.autoJobName(task, domains, signature);
+  const traces = [thisTrace, ...prior.slice(-2).map((r) => D.readTrace(r.runId)).filter((t) => t.length)];
+  const recipe = await D.propose({ job: name, task, traces, run, timeoutMs, verbose });
+  let st = jobs.transition({ ...D.getJob(name), auto: true, signature, task, risk: recipe.risk,
+    taskVariants: [...new Set(prior.map((r) => jobs.normalizeVariant(r.task)))] }, { kind: "repaired", version: recipe.version });
+  return { job: name, state: st, recipe, created: true };
+}
+
+// Ask a model to turn successful traces (or a failed recipe + fallback trace)
+// into a recipe; validate and save it. Returns the saved recipe.
+async function proposeRecipe({ job, task, traces, previous, failure, run = runModel, model = RECIPE_MODEL, timeoutMs = 10 * 60 * 1000, verbose = false }) {
+  if (!recipes.safeJob(job)) throw new Error(`invalid job name "${job}"`);
+  if (!traces || !traces.length || traces.every((t) => !t.length)) throw new Error("no traces to learn from");
+  const prompt = recipes.proposalPrompt({ job, task, traces, previous, failure });
+  const res = await run({ model, prompt, allowedTools: [], timeoutMs, verbose });
+  const obj = recipes.extractJson(String(res.result || ""));
+  if (!obj) throw new Error(`recipe model returned no JSON: ${String(res.result || "").slice(0, 300)}`);
+  obj.job = job;
+  if (!obj.task) obj.task = task;
+  if (!obj.risk) obj.risk = recipes.inferRisk(obj);
+  const errs = recipes.validateRecipe(obj);
+  if (errs.length) throw new Error(`recipe invalid: ${errs.join("; ")}`);
+  const saved = recipes.saveRecipe(obj);
+  saved._usage = usageOf(res);
+  return saved;
+}
+
+// One journal.jsonl line for a finished run. Domains come from the run's trace
+// (newTab/navigate URLs), so auto signatures group by site even without --job.
+function journalRecord({ runId, job, task, startedAt, stages, verdict, mode, evidence }) {
+  const domains = journal.domainsFromTrace(journal.readTrace(runId));
+  const sum = (k) => stages.reduce((n, s) => n + (Number(s[k]) || 0), 0);
+  return {
+    runId, job, signature: journal.signatureOf({ job, task, domains }), task,
+    startedAt, endedAt: new Date().toISOString(), mode,
+    verdict: verdict ? verdict.verdict : "fail",
+    stages: stages.map((s) => ({ stage: s.stage, input: s.input, output: s.output, costUsd: s.costUsd })),
+    costUsd: sum("costUsd"), inputTokens: sum("input"), outputTokens: sum("output"),
+    domains, trace: journal.traceFile(runId),
+    evidence: evidence ? String(evidence).slice(0, 4000) : undefined,
+  };
 }
 
 function printReport({ verdict, evidence, stages }) {
@@ -295,6 +565,30 @@ function printReport({ verdict, evidence, stages }) {
   if (cost > 0) console.log(`${"total".padEnd(22)} ${"".padStart(26)}  $${cost.toFixed(4)}`);
 }
 
+function printJournalLine({ runId, job, journalFile, record, mode, state, repaired, autoMatch, mismatch, learned }) {
+  const cmds = journal.readTrace(runId).length;
+  if (autoMatch) {
+    console.log(mismatch
+      ? `task looked like job ${autoMatch.job} but the judge disagreed — ran as a one-off (job not penalised)`
+      : `task recognised as job ${autoMatch.job}${autoMatch.exact ? " (known wording)" : autoMatch.byModel ? ` (classifier, ${autoMatch.why || "similar"})` : ` (similarity ${autoMatch.score.toFixed(2)})`}`);
+  }
+  if (learned && learned.recipe) {
+    console.log(learned.created
+      ? `learned: this task has passed ${jobs.AUTO_PROPOSE_PASSES}× → job ${learned.job} created with recipe v${learned.recipe.version} (risk ${learned.recipe.risk}); next runs are audited, then free`
+      : `learned: recipe v${learned.recipe.version} for job ${learned.job} → audit`);
+  } else if (learned && learned.error) console.log(`learn: recipe proposal failed: ${learned.error}`);
+  if (job && state) {
+    console.log(`job ${job}: ran in ${mode} mode → now ${state.mode}` +
+      (state.lastResult === "fail" && state.lastAuthFail && state.updatedAt && state.lastAuthFail >= (state.updatedAt || "") ? " (LOGIN REQUIRED — session expired, recipe unchanged)" : "") +
+      (state.mode === "audit" ? ` (${state.auditPasses || 0}/${state.auditRequired} audit passes${state.repairNeeded ? ", REPAIR NEEDED" : ""})` : "") +
+      (state.mode === "economy" ? ` (canary in ${(state.canaryEvery || 5) - (state.runsSinceCanary || 0)} runs)` : "") +
+      (repaired && repaired.version ? `; recipe repaired → v${repaired.version}` : repaired && repaired.error ? `; repair failed: ${repaired.error}` : ""));
+  }
+  console.log(`run ${runId}${job ? ` job=${job}` : ""}: ${cmds} bridge command(s) traced` +
+    (record && record.domains.length ? ` on ${record.domains.join(", ")}` : "") +
+    (journalFile ? `; journaled (bridge journal --trace ${runId})` : ""));
+}
+
 async function main(argv) {
   if (process.env.AI_BRIDGE_AGENT === "1") {
     console.error(
@@ -311,12 +605,16 @@ async function main(argv) {
     else if (args[i] === "--verbose") opts.verbose = true;
     else if (args[i] === "--start") opts.start = args[++i];
     else if (args[i] === "--only") opts.only = true;
+    else if (args[i] === "--job") opts.job = args[++i];
+    else if (args[i] === "--params") opts.params = JSON.parse(args[++i]);
+    else if (args[i] === "--no-repair") opts.noRepair = true;
+    else if (args[i] === "--no-auto") opts.noAuto = true;
     else if (args[i] === "--help" || args[i] === "-h") { rest.length = 0; break; }
     else rest.push(args[i]);
   }
   const task = rest.join(" ").trim();
   if (!task) {
-    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only]');
+    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name|none] [--params json] [--no-repair] [--no-auto]');
     process.exit(2);
   }
 
@@ -332,6 +630,7 @@ async function main(argv) {
 
   const report = await runAgent(task, opts);
   printReport(report);
+  printJournalLine(report);
   process.exit(report.verdict.verdict === "pass" ? 0 : 1);
 }
 
@@ -339,4 +638,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL };
+module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, runLoginCmd, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };

@@ -3,8 +3,13 @@
 // parsing, and evidence extraction. Uses an injected mock runner — no real
 // claude CLI, no network.
 
-const { runAgent, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL } =
+const fs = require("fs");
+const os = require("os");
+// Journal/trace files go to a temp state dir, never the real ~/.ai-browser-bridge.
+process.env.AI_BRIDGE_HOME = fs.mkdtempSync(require("path").join(os.tmpdir(), "ai-bridge-agent-"));
+const { runAgent, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL } =
   require("../server/agent.js");
+const journal = require("../server/journal.js");
 
 let failures = 0;
 const assert = (cond, name) => {
@@ -16,8 +21,8 @@ const assert = (cond, name) => {
 function mockRun(judgeVerdicts) {
   const calls = [];
   let judgeIdx = 0;
-  const run = async ({ engine, model, effort, prompt }) => {
-    calls.push({ engine, model, effort, prompt });
+  const run = async ({ engine, model, effort, prompt, env }) => {
+    calls.push({ engine, model, effort, prompt, env });
     if (model === JUDGE_MODEL && prompt.includes("strict verifier")) {
       const v = judgeVerdicts[judgeIdx++];
       return { result: v, usage: { input_tokens: 100, output_tokens: 20 }, total_cost_usd: 0.01 };
@@ -88,6 +93,225 @@ function mockRun(judgeVerdicts) {
     assert(r.verdict.verdict === "pass", "malformed judge: recovers via escalation");
     const judgeCalls = m.calls.filter((c) => c.prompt.includes("strict verifier"));
     assert(judgeCalls[1].prompt.includes("not valid JSON"), "malformed judge: re-ask prompt sent");
+  }
+
+  // 8) journal: run id + job flow to the ops env, the run is journaled with a job signature
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"done"}']);
+    const r = await runAgent("invoice trip 123", { job: "toll-invoices", runId: "testrun0001" }, m.run);
+    assert(r.runId === "testrun0001" && r.job === "toll-invoices", "journal: runId/job returned");
+    assert(m.calls[0].env && m.calls[0].env.AI_BRIDGE_RUN_ID === "testrun0001" && m.calls[0].env.AI_BRIDGE_JOB === "toll-invoices",
+      "journal: ops rung gets AI_BRIDGE_RUN_ID/AI_BRIDGE_JOB");
+    assert(r.record.signature === "job:toll-invoices" && r.record.verdict === "pass" && r.record.mode === "regular",
+      "journal: record has job signature + verdict");
+    assert(Math.abs(r.record.costUsd - 0.06) < 1e-9 && r.record.inputTokens === 5100 && r.record.outputTokens === 820,
+      "journal: cost/tokens summed over ops + judge");
+    const rows = journal.summarize(journal.readJournal({}));
+    assert(rows.some((x) => x.signature === "job:toll-invoices" && x.runs === 1), "journal: appended to journal.jsonl");
+  }
+
+  // 9) journal: auto signature uses domains from the run's trace
+  {
+    journal.appendTrace("testrun0002", { cmd: "newTab", params: { url: "https://www.kbb.com/x" }, ok: true });
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    const r = await runAgent("Get KBB value for 9GYW724", { runId: "testrun0002", noJournal: true }, m.run);
+    assert(r.record.signature === "auto:kbb.com|get kbb value for #gyw#" && r.journalFile === null,
+      "journal: auto signature from trace domains; noJournal skips the write");
+    assert(m.calls[0].env.AI_BRIDGE_JOB === undefined, "journal: no AI_BRIDGE_JOB without --job");
+  }
+
+  // 10) economy mode paths: audit -> economy, economy without judge, fallback + repair
+  {
+    const jobs = require("../server/jobs.js");
+    const recipe = { job: "toll", version: 2, risk: "read", task: "pull", steps: [{ do: "newTab", url: "u" }], output: "rows" };
+    let recipeOk = true;
+    const recipeCalls = [];
+    const deps = {
+      loadRecipe: () => recipe,
+      runRecipe: async (r, o) => {
+        recipeCalls.push({ version: r.version, env: o.env });
+        return recipeOk
+          ? { ok: true, evidence: "EVIDENCE REPORT\nTask: pull\nFinal state: 3 rows", steps: [], output: [1, 2, 3] }
+          : { ok: false, evidence: "EVIDENCE REPORT\nBlockers: LOGIN REQUIRED", steps: [], failure: { step: 2, do: "assert", error: "LOGIN REQUIRED", digest: { url: "x" } } };
+      },
+      propose: async ({ job, previous, failure, traces }) => ({ job, version: (previous.version || 0) + 1, steps: [], _usage: { input: 1, output: 1 }, _failure: failure, _traces: traces }),
+    };
+    // seed: job in audit with the recipe
+    jobs.putJob({ job: "toll", mode: "audit", risk: "read", auditPasses: 0, auditRequired: 3, canaryEvery: 3, runsSinceCanary: 0, recipeVersion: 2, history: [] });
+
+    // audit pass #1: recipe + judge, no ops model
+    let m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    let r = await runAgent("pull", { job: "toll", runId: "eco00000001" }, m.run, deps);
+    assert(r.mode === "audit" && r.verdict.verdict === "pass", "economy: audit run passes via recipe + judge");
+    assert(m.calls.length === 1 && m.calls[0].model === JUDGE_MODEL, "economy: audit spends only the judge call");
+    assert(recipeCalls[0].env.AI_BRIDGE_RUN_ID === "eco00000001" && recipeCalls[0].env.AI_BRIDGE_JOB === "toll", "economy: recipe run is traced under the run id");
+    assert(r.stages[0].stage === "recipe:toll@v2" && r.stages[0].costUsd === 0, "economy: recipe stage costs 0");
+    assert(jobs.getJob("toll").auditPasses === 1 && jobs.getJob("toll").mode === "audit", "economy: audit pass counted");
+
+    // audit passes #2, #3 -> economy
+    for (const id of ["eco00000002", "eco00000003"]) await runAgent("pull", { job: "toll", runId: id }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(jobs.getJob("toll").mode === "economy", "economy: third audit pass switches to economy");
+
+    // economy run: no model at all
+    m = mockRun([]);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000004" }, m.run, deps);
+    assert(r.mode === "economy" && r.verdict.verdict === "pass" && m.calls.length === 0 && r.record.costUsd === 0, "economy: run with zero model calls");
+
+    // second economy run, then the 3rd is a canary (canaryEvery=3) -> judge called once
+    await runAgent("pull", { job: "toll", runId: "eco00000005" }, mockRun([]).run, deps);
+    m = mockRun(['{"verdict":"pass","feedback":"still fine"}']);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000006" }, m.run, deps);
+    assert(m.calls.length === 1 && /canary/.test(r.stages[0].stage) && r.verdict.feedback.includes("canary"), "economy: periodic canary judges the recipe evidence");
+    assert(jobs.getJob("toll").runsSinceCanary === 0, "economy: canary resets the counter");
+
+    // recipe failure -> fallback to the ladder (ops opus + judge), state back to audit, recipe repaired
+    recipeOk = false;
+    m = mockRun(['{"verdict":"pass","feedback":"done by model"}']);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000007" }, m.run, deps);
+    assert(r.mode === "economy-fallback" && r.verdict.verdict === "pass", "fallback: economy failure completes via the ladder");
+    assert(m.calls[0].model === "claude-opus-5-5" && m.calls[0].prompt.includes("LOGIN REQUIRED"), "fallback: ops model told why the recipe failed");
+    assert(r.repaired && r.repaired.version === 3 && r.repaired._failure.error === "LOGIN REQUIRED", "fallback: recipe repaired from the failure + fallback trace");
+    const st = jobs.getJob("toll");
+    assert(st.mode === "audit" && st.auditPasses === 0 && st.repairNeeded === false && st.recipeVersion === 3, "fallback: job back in audit with the repaired recipe");
+    assert(r.stages.some((s) => s.stage.startsWith("repair:")), "fallback: repair stage reported");
+
+    // judge rejects recipe evidence in audit -> fallback too; --no-repair skips repair
+    recipeOk = true;
+    m = mockRun(['{"verdict":"fail","feedback":"rows look stale"}', '{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("pull", { job: "toll", runId: "eco00000008", noRepair: true }, m.run, deps);
+    assert(r.mode === "audit-fallback" && r.verdict.verdict === "pass" && r.repaired === null, "fallback: judge-fail in audit falls back; --no-repair");
+    assert(jobs.getJob("toll").repairNeeded === true, "fallback: repair still flagged when skipped");
+
+    // repairNeeded -> next run goes regular (no recipe attempt)
+    recipeCalls.length = 0;
+    r = await runAgent("pull", { job: "toll", runId: "eco00000009" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(r.mode === "regular" && recipeCalls.length === 0, "fallback: repair-needed job runs regular until repaired");
+  }
+
+  // 11) automatic mode: untagged tasks are matched to jobs, verified once per wording, learned after 3 passes
+  {
+    const jobs = require("../server/jobs.js");
+    const { MATCH_MODEL } = require("../server/agent.js");
+    const tollTask = "Toll Roads transactions pull (read-only): on secure.thetollroads.com Find a Transaction, set From = 7 days ago and To = today, click VIEW, return every row as JSON plus the row count.";
+    const recipe = { job: "tr", version: 1, risk: "read", task: tollTask, steps: [{ do: "newTab", url: "u" }], output: "rows" };
+    const deps = {
+      loadRecipe: (j) => (j === "tr" ? recipe : null),
+      runRecipe: async () => ({ ok: true, evidence: "EVIDENCE REPORT\nFinal state: 3 rows", steps: [], output: [1, 2, 3] }),
+      propose: async ({ job, task, traces }) => ({ job, version: 1, risk: "read", task, steps: [], _usage: { input: 1, output: 1 }, _n: traces.length }),
+    };
+    jobs.putJob({ job: "tr", mode: "economy", risk: "read", auditPasses: 3, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, task: tollTask, taskVariants: [], history: [] });
+
+    // a) similar wording with the same host → matched; economy but judged once (new wording)
+    const reworded = "Please open https://secure.thetollroads.com/accounts/statements/transaction, Find a Transaction for the last 7 days (From = today-7, To = today), click VIEW and return the rows as JSON with the row count.";
+    let m = mockRun(['{"verdict":"pass","feedback":"rows ok"}']);
+    let r = await runAgent(reworded, { runId: "auto0000001" }, m.run, deps);
+    assert(r.autoMatch && r.autoMatch.job === "tr" && !r.autoMatch.exact, "auto: untagged task matched to job by host + words");
+    assert(r.mode === "economy" && m.calls.length === 1 && m.calls[0].model === JUDGE_MODEL, "auto: new wording in economy is judged exactly once");
+    assert(jobs.getJob("tr").taskVariants.length === 1, "auto: passing wording remembered as a variant");
+
+    // b) same wording again → exact → pure economy, no model
+    m = mockRun([]);
+    r = await runAgent(reworded, { runId: "auto0000002" }, m.run, deps);
+    assert(r.autoMatch.exact === true && r.mode === "economy" && m.calls.length === 0, "auto: known wording runs free");
+
+    // c) uncertain wording → classifier (MATCH_MODEL) decides; it says yes → judged economy run
+    const vague = "toll roads: what did I pay on secure.thetollroads.com recently? json please";
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    const baseRun = m.run;
+    const calls = m.calls;
+    const run2 = async (o) => (o.model === MATCH_MODEL ? (calls.push(o), { result: '{"job":"tr","confidence":0.9,"why":"same pull"}', usage: { input_tokens: 800, output_tokens: 20 }, total_cost_usd: 0.001 }) : baseRun(o));
+    r = await runAgent(vague, { runId: "auto0000003" }, run2, deps);
+    assert(r.autoMatch && r.autoMatch.byModel && r.autoMatch.job === "tr", "auto: classifier settles an uncertain match");
+    assert(calls[0].model === MATCH_MODEL && r.stages[0].stage === `match:${MATCH_MODEL}` && r.mode === "economy", "auto: match stage recorded, recipe used");
+
+    // d) classifier says none → regular ladder, no job
+    const run3 = async (o) => (o.model === MATCH_MODEL ? { result: '{"job":null,"confidence":0.2}', usage: {} } : baseRun(o));
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("toll roads: add a vehicle 9ABC123 on secure.thetollroads.com and return the result as JSON", { runId: "auto0000004" }, async (o) => (o.model === MATCH_MODEL ? { result: '{"job":null}', usage: {} } : m.run(o)), deps);
+    assert(!r.autoMatch && r.mode === "regular" && r.job === null, "auto: classifier 'none' → regular run without a job");
+
+    // e) matched but the judge rejects the recipe evidence for this task → mismatch: one-off run, job not penalised
+    const before = jobs.getJob("tr");
+    m = mockRun(['{"verdict":"fail","feedback":"task wants vehicles, not transactions"}', '{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("Open https://secure.thetollroads.com/accounts/statements/transaction, Find a Transaction, click VIEW, return the rows as JSON with the row count, then ALSO list my vehicles", { runId: "auto0000005" }, m.run, deps);
+    assert(r.mismatch === true && r.job === null && r.mode === "regular" && r.verdict.verdict === "pass", "auto: judge-fail on heuristic match = mismatch, task completed by the ladder");
+    const after = jobs.getJob("tr");
+    assert(after.mode === "economy" && !after.repairNeeded && after.auditPasses === before.auditPasses, "auto: mismatched job keeps its state");
+    assert(!m.calls[1].env.AI_BRIDGE_JOB, "auto: fallback ops run is not traced under the mismatched job");
+
+    // f) --no-auto / --job none skip matching
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent(reworded, { runId: "auto0000006", noAuto: true }, m.run, deps);
+    assert(!r.autoMatch && r.mode === "regular", "auto: --no-auto runs regular");
+    r = await runAgent(reworded, { runId: "auto0000007", job: "none" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(!r.autoMatch && r.job === null, "auto: --job none runs regular without a job");
+
+    // g) auto-learn: an unknown task passing 3× (same domains + wording) gets a job + recipe automatically
+    const journal = require("../server/journal.js");
+    const kbbTask = "Open https://www.kbb.com/ and get the trade-in value for VIN 1C4RJKAG7P8753841 with 42000 miles, ZIP 90732";
+    for (const id of ["learn000001", "learn000002", "learn000003"]) {
+      journal.appendTrace(id, { cmd: "newTab", params: { url: "https://www.kbb.com/" }, ok: true, result: { id: 1 } });
+      m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+      r = await runAgent(kbbTask.replace("42000", id === "learn000002" ? "43000" : "42000"), { runId: id }, m.run, deps);
+    }
+    assert(r.learned && r.learned.created && /^auto-kbb-[0-9a-f]{6}$/.test(r.learned.job), `auto-learn: job created on the 3rd pass (${r.learned && r.learned.job})`);
+    assert(r.learned.recipe._n === 3 && r.stages.some((s) => s.stage.startsWith("learn:")), "auto-learn: recipe proposed from all 3 traces, stage recorded");
+    const aj = jobs.getJob(r.learned.job);
+    assert(aj.auto === true && aj.mode === "audit" && aj.recipeVersion === 1 && aj.taskVariants.length >= 1, "auto-learn: job is auto, in audit, with variants");
+    // the 4th run of the same task now matches the new job and uses its recipe in audit
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent(kbbTask, { runId: "learn000004" }, m.run, { ...deps, loadRecipe: (j) => (j === aj.job ? { job: j, version: 1, risk: "read", steps: [], task: kbbTask } : deps.loadRecipe(j)) });
+    assert(r.autoMatch && r.autoMatch.job === aj.job && r.mode === "audit", "auto-learn: next run is recognised and audited with the new recipe");
+  }
+
+  // 12) login wall: recipe says LOGIN REQUIRED → login hook → replay; without a hook no model is spent; ladder stops on auth blockers
+  {
+    const jobs = require("../server/jobs.js");
+    const recipe = { job: "lw", version: 1, risk: "read", task: "lw task on https://site.example.com/x", steps: [{ do: "newTab", url: "https://site.example.com/x" }], output: "rows" };
+    let authFirst = true;
+    const logins = [];
+    const deps = {
+      loadRecipe: () => recipe,
+      runRecipe: async () => {
+        if (authFirst) { authFirst = false; return { ok: false, evidence: "EVIDENCE REPORT\nBlockers: LOGIN REQUIRED", steps: [], failure: { step: 3, do: "assert", error: "LOGIN REQUIRED", kind: "auth" } }; }
+        return { ok: true, evidence: "EVIDENCE REPORT\nFinal state: 2 rows", steps: [], output: [1, 2] };
+      },
+      runLogin: async (cmd) => { logins.push(cmd); return { ok: true, output: "logged in" }; },
+      propose: async () => { throw new Error("must not propose"); },
+    };
+    // economy job WITH a login hook: hook runs, recipe replays, no model (known wording)
+    jobs.putJob({ job: "lw", mode: "economy", risk: "read", auditPasses: 3, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, task: recipe.task, taskVariants: [], history: [], loginCmd: "/bin/login-hook" });
+    let m = mockRun([]);
+    let r = await runAgent(recipe.task, { job: "lw", runId: "auth0000001" }, m.run, deps);
+    assert(r.verdict.verdict === "pass" && r.mode === "economy" && m.calls.length === 0, "login hook: session restored, recipe replayed, zero model calls");
+    assert(logins[0] === "/bin/login-hook" && r.stages.some((s) => s.stage === "login-hook" && s.ok) && r.stages.filter((s) => s.stage.startsWith("recipe:")).length === 2, "login hook: hook stage + two recipe stages");
+    assert(jobs.getJob("lw").mode === "economy" && !jobs.getJob("lw").repairNeeded, "login hook: job state untouched");
+
+    // hook fails / still logged out → stop: no ladder, no repair, recipe unchanged
+    authFirst = true;
+    deps.runLogin = async () => ({ ok: false, error: "bad password" });
+    deps.runRecipe = async () => ({ ok: false, evidence: "EVIDENCE REPORT\nBlockers: LOGIN REQUIRED", steps: [], failure: { step: 3, do: "assert", error: "LOGIN REQUIRED", kind: "auth" } });
+    m = mockRun([]);
+    r = await runAgent(recipe.task, { job: "lw", runId: "auth0000002" }, m.run, deps);
+    assert(r.verdict.verdict === "fail" && r.blocker === "auth" && m.calls.length === 0 && r.repaired === null, "login wall: hook failed → fail fast, no models, no repair");
+    assert(/LOGIN REQUIRED/.test(r.verdict.feedback) && jobs.getJob("lw").mode === "economy" && !jobs.getJob("lw").repairNeeded && jobs.getJob("lw").lastAuthFail, "login wall: verdict explains, job stays in economy, auth time recorded");
+
+    // no hook configured → same fail-fast with a hint
+    const st = jobs.getJob("lw"); delete st.loginCmd; jobs.putJob(st);
+    m = mockRun([]);
+    r = await runAgent(recipe.task, { job: "lw", runId: "auth0000003" }, m.run, deps);
+    assert(r.blocker === "auth" && m.calls.length === 0 && /--login-cmd/.test(r.verdict.feedback), "login wall: no hook → fail fast with the --login-cmd hint");
+
+    // regular ladder: ops reports an auth blocker → judge fails once, no escalation to the next rungs
+    const authRun = async ({ model, prompt, engine, effort, env }) => {
+      if (model === JUDGE_MODEL && prompt.includes("strict verifier")) return { result: '{"verdict":"fail","feedback":"not logged in"}', usage: { input_tokens: 10, output_tokens: 5 }, total_cost_usd: 0.01 };
+      return { result: "EVIDENCE REPORT\nTask: t\nActions: 1. x\nFinal state: login page\nScreenshots: none\nBlockers: Authentication required — the site shows a login form.", usage: { input_tokens: 100, output_tokens: 10 }, total_cost_usd: 0.05 };
+    };
+    r = await runAgent("some untagged task on https://other.example.com/", { runId: "auth0000004" }, authRun, {});
+    assert(r.verdict.verdict === "fail" && r.blocker === "auth" && r.stages.filter((s) => s.stage.startsWith("ops:")).length === 1, "ladder: auth blocker stops after the first rung");
+    // but "Blockers: none" does not trigger it
+    r = await runAgent("another task", { runId: "auth0000005" }, mockRun(['{"verdict":"fail","feedback":"a"}', '{"verdict":"pass","feedback":"ok"}']).run, {});
+    assert(r.verdict.verdict === "pass" && r.stages.filter((s) => s.stage.startsWith("ops:")).length === 2, "ladder: 'Blockers: none' still escalates normally");
   }
 
   // 7) recursion guard: agent.js refuses to start when spawned by the agent

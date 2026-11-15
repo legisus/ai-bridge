@@ -28,11 +28,13 @@ Codex Astra 6 → judge; stops at the first pass; bills to my existing Claude su
 via headless \`claude -p\`; the Codex rung is skipped with an error if the \`codex\` CLI
 is not installed):
 
-    ${cmd} agent "task description" [--timeout ms] [--verbose]
+    ${cmd} agent "task description" [--timeout ms] [--verbose] [--job name]
 
 It prints a verdict, an evidence report and a per-stage token/cost summary; exits 0 on
 pass. Give it a complete, self-contained task description (URLs, what "done" looks
-like). Only fall back to direct command-by-command driving (below) for one-off single
+like). The agent recognises recurring tasks by itself, learns a deterministic recipe
+after 3 passes and then replays it for free (economy mode) — no tagging needed;
+\`${cmd} jobs\` shows the per-job mode, \`${cmd} journal\` the run history. Only fall back to direct command-by-command driving (below) for one-off single
 commands (a quick \`ping\`, one \`eval\`, one \`screenshot\`) or when I explicitly ask you
 to drive the browser yourself.
 
@@ -40,7 +42,9 @@ A local bridge to my real, logged-in Chrome is available in every session. Run c
 
     ${cmd} <cmd> [params-json] [--file js] [--out file] [--timeout ms]
 
-Each call prints JSON to stdout and exits non-zero on failure. The auth token lives in
+Each call prints JSON to stdout and exits non-zero on failure. To read a page, prefer
+\`snapshot {"tabId":N}\` (visible text + interactive elements with labels and CSS
+selectors, a few KB) over \`screenshot\`. The auth token lives in
 \`~/.ai-browser-bridge/token\`; the CLI reads it automatically. If \`ping\` fails with
 "connect failed", the server is not running — reload the extension at chrome://extensions
 (the native host starts the server) or start it by hand. If it fails with "extension not

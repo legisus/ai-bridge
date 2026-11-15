@@ -10,6 +10,7 @@
 const { WebSocketServer } = require("ws");
 const fs = require("fs");
 const { TOKEN_FILE, LOG_FILE, ensureToken } = require("./token");
+const { appendTrace } = require("./journal");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
 
@@ -24,7 +25,7 @@ const { token: TOKEN, created } = ensureToken();
 if (created) console.log(`[bridge] token generated at ${TOKEN_FILE} — the extension picks it up via the native host (npm run register-host), or paste it into Options`);
 
 let extension = null;                 // the single extension socket
-const pending = new Map();            // request id -> cli socket
+const pending = new Map();            // request id -> { sock, cmd, params, meta, t0 }
 
 const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT, maxPayload: 64 * 1024 * 1024 });
 
@@ -55,23 +56,36 @@ wss.on("connection", (sock) => {
       if (!extension || extension.readyState !== 1) {
         return sock.send(JSON.stringify({ type: "response", id: msg.id, ok: false, error: "extension not connected" }));
       }
-      pending.set(msg.id, sock);
-      log(`cmd ${msg.cmd} ${JSON.stringify(msg.params || {}).slice(0, 200)}`);
+      // meta.runId/job come from `bridge agent` via the CLI (AI_BRIDGE_RUN_ID);
+      // every command of that run is traced to traces/<runId>.jsonl.
+      const meta = msg.meta && typeof msg.meta === "object" ? msg.meta : null;
+      pending.set(msg.id, { sock, cmd: msg.cmd, params: msg.params, meta, t0: Date.now() });
+      log(`cmd ${msg.cmd} ${JSON.stringify(msg.params || {}).slice(0, 200)}${meta && meta.runId ? ` run=${meta.runId}` : ""}`);
       extension.send(JSON.stringify({ type: "command", id: msg.id, cmd: msg.cmd, params: msg.params }));
       return;
     }
 
     if (role === "extension" && msg.type === "response") {
-      const cli = pending.get(msg.id);
+      const req = pending.get(msg.id);
       pending.delete(msg.id);
-      if (cli && cli.readyState === 1) cli.send(JSON.stringify(msg));
+      if (!req) return;
+      if (req.meta && req.meta.runId) {
+        const as = req.meta.as && typeof req.meta.as === "object" ? req.meta.as : null; // e.g. snapshot sent as eval
+        appendTrace(req.meta.runId, {
+          ts: new Date(req.t0).toISOString(), job: req.meta.job || undefined,
+          cmd: as && as.cmd ? String(as.cmd) : req.cmd, params: as ? as.params : req.params,
+          ok: !!msg.ok, error: msg.ok ? undefined : msg.error,
+          ms: Date.now() - req.t0, result: msg.ok ? msg.result : undefined,
+        });
+      }
+      if (req.sock.readyState === 1) req.sock.send(JSON.stringify(msg));
       return;
     }
   });
 
   sock.on("close", () => {
     if (sock === extension) { extension = null; log("extension disconnected"); }
-    for (const [id, c] of pending) if (c === sock) pending.delete(id);
+    for (const [id, r] of pending) if (r.sock === sock) pending.delete(id);
   });
 });
 
