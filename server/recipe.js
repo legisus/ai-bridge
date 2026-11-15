@@ -17,6 +17,9 @@ const { selfArgs } = require("./runtime");
 
 const RECIPES_DIR = path.join(DIR, "recipes");
 const PSEUDO = new Set(["assert", "poll", "sleep"]);
+// A failure that no amount of model effort fixes: the session needs a login.
+const AUTH_RE = /login required|log ?in|sign ?in|authenticat|session (has )?expired|logged out|password/i;
+function isAuthFailure(text) { return AUTH_RE.test(String(text || "")); }
 const WRITE_CMDS = new Set(["click", "insertText", "type", "key", "download"]);
 
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { mode: 0o700, recursive: true }); }
@@ -208,7 +211,7 @@ async function runRecipe(recipe, { params = {}, env = {}, exec = execBridge, now
       rec.error = String(e.message || e);
       if (s.optional) { rec.ok = true; rec.skipped = true; log(`step ${i} optional failed: ${rec.error}`); }
       else {
-        failure = { step: i, do: s.do, error: rec.error, note: s.note };
+        failure = { step: i, do: s.do, error: rec.error, note: s.note, kind: isAuthFailure(rec.error) ? "auth" : "step" };
         log(`step ${i} (${s.do}) FAILED: ${rec.error}`);
       }
     }
@@ -335,5 +338,5 @@ function extractJson(text) {
 module.exports = {
   RECIPES_DIR, recipeFile, safeJob, loadRecipe, saveRecipe, validateRecipe, inferRisk,
   render, renderDeep, formatDate, execBridge, runRecipe, buildEvidence,
-  RECIPE_SPEC, compactTrace, proposalPrompt, extractJson,
+  RECIPE_SPEC, compactTrace, proposalPrompt, extractJson, AUTH_RE, isAuthFailure,
 };

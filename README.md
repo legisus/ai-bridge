@@ -215,6 +215,11 @@ bridge recipe show|run <job>              # inspect or replay a recipe by hand
 bridge recipe propose <job>               # learn now instead of waiting for 3 passes
 ```
 
+Expired sessions are handled without models: give a job a login hook
+(`bridge jobs set <job> --login-cmd "…"`) and the bridge re-authenticates and
+replays the recipe; without one, a `LOGIN REQUIRED` run fails fast instead of
+escalating through the ladder.
+
 Jobs whose recipes write to the outside world (`risk: write`) stay in audit —
 recipe plus judge every time — unless you allow economy with
 `bridge jobs set <job> --risk read`. Details: [docs/ECONOMY-MODE.md](docs/ECONOMY-MODE.md).

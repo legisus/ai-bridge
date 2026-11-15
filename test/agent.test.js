@@ -264,6 +264,56 @@ function mockRun(judgeVerdicts) {
     assert(r.autoMatch && r.autoMatch.job === aj.job && r.mode === "audit", "auto-learn: next run is recognised and audited with the new recipe");
   }
 
+  // 12) login wall: recipe says LOGIN REQUIRED → login hook → replay; without a hook no model is spent; ladder stops on auth blockers
+  {
+    const jobs = require("../server/jobs.js");
+    const recipe = { job: "lw", version: 1, risk: "read", task: "lw task on https://site.example.com/x", steps: [{ do: "newTab", url: "https://site.example.com/x" }], output: "rows" };
+    let authFirst = true;
+    const logins = [];
+    const deps = {
+      loadRecipe: () => recipe,
+      runRecipe: async () => {
+        if (authFirst) { authFirst = false; return { ok: false, evidence: "EVIDENCE REPORT\nBlockers: LOGIN REQUIRED", steps: [], failure: { step: 3, do: "assert", error: "LOGIN REQUIRED", kind: "auth" } }; }
+        return { ok: true, evidence: "EVIDENCE REPORT\nFinal state: 2 rows", steps: [], output: [1, 2] };
+      },
+      runLogin: async (cmd) => { logins.push(cmd); return { ok: true, output: "logged in" }; },
+      propose: async () => { throw new Error("must not propose"); },
+    };
+    // economy job WITH a login hook: hook runs, recipe replays, no model (known wording)
+    jobs.putJob({ job: "lw", mode: "economy", risk: "read", auditPasses: 3, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, task: recipe.task, taskVariants: [], history: [], loginCmd: "/bin/login-hook" });
+    let m = mockRun([]);
+    let r = await runAgent(recipe.task, { job: "lw", runId: "auth0000001" }, m.run, deps);
+    assert(r.verdict.verdict === "pass" && r.mode === "economy" && m.calls.length === 0, "login hook: session restored, recipe replayed, zero model calls");
+    assert(logins[0] === "/bin/login-hook" && r.stages.some((s) => s.stage === "login-hook" && s.ok) && r.stages.filter((s) => s.stage.startsWith("recipe:")).length === 2, "login hook: hook stage + two recipe stages");
+    assert(jobs.getJob("lw").mode === "economy" && !jobs.getJob("lw").repairNeeded, "login hook: job state untouched");
+
+    // hook fails / still logged out → stop: no ladder, no repair, recipe unchanged
+    authFirst = true;
+    deps.runLogin = async () => ({ ok: false, error: "bad password" });
+    deps.runRecipe = async () => ({ ok: false, evidence: "EVIDENCE REPORT\nBlockers: LOGIN REQUIRED", steps: [], failure: { step: 3, do: "assert", error: "LOGIN REQUIRED", kind: "auth" } });
+    m = mockRun([]);
+    r = await runAgent(recipe.task, { job: "lw", runId: "auth0000002" }, m.run, deps);
+    assert(r.verdict.verdict === "fail" && r.blocker === "auth" && m.calls.length === 0 && r.repaired === null, "login wall: hook failed → fail fast, no models, no repair");
+    assert(/LOGIN REQUIRED/.test(r.verdict.feedback) && jobs.getJob("lw").mode === "economy" && !jobs.getJob("lw").repairNeeded && jobs.getJob("lw").lastAuthFail, "login wall: verdict explains, job stays in economy, auth time recorded");
+
+    // no hook configured → same fail-fast with a hint
+    const st = jobs.getJob("lw"); delete st.loginCmd; jobs.putJob(st);
+    m = mockRun([]);
+    r = await runAgent(recipe.task, { job: "lw", runId: "auth0000003" }, m.run, deps);
+    assert(r.blocker === "auth" && m.calls.length === 0 && /--login-cmd/.test(r.verdict.feedback), "login wall: no hook → fail fast with the --login-cmd hint");
+
+    // regular ladder: ops reports an auth blocker → judge fails once, no escalation to the next rungs
+    const authRun = async ({ model, prompt, engine, effort, env }) => {
+      if (model === JUDGE_MODEL && prompt.includes("strict verifier")) return { result: '{"verdict":"fail","feedback":"not logged in"}', usage: { input_tokens: 10, output_tokens: 5 }, total_cost_usd: 0.01 };
+      return { result: "EVIDENCE REPORT\nTask: t\nActions: 1. x\nFinal state: login page\nScreenshots: none\nBlockers: Authentication required — the site shows a login form.", usage: { input_tokens: 100, output_tokens: 10 }, total_cost_usd: 0.05 };
+    };
+    r = await runAgent("some untagged task on https://other.example.com/", { runId: "auth0000004" }, authRun, {});
+    assert(r.verdict.verdict === "fail" && r.blocker === "auth" && r.stages.filter((s) => s.stage.startsWith("ops:")).length === 1, "ladder: auth blocker stops after the first rung");
+    // but "Blockers: none" does not trigger it
+    r = await runAgent("another task", { runId: "auth0000005" }, mockRun(['{"verdict":"fail","feedback":"a"}', '{"verdict":"pass","feedback":"ok"}']).run, {});
+    assert(r.verdict.verdict === "pass" && r.stages.filter((s) => s.stage.startsWith("ops:")).length === 2, "ladder: 'Blockers: none' still escalates normally");
+  }
+
   // 7) recursion guard: agent.js refuses to start when spawned by the agent
   {
     const { execFile } = require("child_process");

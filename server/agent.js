@@ -20,7 +20,7 @@
 
 "use strict";
 
-const { spawn } = require("child_process");
+const { spawn, exec: shellExec } = require("child_process");
 const crypto = require("crypto");
 const path = require("path");
 
@@ -249,8 +249,9 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   const D = {
     runRecipe: recipes.runRecipe, loadRecipe: recipes.loadRecipe, getJob: jobs.getJob, putJob: jobs.putJob,
     loadJobs: jobs.loadJobs, readJournal: journal.readJournal, readTrace: journal.readTrace,
-    propose: proposeRecipe, ...deps,
+    propose: proposeRecipe, runLogin: runLoginCmd, ...deps,
   };
+  let blocker = null; // "auth" when the site wants a login nobody here can give
 
   // ---- which job is this? explicit --job, or matched from the task text -------
   const auto = !opts.noAuto && opts.job !== "none";
@@ -308,7 +309,27 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     const t0 = Date.now();
     recipeResult = await D.runRecipe(recipe, { params: opts.params || {}, env: childEnv, verbose });
     stages.push({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
-    if (recipeResult.ok) {
+    // Session expired? Run the job's login hook (if any) and replay once. A
+    // model cannot log in either, so without a hook this run ends here.
+    if (!recipeResult.ok && recipeResult.failure.kind === "auth") {
+      if (state.loginCmd) {
+        const t1 = Date.now();
+        const login = await D.runLogin(state.loginCmd, { timeoutMs: 5 * 60 * 1000, verbose });
+        stages.push({ stage: "login-hook", input: 0, output: 0, costUsd: 0, ms: Date.now() - t1, ok: login.ok });
+        if (login.ok) {
+          recipeResult = await D.runRecipe(recipe, { params: opts.params || {}, env: childEnv, verbose });
+          stages.push({ stage: `recipe:${job}@v${recipe.version}(after login)`, input: 0, output: 0, costUsd: 0 });
+        } else if (verbose) console.error(`[agent] login hook failed: ${login.error}`);
+      }
+      if (!recipeResult.ok && recipeResult.failure.kind === "auth") {
+        blocker = "auth";
+        lastEvidence = recipeResult.evidence;
+        finalVerdict = { verdict: "fail", feedback: `LOGIN REQUIRED on ${(recipe.steps.find((st) => st.url) || {}).url || job}: the session expired and ${state.loginCmd ? "the login hook did not restore it" : "the job has no login hook (bridge jobs set " + job + " --login-cmd \"…\")"}. Not escalated to models (they cannot log in either); recipe left unchanged.` };
+        state = jobs.transition(state, { kind: "auth-fail", error: recipeResult.failure.error });
+      }
+    }
+    if (blocker) { /* skip the rest of the recipe handling */ }
+    else if (recipeResult.ok) {
       lastEvidence = recipeResult.evidence;
       if (planned.judge) {
         const v = await judge(lastEvidence);
@@ -342,7 +363,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
 
   // ---- regular ladder -------------------------------------------------------
-  if (mode === "regular" || fellBack) {
+  if (!blocker && (mode === "regular" || fellBack)) {
     const startIdx = opts.start
       ? OPS_LADDER.findIndex(r => r.label === opts.start || r.model === opts.start || r.label.startsWith(opts.start))
       : 0;
@@ -373,6 +394,13 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       finalVerdict = verdict;
       if (verdict.verdict === "pass") break;
       feedback = verdict.feedback;
+      // A login wall stops every rung the same way: do not pay for the next ones.
+      const blockLine = /^Blockers:\s*(.+)$/im.exec(lastEvidence);
+      if (blockLine && recipes.isAuthFailure(blockLine[1]) && !/\bnone\b/i.test(blockLine[1].slice(0, 12))) {
+        blocker = "auth";
+        finalVerdict = { verdict: "fail", feedback: `LOGIN REQUIRED: ${blockLine[1].trim().slice(0, 200)} — not escalated (models cannot log in).` };
+        break;
+      }
     }
     if (state) state = jobs.transition(state, { kind: finalVerdict.verdict === "pass" ? "regular-pass" : "regular-fail" });
     if (state && finalVerdict.verdict === "pass") state = rememberVariant(state, task);
@@ -395,6 +423,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
 
   const journalMode = mismatch ? "regular" : mode === "regular" ? "regular" : fellBack ? `${mode}-fallback` : mode;
+  if (blocker) finalVerdict.blocker = blocker;
 
   // ---- learn: enough passing model runs of the same task → propose a recipe ----
   // (and repair a flagged recipe from a plain regular pass). The bridge decides
@@ -418,13 +447,28 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
 
   const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence });
+  if (blocker) record.blocker = blocker;
   let journalFile = null;
   if (!opts.noJournal) {
     try { journalFile = journal.appendJournal(record); }
     catch (e) { if (verbose) console.error(`[agent] journal write failed: ${e.message}`); }
   }
   return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, mode: journalMode, state, repaired, record, journalFile,
-    autoMatch, mismatch, learned };
+    autoMatch, mismatch, learned, blocker };
+}
+
+// Per-job login hook: a shell command (bridge jobs set <job> --login-cmd "…")
+// that restores the site session in the user's Chrome, e.g. by driving the
+// login form with stored credentials. Resolves {ok, error?, output}.
+function runLoginCmd(cmd, { timeoutMs = 5 * 60 * 1000, verbose = false } = {}) {
+  return new Promise((resolve) => {
+    if (verbose) console.error(`[agent] running login hook: ${cmd}`);
+    shellExec(cmd, { timeout: timeoutMs, env: { ...process.env, AI_BRIDGE_AGENT: "1" }, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (verbose && (stdout || stderr)) console.error(String(stdout || "") + String(stderr || ""));
+      if (err) return resolve({ ok: false, error: (String(stderr || "").trim() || err.message).slice(-400), output: String(stdout || "") });
+      resolve({ ok: true, output: String(stdout || "") });
+    });
+  });
 }
 
 // Remember a task wording that passed a judge together with this job.
@@ -535,6 +579,7 @@ function printJournalLine({ runId, job, journalFile, record, mode, state, repair
   } else if (learned && learned.error) console.log(`learn: recipe proposal failed: ${learned.error}`);
   if (job && state) {
     console.log(`job ${job}: ran in ${mode} mode → now ${state.mode}` +
+      (state.lastResult === "fail" && state.lastAuthFail && state.updatedAt && state.lastAuthFail >= (state.updatedAt || "") ? " (LOGIN REQUIRED — session expired, recipe unchanged)" : "") +
       (state.mode === "audit" ? ` (${state.auditPasses || 0}/${state.auditRequired} audit passes${state.repairNeeded ? ", REPAIR NEEDED" : ""})` : "") +
       (state.mode === "economy" ? ` (canary in ${(state.canaryEvery || 5) - (state.runsSinceCanary || 0)} runs)` : "") +
       (repaired && repaired.version ? `; recipe repaired → v${repaired.version}` : repaired && repaired.error ? `; repair failed: ${repaired.error}` : ""));
@@ -593,4 +638,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };
+module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, runLoginCmd, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };

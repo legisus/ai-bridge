@@ -74,6 +74,11 @@ function transition(state, event, { riskOverride } = {}) {
       s.lastResult = "pass";
       break;
     }
+    case "auth-fail": {
+      // The site wants a login. The recipe is fine; nothing to repair, no mode change.
+      s.lastResult = "fail"; s.lastFailure = event.error || "LOGIN REQUIRED"; s.lastAuthFail = new Date().toISOString();
+      break;
+    }
     case "recipe-fail":
     case "judge-fail": {
       // Recipe broke (or passed its own assertions but the judge disagreed):
@@ -178,9 +183,9 @@ function formatTable(jobs) {
     const j = { ...DEFAULTS, ...jobs[n] };
     return [n + (j.auto ? "*" : ""), j.mode || "regular", j.risk || "-", j.mode === "audit" ? `${j.auditPasses || 0}/${j.auditRequired}` : "-",
       j.mode === "economy" ? `${j.runsSinceCanary || 0}/${j.canaryEvery}` : "-", j.recipeVersion != null ? `v${j.recipeVersion}` : "-",
-      j.repairNeeded ? "REPAIR" : (j.lastResult || "-"), (j.updatedAt || "").slice(0, 16).replace("T", " ")];
+      j.repairNeeded ? "REPAIR" : (j.lastResult || "-"), (j.updatedAt || "").slice(0, 16).replace("T", " "), j.loginCmd ? "hook" : "-"];
   });
-  const head = ["job", "mode", "risk", "audit", "canary", "recipe", "last", "updated"];
+  const head = ["job", "mode", "risk", "audit", "canary", "recipe", "last", "updated", "login"];
   const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
   const fmt = (r) => r.map((c, i) => c.padEnd(w[i])).join("  ");
   return [fmt(head), ...rows.map(fmt), names.some((n) => jobs[n].auto) ? "* = job created automatically from a repeated task" : ""].filter(Boolean).join("\n");
@@ -200,6 +205,7 @@ function main(argv) {
       else if (argv[i] === "--risk") { const r = argv[++i]; if (!["read", "write"].includes(r)) { console.error("risk must be read|write"); process.exit(2); } s.risk = r; }
       else if (argv[i] === "--audits") s.auditRequired = Number(argv[++i]);
       else if (argv[i] === "--canary") s.canaryEvery = Number(argv[++i]);
+      else if (argv[i] === "--login-cmd") { const c = argv[++i]; if (c === "none" || c === "") delete s.loginCmd; else s.loginCmd = c; }
     }
     putJob(pushHistory(s, { event: sub, by: "cli" }));
     process.stdout.write(formatTable(loadJobs()) + "\n");

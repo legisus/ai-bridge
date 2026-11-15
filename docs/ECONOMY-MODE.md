@@ -101,6 +101,25 @@ Nothing has to be tagged. For every `bridge agent "task"`:
    repaired from a plain regular pass as well.
 4. Opt-outs: `--job none`, `--no-auto`; `--job <name>` forces a job.
 
+## Login walls
+
+Sites log the browser out after a while. A recipe detects this with its first
+`assert` (message `LOGIN REQUIRED`); the runner marks the failure `kind: "auth"`.
+Models cannot log in either, so the agent never escalates an auth failure:
+
+- if the job has a **login hook** (`bridge jobs set <job> --login-cmd "shell…"`),
+  the hook runs (it should drive the site's login form in the user's Chrome with
+  stored credentials, e.g. `~/bin/tollroads-login.sh`), then the recipe replays
+  once; a pass counts normally;
+- otherwise, or if the hook fails, the run ends with `LOGIN REQUIRED …` (exit 1),
+  the recipe stays unchanged and the job keeps its mode (`lastAuthFail` recorded);
+- in the regular ladder, an evidence report whose `Blockers:` line names a
+  login/authentication problem stops the ladder after that rung.
+
+This came from a live incident (2026-11-15): the Toll Roads session expired,
+the recipe fell back correctly, and the ladder then spent $5.67 over two runs
+on a login page it could not get past.
+
 ## State machine
 
 ```
