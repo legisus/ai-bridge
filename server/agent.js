@@ -28,6 +28,7 @@ const { SELF_CMD, selfArgs } = require("./runtime");
 const journal = require("./journal");
 const recipes = require("./recipe");
 const jobs = require("./jobs");
+const restrictedRun = require("./channels/restricted");
 
 const RECIPE_MODEL = process.env.AI_BRIDGE_RECIPE_MODEL || "claude-opus-5-5";
 // Cheap classifier that settles "is this the same job?" when word overlap is inconclusive.
@@ -285,7 +286,11 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   };
   let blocker = null; // "auth" when the site wants a login nobody here can give; "cancelled" on abort
   const signal = opts.signal;
-  const baseEnv = opts.baseEnv;
+  // Restricted runs (messenger-originated): browser-only tools, scrubbed env, no
+  // codex rung unless opted in, no learning from their traces.
+  const restricted = !!opts.restricted;
+  const baseEnv = opts.baseEnv || (restricted ? restrictedRun.cleanEnv() : undefined);
+  const pushStage = (st) => { stages.push(st); if (typeof opts.onProgress === "function") { try { opts.onProgress(st); } catch {} } };
   const CANCELLED = { verdict: "cancelled", feedback: "stopped by user; actions already performed were not undone" };
   // Common options for every model call of this run.
   const runOpts = (o) => ({ ...o, signal, baseEnv, cwd: opts.cwd });
@@ -301,7 +306,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     if (found.match) autoMatch = found.match;
     else if (found.uncertain.length) {
       const res = await run(runOpts({ model: MATCH_MODEL, prompt: jobs.classifyPrompt(task, found.uncertain), allowedTools: [], timeoutMs, verbose }));
-      stages.push({ stage: `match:${MATCH_MODEL}`, ...usageOf(res) });
+      pushStage({ stage: `match:${MATCH_MODEL}`, ...usageOf(res) });
       const obj = recipes.extractJson(String(res.result || ""));
       if (obj && obj.job && found.uncertain.some((u) => u.job === obj.job) && (obj.confidence == null || obj.confidence >= 0.7)) {
         autoMatch = { job: obj.job, score: Number(obj.confidence) || 0, exact: false, byModel: true, why: obj.why };
@@ -311,11 +316,11 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
   // Child model processes inherit these; the CLI tags every bridge command
   // with them and the server writes traces/<runId>.jsonl.
-  childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}) };
+  childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}), ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}) };
 
   const judge = async (evidence) => {
     let judgeRes = await run(runOpts({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose }));
-    stages.push({ stage: "judge:fable-5.1", ...usageOf(judgeRes) });
+    pushStage({ stage: "judge:fable-5.1", ...usageOf(judgeRes) });
     let verdict = parseVerdict(String(judgeRes.result || ""));
     if (!verdict) {
       // one re-ask on malformed JSON
@@ -324,7 +329,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         prompt: judgePrompt(task, evidence) + "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
         allowedTools: [], timeoutMs, verbose,
       }));
-      stages.push({ stage: "judge:fable-5.1(retry)", ...usageOf(judgeRes) });
+      pushStage({ stage: "judge:fable-5.1(retry)", ...usageOf(judgeRes) });
       verdict = parseVerdict(String(judgeRes.result || "")) ||
         { verdict: "fail", feedback: String(judgeRes.result || "judge output unreadable") };
     }
@@ -355,7 +360,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       }
     }
     recipeResult = blocker ? { ok: false, evidence: "", steps: [], failure: { step: -1, do: "approval", error: "declined", kind: "declined" } } : await D.runRecipe(recipe, recipeOpts);
-    if (!blocker) stages.push({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
+    if (!blocker) pushStage({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
     if (!recipeResult.ok && recipeResult.failure.kind === "cancelled") { blocker = "cancelled"; finalVerdict = { ...CANCELLED }; lastEvidence = recipeResult.evidence || ""; }
     // Session expired? Run the job's login hook (if any) and replay once. A
     // model cannot log in either, so without a hook this run ends here.
@@ -363,10 +368,10 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       if (state.loginCmd) {
         const t1 = Date.now();
         const login = await D.runLogin(state.loginCmd, { timeoutMs: 5 * 60 * 1000, verbose, baseEnv });
-        stages.push({ stage: "login-hook", input: 0, output: 0, costUsd: 0, ms: Date.now() - t1, ok: login.ok });
+        pushStage({ stage: "login-hook", input: 0, output: 0, costUsd: 0, ms: Date.now() - t1, ok: login.ok });
         if (login.ok) {
           recipeResult = await D.runRecipe(recipe, recipeOpts);
-          stages.push({ stage: `recipe:${job}@v${recipe.version}(after login)`, input: 0, output: 0, costUsd: 0 });
+          pushStage({ stage: `recipe:${job}@v${recipe.version}(after login)`, input: 0, output: 0, costUsd: 0 });
         } else if (verbose) console.error(`[agent] login hook failed: ${login.error}`);
       }
       if (!recipeResult.ok && recipeResult.failure.kind === "auth") {
@@ -390,7 +395,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
           // says the recipe's result does not satisfy it: wrong job, not a
           // broken recipe. No penalty for the job; run the task on its own.
           mismatch = true; fellBack = true; job = null; state = null;
-          childEnv = { AI_BRIDGE_RUN_ID: runId };
+          childEnv = { AI_BRIDGE_RUN_ID: runId, ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}) };
           feedback = `A recipe for a similar job (${autoMatch.job}) ran first but its result does not satisfy this task: ${v.feedback}`;
         } else {
           fellBack = true; feedback = `The deterministic recipe for this job ran but the judge rejected its evidence: ${v.feedback}`;
@@ -417,9 +422,10 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       : 0;
     if (startIdx < 0) throw new Error(`unknown --start model "${opts.start}"; use one of ${OPS_LADDER.map(r => r.label).join(", ")}`);
     // --only: stay on the start rung (no escalation to pricier models on a fail)
-    const rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
-    const playbookExtra = "";
-    const opsTools = [`Bash(${SELF_CMD}:*)`];
+    let rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
+    if (restricted && !opts.codex) rungs = rungs.filter((r) => r.engine !== "codex");
+    const playbookExtra = restricted ? restrictedRun.PLAYBOOK_ADDENDUM : "";
+    const opsTools = restricted ? restrictedRun.allowedTools(SELF_CMD) : [`Bash(${SELF_CMD}:*)`];
     for (const rung of rungs) {
       const opsPrompt = [
         OPS_PLAYBOOK,
@@ -439,7 +445,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         env: childEnv,
       }));
       lastEvidence = extractEvidence(String(opsRes.result || ""));
-      stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
+      pushStage({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
 
       // Stop-before-send: the model paused before an irreversible step. Ask,
       // then rerun the same rung with the answer (or stop here).
@@ -457,7 +463,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
           allowedTools: opsTools, timeoutMs, verbose, env: childEnv,
         }));
         lastEvidence = extractEvidence(String(again.result || ""));
-        stages.push({ stage: `ops:${rung.label}(approved)`, ...usageOf(again) });
+        pushStage({ stage: `ops:${rung.label}(approved)`, ...usageOf(again) });
       }
 
       const verdict = await judge(lastEvidence);
@@ -485,14 +491,14 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
 
   // ---- repair a broken recipe from this (successful) fallback run -------------
   let repaired = null;
-  if (fellBack && !mismatch && finalVerdict.verdict === "pass" && !opts.noRepair) {
+  if (fellBack && !mismatch && finalVerdict.verdict === "pass" && !opts.noRepair && !restricted) {
     try {
       repaired = await D.propose({
         job, task, previous: recipe, failure: recipeResult.failure,
         traces: [journal.readTrace(runId)], run, timeoutMs, verbose,
       });
       state = jobs.transition(state, { kind: "repaired", version: repaired.version });
-      stages.push({ stage: `repair:${RECIPE_MODEL}`, ...(repaired._usage || { input: 0, output: 0 }) });
+      pushStage({ stage: `repair:${RECIPE_MODEL}`, ...(repaired._usage || { input: 0, output: 0 }) });
     } catch (e) {
       if (verbose) console.error(`[agent] recipe repair failed: ${e.message}`);
       repaired = { error: e.message };
@@ -506,12 +512,12 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   // (and repair a flagged recipe from a plain regular pass). The bridge decides
   // on its own; nobody has to tag jobs or run `recipe propose`.
   let learned = null;
-  if (auto && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
+  if (auto && !restricted && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
     try {
       learned = await autoLearn({ job, state, task, runId, startedAt, stages, D, run, timeoutMs, verbose });
       if (learned && learned.recipe) {
         job = learned.job; state = learned.state;
-        stages.push({ stage: `learn:${RECIPE_MODEL}`, ...(learned.recipe._usage || { input: 0, output: 0 }) });
+        pushStage({ stage: `learn:${RECIPE_MODEL}`, ...(learned.recipe._usage || { input: 0, output: 0 }) });
       }
     } catch (e) { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
   }
@@ -525,6 +531,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
 
   const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence });
   if (blocker) record.blocker = blocker;
+  if (opts.source) record.source = String(opts.source);
   let journalFile = null;
   if (!opts.noJournal) {
     try { journalFile = journal.appendJournal(record); }

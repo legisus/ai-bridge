@@ -21,8 +21,9 @@ const assert = (cond, name) => {
 function mockRun(judgeVerdicts) {
   const calls = [];
   let judgeIdx = 0;
-  const run = async ({ engine, model, effort, prompt, env }) => {
-    calls.push({ engine, model, effort, prompt, env });
+  const run = async (opts) => {
+    const { model, prompt } = opts;
+    calls.push({ ...opts });
     if (model === JUDGE_MODEL && prompt.includes("strict verifier")) {
       const v = judgeVerdicts[judgeIdx++];
       return { result: v, usage: { input_tokens: 100, output_tokens: 20 }, total_cost_usd: 0.01 };
@@ -433,6 +434,72 @@ function mockRun(judgeVerdicts) {
     let s3 = scripted([needs], ['{"verdict":"fail","feedback":"not sent"}', '{"verdict":"fail","feedback":"x"}', '{"verdict":"fail","feedback":"y"}']);
     r = await runAgent("email Bob the draft", { runId: "appr0000008", only: true }, s3.run, {});
     assert(r.verdict.verdict === "fail" && s3.calls.length === 2, "step gate: no hook → evidence judged as before");
+  }
+
+  // 14) restricted runs: browser-only tools, no codex, clean env, cwd, progress, no learning, source
+  {
+    const { allowedTools, cleanEnv } = require("../server/channels/restricted.js");
+    const { SELF_CMD } = require("../server/runtime.js");
+    const os = require("os");
+    process.env.AI_BRIDGE_TELEGRAM_TOKEN = "supersecret";
+    const cwd = fs.mkdtempSync(require("path").join(os.tmpdir(), "ai-bridge-cwd-"));
+
+    // three failing judges → only two ops rungs (no codex)
+    let m = mockRun(['{"verdict":"fail","feedback":"a"}', '{"verdict":"fail","feedback":"b"}', '{"verdict":"fail","feedback":"c"}']);
+    const progress = [];
+    let r = await runAgent("read the title", { runId: "restr000001", restricted: true, cwd, source: "channel:telegram", onProgress: (p) => progress.push(p.stage) }, m.run, {});
+    const ops = m.calls.filter((c) => !c.prompt.includes("strict verifier"));
+    assert(ops.length === 2 && ops.every((c) => c.engine !== "codex"), "restricted: codex rung skipped");
+    assert(JSON.stringify(ops[0].allowedTools) === JSON.stringify(allowedTools(SELF_CMD)), "restricted: allowedTools is the browser-only list");
+    assert(!ops[0].allowedTools.some((t) => /agent|jobs|recipe/.test(t)), "restricted: no admin subcommand pattern");
+    assert(ops[0].baseEnv && !("AI_BRIDGE_TELEGRAM_TOKEN" in ops[0].baseEnv) && ops[0].baseEnv.PATH === process.env.PATH, "restricted: baseEnv is scrubbed (no token, PATH kept)");
+    assert(ops[0].cwd === cwd && ops[0].env.AI_BRIDGE_OUTBOX === cwd, "restricted: cwd and AI_BRIDGE_OUTBOX point at the outbox");
+    assert(ops[0].prompt.includes("NEEDS APPROVAL") && ops[0].prompt.includes("Do not use download"), "restricted: playbook addendum included");
+    assert(progress[0] === "ops:opus-5.5" && progress[1] === "judge:fable-5.1", "restricted: onProgress reports stages in order");
+    assert(r.record.source === "channel:telegram", "restricted: source recorded on the journal record");
+
+    // codex opt-in
+    m = mockRun(['{"verdict":"fail","feedback":"a"}', '{"verdict":"fail","feedback":"b"}', '{"verdict":"fail","feedback":"c"}']);
+    await runAgent("read the title", { runId: "restr000002", restricted: true, codex: true, cwd }, m.run, {});
+    assert(m.calls.filter((c) => c.engine === "codex").length === 1, "restricted: codex: true re-enables the last rung");
+
+    // unrestricted baseline still uses the blanket pattern and process.env
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    await runAgent("read the title", { runId: "restr000003" }, m.run, {});
+    assert(m.calls[0].allowedTools[0] === `Bash(${SELF_CMD}:*)` && m.calls[0].baseEnv === undefined, "unrestricted: blanket tool pattern, inherited env");
+
+    // recipe + login hook receive the scrubbed env
+    const jobs = require("../server/jobs.js");
+    jobs.putJob({ job: "rst", mode: "audit", risk: "read", auditPasses: 0, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, loginCmd: "true", history: [] });
+    const seen = {};
+    let first = true;
+    const deps = {
+      loadRecipe: () => ({ job: "rst", version: 1, risk: "read", task: "t", steps: [{ do: "newTab", url: "u" }] }),
+      runRecipe: async (rec, o) => { seen.recipe = o.baseEnv; if (first) { first = false; return { ok: false, evidence: "", steps: [], failure: { step: 0, do: "assert", error: "LOGIN REQUIRED", kind: "auth" } }; } return { ok: true, evidence: "EVIDENCE REPORT\nFinal state: ok", steps: [] }; },
+      runLogin: async (cmd, o) => { seen.login = o.baseEnv; return { ok: true }; },
+    };
+    await runAgent("t", { job: "rst", runId: "restr000004", restricted: true, cwd }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(seen.recipe && !("AI_BRIDGE_TELEGRAM_TOKEN" in seen.recipe) && seen.login && !("AI_BRIDGE_TELEGRAM_TOKEN" in seen.login), "restricted: recipe runner and login hook get the scrubbed env");
+
+    // learning: seeded history makes an unrestricted run propose; the same restricted run does not
+    const task = "Fetch the KBB value page for 9GYW724 and report the number";
+    const seedTrace = (id) => journal.appendTrace(id, { cmd: "newTab", params: { url: "https://www.kbb.com/x" }, ok: true });
+    const sig = journal.signatureOf({ task, domains: ["kbb.com"] });
+    for (const id of ["learn000001", "learn000002"]) {
+      seedTrace(id);
+      journal.appendJournal({ runId: id, task, signature: sig, verdict: "pass", mode: "regular", startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), domains: ["kbb.com"], stages: [], costUsd: 0 });
+    }
+    let proposed = 0;
+    const learnDeps = { propose: async ({ job, task: t }) => { proposed++; return { job, task: t, version: 1, risk: "read", steps: [{ do: "newTab", url: "u" }], _usage: { input: 1, output: 1 } }; } };
+    seedTrace("learn000003");
+    await runAgent(task, { runId: "learn000003" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, learnDeps);
+    assert(proposed === 1, "learning: unrestricted third pass proposes a recipe");
+    seedTrace("learn000004");
+    r = await runAgent(task, { runId: "learn000004", restricted: true, cwd, job: "none" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, learnDeps);
+    seedTrace("learn000005");
+    r = await runAgent(task, { runId: "learn000005", restricted: true, cwd }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, learnDeps);
+    assert(proposed === 1 && !r.learned, "learning: restricted runs never propose or repair");
+    delete process.env.AI_BRIDGE_TELEGRAM_TOKEN;
   }
 
   console.log(failures === 0 ? "\nAll agent tests passed." : `\n${failures} test(s) FAILED.`);
