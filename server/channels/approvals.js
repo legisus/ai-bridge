@@ -60,8 +60,10 @@ class Approvals {
     if (!rec) return "stale";
     if (rec.resolved) return "stale";
     if (this._expired(rec)) { this._settle(rec, "denied"); return "stale"; }
+    // `kind` is checked when the caller knows it (button data); the /approve text
+    // fallback passes undefined and relies on the id + conversation binding.
     if (String(actorId) !== rec.senderId || channel !== rec.channel || (accountId || "default") !== rec.accountId ||
-        String(chatId) !== rec.chatId || kind !== rec.kind) return "forbidden";
+        String(chatId) !== rec.chatId || (kind !== undefined && kind !== rec.kind)) return "forbidden";
     const d = decision === "a" || decision === "approved" || decision === "yes" ? "approved" : "denied";
     this._settle(rec, d);
     return d;
