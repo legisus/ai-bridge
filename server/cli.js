@@ -44,6 +44,8 @@ if (argv.length === 0) {
   console.error("       bridge recipe propose|run|show <job> | validate|import <file>   # economy mode recipes");
   console.error("       bridge jobs [set <job> --mode regular|audit|economy --risk read|write] | reset <job>");
   console.error("       bridge claude-md [--project] [--print]   # teach Claude Code the bridge (writes CLAUDE.md)");
+  console.error("       bridge channels start [--verbose] | status   # messenger daemon (Telegram …), see docs/CHANNELS.md");
+  console.error("       bridge pairing list | approve <channel> <code> | revoke <channel> <senderId>");
   console.error("  Direct mode is the DEFAULT: commands use ordinary extension APIs and");
   console.error("  never attach chrome.debugger (no DevTools session, no debugging banner).");
   console.error("  eval runs via chrome.userScripts (enable \"Allow User Scripts\" once on the");
@@ -55,6 +57,13 @@ if (argv.length === 0) {
   console.error("  pdf and background-tab screenshots are CDP-only and always need approval.");
   process.exit(2);
 }
+
+// `bridge channels …` / `bridge pairing …` — messenger daemon and its allowlist.
+if (argv[0] === "channels") {
+  require("./channels/main").main(argv.slice(1)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
+  return;
+}
+if (argv[0] === "pairing") { require("./channels/pairing").main(argv.slice(1)); return; }
 
 // `bridge claude-md` — append the CLAUDE.md block (with this CLI's path) for Claude Code.
 if (argv[0] === "claude-md") { require("./claude-md").main(argv.slice(1)); return; }

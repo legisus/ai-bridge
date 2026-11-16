@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd template for the AI Browser Bridge messenger daemon (bridge channels start).
+  1. Replace the two /ABSOLUTE/PATH/ai-bridge occurrences with your clone path.
+  2. Replace /opt/homebrew/bin/node with the output of `which node`.
+  3. cp deploy/launchd/com.ai-bridge.channels.plist ~/Library/LaunchAgents/
+  4. launchctl load ~/Library/LaunchAgents/com.ai-bridge.channels.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ai-bridge.channels</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/ABSOLUTE/PATH/ai-bridge/server/channels/main.js</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/ai-bridge/server/channels.out</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/ai-bridge/server/channels.out</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

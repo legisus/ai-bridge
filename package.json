@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "node test/protocol.test.js && node test/agent.test.js && node test/journal.test.js && node test/trace.test.js && node test/recipe.test.js && node test/claude-md.test.js && node test/native-host.test.js && node test/sea.test.js",
+    "test": "node test/protocol.test.js && node test/agent.test.js && node test/journal.test.js && node test/trace.test.js && node test/recipe.test.js && node test/claude-md.test.js && node test/native-host.test.js && node test/sea.test.js && node test/atomic.test.js && node test/channels.chunk.test.js && node test/channels.pairing.test.js && node test/channels.policy.test.js && node test/channels.approvals.test.js && node test/channels.state.test.js && node test/channels.outbox.test.js && node test/channels.restricted.test.js && node test/channels.intent.test.js && node test/channels.config.test.js && node test/channel-telegram.test.js && node test/channels.manager.test.js && node test/channels.main.test.js",
     "register-host": "node server/register-native-host.js",
     "build:sea": "node scripts/build-sea.js",
     "build:mac": "bash macos/build-app.sh",
