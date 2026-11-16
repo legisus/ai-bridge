@@ -117,18 +117,18 @@ function abortError() { return Object.assign(new Error("cancelled"), { name: "Ab
 // Spawn a child in its own process group so an AbortSignal can kill it together
 // with everything it spawned (claude → bash → bridge CLI …). `baseEnv` replaces
 // process.env as the environment base (restricted runs pass a scrubbed one).
-function spawnTracked(cmd, args, { signal, cwd, baseEnv, env, stdio } = {}) {
+function spawnTracked(cmd, args, { signal, cwd, baseEnv, env, stdio, detach } = {}) {
   if (signal && signal.aborted) throw abortError();
   const child = spawn(cmd, args, {
     stdio: stdio || ["ignore", "pipe", "pipe"],
     cwd: cwd || undefined,
-    detached: process.platform !== "win32",
+    // Own process group only when something can kill it (an AbortSignal, or a
+    // runner with a timeout asking for it); plain spawns keep the caller's group.
+    detached: (!!signal || !!detach) && process.platform !== "win32",
     env: { ...(baseEnv || process.env), AI_BRIDGE_AGENT: "1", ...(env || {}) },
   });
   if (signal) {
-    const kill = () => {
-      try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
-    };
+    const kill = () => killGroup(child);
     signal.addEventListener("abort", kill, { once: true });
     child.once("close", () => signal.removeEventListener("abort", kill));
   }
@@ -137,26 +137,37 @@ function spawnTracked(cmd, args, { signal, cwd, baseEnv, env, stdio } = {}) {
 
 // Spawn `claude -p` and resolve with the parsed --output-format json result.
 // Injectable via deps for testing.
-function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env, signal, cwd, baseEnv }) {
+// Every built-in tool other than Bash. Disallowed for tool-less calls (judge,
+// classifier) and for restricted ops runs, so inherited settings.json allow
+// rules cannot hand a messenger-originated task the filesystem or the web.
+const NON_BASH_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch",
+  "Agent", "Task", "TodoWrite", "TodoRead", "Skill", "KillShell", "BashOutput", "EnterPlanMode", "ExitPlanMode"];
+
+function killGroup(child) {
+  try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+}
+
+function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env, signal, cwd, baseEnv, restricted }) {
   return new Promise((resolve, reject) => {
     const args = ["-p", prompt, "--model", model, "--output-format", "json"];
     if (allowedTools && allowedTools.length) {
       args.push("--allowedTools", allowedTools.join(","));
       // Recursion guard: the ops session must never spawn the agent itself.
-      args.push("--disallowedTools", `Bash(${SELF_CMD} agent:*)`);
+      const dis = [`Bash(${SELF_CMD} agent:*)`, ...(restricted ? NON_BASH_TOOLS : [])];
+      args.push("--disallowedTools", dis.join(","));
     } else {
-      args.push("--disallowedTools", "Bash,Edit,Write,WebFetch,WebSearch");
+      args.push("--disallowedTools", ["Bash", ...NON_BASH_TOOLS].join(","));
     }
     // AI_BRIDGE_AGENT marks every process spawned by the agent (and their
     // children), so a recursive `bridge agent` call can be refused at startup
     // no matter how the ops model spells the command.
     let child;
-    try { child = spawnTracked("claude", args, { signal, cwd, baseEnv, env, stdio: ["ignore", "pipe", "pipe"] }); }
+    try { child = spawnTracked("claude", args, { signal, cwd, baseEnv, env, detach: true, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (e) { return reject(e); }
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killGroup(child);
       reject(new Error(`claude (${model}) timed out after ${timeoutMs} ms`));
     }, timeoutMs);
     child.stdout.on("data", (d) => { out += d; });
@@ -169,6 +180,7 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env, signa
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (signal && signal.aborted) return reject(abortError());
       if (code !== 0) {
         return reject(new Error(`claude (${model}) exited ${code}: ${err.trim() || out.trim()}`));
       }
@@ -196,11 +208,11 @@ function runCodex({ model, effort, prompt, timeoutMs, verbose, env, signal, cwd,
       "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
       "-C", cwd || process.cwd(), "-o", outPath, prompt];
     let child;
-    try { child = spawnTracked("codex", args, { signal, cwd, baseEnv, env, stdio: ["ignore", "pipe", "pipe"] }); }
+    try { child = spawnTracked("codex", args, { signal, cwd, baseEnv, env, detach: true, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (e) { cleanup(); return reject(e); }
     let err = "";
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killGroup(child);
       cleanup();
       reject(new Error(`codex (${model}) timed out after ${timeoutMs} ms`));
     }, timeoutMs);
@@ -293,7 +305,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   const pushStage = (st) => { stages.push(st); if (typeof opts.onProgress === "function") { try { opts.onProgress(st); } catch {} } };
   const CANCELLED = { verdict: "cancelled", feedback: "stopped by user; actions already performed were not undone" };
   // Common options for every model call of this run.
-  const runOpts = (o) => ({ ...o, signal, baseEnv, cwd: opts.cwd });
+  const runOpts = (o) => ({ ...o, signal, baseEnv, cwd: opts.cwd, restricted });
 
   const auto = !opts.noAuto && opts.job !== "none";
   let job = opts.job && opts.job !== "none" ? String(opts.job).trim() : null;
@@ -316,7 +328,8 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
   // Child model processes inherit these; the CLI tags every bridge command
   // with them and the server writes traces/<runId>.jsonl.
-  childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}), ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}) };
+  const restrictedEnv = restricted ? { AI_BRIDGE_RESTRICTED: "1" } : {};
+  childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}), ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
 
   const judge = async (evidence) => {
     let judgeRes = await run(runOpts({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose }));
@@ -354,6 +367,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     if (opts.approve && recipes.effectiveRisk(recipe) === "write") {
       const digest = crypto.createHash("sha256").update(`${job}:${recipe.version}:${JSON.stringify(rendered)}`).digest("hex");
       const decision = await opts.approve({ kind: "recipe", title: job, detail: `recipe v${recipe.version} (risk write)`, digest });
+      if (decision === "cancelled") throw abortError();
       if (decision !== "approved") {
         blocker = "declined";
         finalVerdict = { verdict: "declined", feedback: "write-risk recipe not approved; nothing was run" };
@@ -395,7 +409,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
           // says the recipe's result does not satisfy it: wrong job, not a
           // broken recipe. No penalty for the job; run the task on its own.
           mismatch = true; fellBack = true; job = null; state = null;
-          childEnv = { AI_BRIDGE_RUN_ID: runId, ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}) };
+          childEnv = { AI_BRIDGE_RUN_ID: runId, ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
           feedback = `A recipe for a similar job (${autoMatch.job}) ran first but its result does not satisfy this task: ${v.feedback}`;
         } else {
           fellBack = true; feedback = `The deterministic recipe for this job ran but the judge rejected its evidence: ${v.feedback}`;
@@ -452,6 +466,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       const pending = opts.approve ? needsApprovalLine(lastEvidence) : null;
       if (pending) {
         const decision = await opts.approve({ kind: "step", title: pending, detail: "the agent stopped before this action", digest: crypto.createHash("sha256").update(pending).digest("hex") });
+        if (decision === "cancelled") throw abortError();
         if (decision !== "approved") {
           blocker = "declined";
           finalVerdict = { verdict: "declined", feedback: `not approved: ${pending}` };
@@ -569,7 +584,8 @@ function rememberVariant(state, task) {
 async function autoLearn({ job, state, task, runId, startedAt, stages, D, run, timeoutMs, verbose }) {
   const thisTrace = D.readTrace(runId);
   if (!thisTrace.length) return null;
-  const all = D.readJournal({ days: 60 });
+  // Messenger-originated runs never feed learning, whoever runs the later pass.
+  const all = D.readJournal({ days: 60 }).filter((r) => !(r.source && String(r.source).startsWith("channel:")));
   const passes = (recs) => recs.filter((r) => r.verdict === "pass" && (r.mode || "regular") === "regular");
 
   if (job) {
@@ -712,10 +728,14 @@ async function main(argv) {
     child.on("error", reject);
   });
 
-  const report = await runAgent(task, opts);
+  // Ctrl-C aborts the run (and kills the model's process group) instead of
+  // leaving a headless claude driving Chrome.
+  const controller = new AbortController();
+  process.on("SIGINT", () => { if (!controller.signal.aborted) { console.error("\n[agent] interrupted — stopping"); controller.abort(); } });
+  const report = await runAgent(task, { ...opts, signal: controller.signal });
   printReport(report);
   printJournalLine(report);
-  process.exit(report.verdict.verdict === "pass" ? 0 : 1);
+  process.exit(report.verdict.verdict === "pass" ? 0 : report.verdict.verdict === "cancelled" ? 130 : 1);
 }
 
 if (require.main === module) {

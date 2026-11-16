@@ -9,9 +9,10 @@ const API = "https://api.telegram.org";
 const POLL_TIMEOUT_S = 30;
 const ALLOWED_UPDATES = ["message", "callback_query"];
 const BACKOFF_MIN = 1000, BACKOFF_MAX = 30000;
+const HANDLER_ATTEMPTS = 3;           // a failing inbound handler is retried this many times before the update is skipped
 
 function makeAdapter(config, deps = {}) {
-  const { token, accountId = "default", apiBase = API } = config;
+  const { token, accountId = "default", apiBase = API, pollAbortMs = (POLL_TIMEOUT_S + 10) * 1000 } = config;
   const fetchFn = deps.fetch || globalThis.fetch;
   const log = deps.log || (() => {});
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -23,12 +24,12 @@ function makeAdapter(config, deps = {}) {
 
   // One API call. 429 → wait retry_after and retry once; 5xx/network → wait 2 s and
   // retry once; other 4xx → permanent error. Returns the `result` field.
-  async function call(method, body, { form = false, retried = false, retry = true } = {}) {
+  async function call(method, body, { form = false, retried = false, retry = true, signal } = {}) {
     let res;
     try {
       res = form
-        ? await fetchFn(url(method), { method: "POST", body })
-        : await fetchFn(url(method), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+        ? await fetchFn(url(method), { method: "POST", body, signal })
+        : await fetchFn(url(method), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}), signal });
     } catch (e) {
       if (retry && !retried) { await sleep(2000); return call(method, body, { form, retried: true }); }
       throw Object.assign(new Error(`telegram ${method}: ${e.message}`), { permanent: false, status: 0 });
@@ -84,7 +85,10 @@ function makeAdapter(config, deps = {}) {
       try {
         const offset = (getOffset && getOffset()) ?? 0;
         // No call-level retry while polling: the loop's own backoff governs.
-        updates = await call("getUpdates", { offset, timeout: POLL_TIMEOUT_S, allowed_updates: ALLOWED_UPDATES }, { retry: false });
+        // Client-side deadline: a poll that hangs (sleep, network change) is
+        // aborted instead of waiting for the socket's own timeout.
+        updates = await call("getUpdates", { offset, timeout: POLL_TIMEOUT_S, allowed_updates: ALLOWED_UPDATES },
+          { retry: false, signal: typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(pollAbortMs) : undefined });
         backoff = BACKOFF_MIN;
       } catch (e) {
         if (!running) break;
@@ -95,9 +99,23 @@ function makeAdapter(config, deps = {}) {
       }
       for (const u of updates || []) {
         if (!running) break;
-        try { await handleUpdate(u, onInbound); }
-        catch (e) { log(`update ${u.update_id} handler error: ${e.message}`); }
-        if (setOffset) await setOffset(u.update_id + 1);
+        // A failing handler (e.g. state write) is retried before the update is
+        // given up on; the offset only moves once the update is settled.
+        for (let attempt = 1; attempt <= HANDLER_ATTEMPTS; attempt++) {
+          try { await handleUpdate(u, onInbound); break; }
+          catch (e) {
+            log(`update ${u.update_id} handler error (attempt ${attempt}/${HANDLER_ATTEMPTS}): ${e.message}`);
+            if (attempt === HANDLER_ATTEMPTS) log(`update ${u.update_id} skipped after ${HANDLER_ATTEMPTS} failures`);
+            else await sleep(500 * attempt);
+          }
+        }
+        if (setOffset) {
+          let delay = BACKOFF_MIN;
+          while (running) {
+            try { await setOffset(u.update_id + 1); break; }
+            catch (e) { log(`setOffset failed: ${e.message}; retry in ${delay} ms`); await sleep(delay); delay = Math.min(delay * 2, BACKOFF_MAX); }
+          }
+        }
       }
     }
   }

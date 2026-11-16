@@ -56,8 +56,9 @@ function fakeRunAgent() {
 
 function build({ adapter, runAgent, config, stateFile, classify } = {}) {
   const state = new ChannelState(stateFile || path.join(process.env.AI_BRIDGE_HOME, `state-${Math.random().toString(36).slice(2)}.json`));
+  process.env.MGR_PASS = "yes"; process.env.AI_BRIDGE_TELEGRAM_TOKEN = TOKEN;
   const m = new Manager({
-    config: config || { fake: { token: TOKEN, dmPolicy: "pairing", allowFrom: [], codex: false, accountId: "default" } },
+    config: config || { fake: { token: TOKEN, dmPolicy: "pairing", allowFrom: [], codex: false, accountId: "default", envPassthrough: ["MGR_PASS"] } },
     adapters: [adapter], state, pairing,
     approvals: new Approvals({ now }),
     limiter: new RateLimiter({ now }),
@@ -108,6 +109,7 @@ function build({ adapter, runAgent, config, stateFile, classify } = {}) {
     await tick();
     assert(/^⏳ working on it \(run [0-9a-f]+\)$/.test(a.texts()[0]), "accept: first task replies 'working on it'");
     assert(ra.calls.length === 1 && ra.calls[0].opts.restricted === true && ra.calls[0].opts.source === "channel:fake" && ra.calls[0].opts.codex === false, "run: runAgent called restricted with source");
+    assert(ra.calls[0].opts.baseEnv && ra.calls[0].opts.baseEnv.PATH === process.env.PATH && !("AI_BRIDGE_TELEGRAM_TOKEN" in ra.calls[0].opts.baseEnv) && ra.calls[0].opts.baseEnv.MGR_PASS === "yes", "run: baseEnv is scrubbed and honours envPassthrough");
     assert(fs.existsSync(ra.calls[0].opts.cwd) && ra.calls[0].opts.cwd.includes("outbox"), "run: cwd is a fresh outbox dir");
     assert(state.queue()[0].status === "running", "run: status running while the agent works");
 
@@ -304,6 +306,77 @@ function build({ adapter, runAgent, config, stateFile, classify } = {}) {
     ra.finish({});
     await tick(60);
     assert(state.queue().length === 0, "recovery: queue drained");
+    await m.stop();
+  }
+
+  // ---- 9) review fixes: revocation is honoured late, cancel while awaiting, done-item recovery, digest, drain guard
+  {
+    let unhandled = 0; const onUR = () => { unhandled++; }; process.on("unhandledRejection", onUR);
+    pairing.save({ pending: [], approved: [{ channel: "fake", accountId: "default", senderId: "42", approvedAt: "x" }, { channel: "fake", accountId: "default", senderId: "44", approvedAt: "x" }] });
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    const { m, state } = build({ adapter: a, runAgent: ra });
+    await m.start();
+    // 44 queues a task behind 42's running one, then gets revoked
+    await a.emit({ senderId: "42", chatId: "42", messageId: 1, eventId: "e1", text: "first" });
+    await tick();
+    await a.emit({ senderId: "44", chatId: "44", messageId: 2, eventId: "e2", text: "second from 44" });
+    pairing.revoke("fake", "44");
+    ra.finish({});
+    await tick(60);
+    assert(ra.calls.length === 1 && a.sent.some((s) => s.chatId === "44" && /no longer paired/.test(s.text)) && state.queue().length === 0, "revocation: a queued task from a revoked sender is dropped with a notice, not run");
+
+    // revoked actor cannot approve: 42's write task, then revoke 42, tap → forbidden
+    pairing.save({ pending: [], approved: [{ channel: "fake", accountId: "default", senderId: "42", approvedAt: "x" }] });
+    await a.emit({ senderId: "42", chatId: "42", messageId: 3, eventId: "e3", text: "send it now" });
+    await tick();
+    const p1 = a.sent.filter((s) => s.type === "buttons").pop();
+    pairing.revoke("fake", "42");
+    await a.emitAction({ actorId: "42", chatId: "42", messageId: 3, data: p1.buttons[0].data });
+    await tick();
+    assert(ra.calls.length === 1 && !a.sent.some((s) => s.type === "edit" && /approved/.test(s.text)), "revocation: a revoked sender's tap does not approve");
+    pairing.save({ pending: [], approved: [{ channel: "fake", accountId: "default", senderId: "42", approvedAt: "x" }] });
+    // cancel while awaiting approval → cancelled, journaled as cancelled, not declined
+    await a.emit({ senderId: "42", chatId: "42", messageId: 4, eventId: "e4", text: "/cancel" });
+    await tick(60);
+    const j = journal.readJournal({}).filter((r) => r.task === "send it now");
+    assert(a.texts().some((t) => t.startsWith("⏹ cancelled")) && j.length === 1 && j[0].verdict === "cancelled", "cancel while awaiting approval: ⏹ cancelled and one journal record with verdict cancelled");
+    assert(state.queue().length === 0 && ra.calls.length === 1, "cancel while awaiting approval: item removed, agent never called");
+
+    // agent-side approval keeps the agent's digest
+    await a.emit({ senderId: "42", chatId: "42", messageId: 5, eventId: "e5", text: "look at it" });
+    await tick();
+    const dp = ra.calls[1].opts.approve({ kind: "recipe", title: "toll", detail: "recipe v3 (risk write)", digest: "feedfacefeedface" });
+    await tick();
+    const runId = ra.calls[1].opts.runId;
+    assert(m.approvals.pendingFor(runId)[0].digest === "feedfacefeedface", "approval binding: the agent's digest is stored, not the prompt text's");
+    const pr = a.sent.filter((s) => s.type === "buttons").pop();
+    await a.emitAction({ actorId: "42", chatId: "42", messageId: 5, data: pr.buttons[1].data });
+    assert((await dp) === "denied", "approval: deny resolves denied");
+    // drain guard: a throwing state write must not become an unhandled rejection
+    const origRemove = state.remove.bind(state);
+    let thrown = false;
+    state.remove = (pred) => { if (!thrown) { thrown = true; throw new Error("disk full"); } return origRemove(pred); };
+    ra.finish({});
+    await tick(80);
+    state.remove = origRemove;
+    assert(unhandled === 0, "drain guard: a throwing state write is caught (no unhandledRejection)");
+    await m.stop();
+    process.off("unhandledRejection", onUR);
+  }
+  {
+    // recovery: a `done` item whose journal record exists → one notice, no duplicate journal, removed
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover2.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "d1", item: { runId: "runD00000004", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "was done" } });
+    seed.setStatus("runD00000004", "done");
+    journal.appendJournal({ runId: "runD00000004", task: "was done", verdict: "pass", mode: "regular", source: "channel:fake", startedAt: "x", endedAt: "y", stages: [], costUsd: 0, domains: [] });
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    const { m, state } = build({ adapter: a, runAgent: ra, stateFile });
+    await m.start();
+    await tick();
+    assert(a.texts().some((t) => t.includes('"was done"') && /lost|not delivered/.test(t)), "recovery: done item → 'result lost' notice");
+    assert(journal.readJournal({}).filter((r) => r.runId === "runD00000004").length === 1, "recovery: no duplicate journal record for a run that already has one");
+    assert(state.queue().length === 0 && ra.calls.length === 0, "recovery: done item removed, nothing run");
     await m.stop();
   }
 

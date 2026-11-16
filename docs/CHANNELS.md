@@ -105,9 +105,20 @@ type in the terminal:
 - The **Codex rung is off** (it has no per-command tool allowlist). Set
   `"codex": true` on the channel to re-enable it.
 - Child processes get a **scrubbed environment**: `PATH HOME USER LANG TMPDIR
-  BRIDGE_PORT` and the run's `AI_BRIDGE_*` metadata. Messenger tokens never
-  reach a model, a recipe step or a login hook, and are redacted from logs,
-  errors and delivered evidence.
+  BRIDGE_PORT`, the run's `AI_BRIDGE_*` metadata, and the model's own
+  credentials (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `XDG_CONFIG_HOME`, `CODEX_HOME`,
+  `OPENAI_API_KEY`) so `claude -p` can start on a server. Anything else you
+  need (a proxy, say) goes in `"envPassthrough": ["HTTPS_PROXY"]` per channel.
+  Messenger tokens never reach a model, a recipe step or a login hook, and are
+  redacted from logs, errors and delivered evidence.
+- A **second fence at the CLI**: with `AI_BRIDGE_RESTRICTED=1` (set for every
+  child of a channel run) the bridge CLI itself refuses the admin subcommands
+  and confines `--out` / `--file` to the run's outbox directory, symlinks
+  included. Even a model that talked its way past the tool allowlist cannot
+  write `pairing.json` or read your files through the bridge.
+- Model runs may call **no built-in tool other than Bash** (no Read, Write,
+  Glob, WebFetch…), whatever your `settings.json` allows elsewhere.
 - Channel runs **never learn or repair recipes**; recipes stay something you grow
   from the terminal. They may run existing recipes.
 
@@ -122,7 +133,8 @@ type in the terminal:
     "dmPolicy": "pairing",
     "allowFrom": ["123456789"],
     "codex": false,
-    "intentKeywords": ["send", "pay", "..."]
+    "intentKeywords": ["send", "pay", "..."],
+    "envPassthrough": ["HTTPS_PROXY"]
   }
 }
 ```
@@ -160,6 +172,10 @@ bridge channels start
 ```
 
 The CLI on the server connects to `127.0.0.1:8765`, which is now the tunnel.
+Claude Code on the server authenticates either through `claude login` run as
+the daemon's user or through `CLAUDE_CODE_OAUTH_TOKEN` in the daemon's
+environment (the systemd template shows where); both survive the scrubbed
+child environment.
 Screenshots and PDFs still land in the server-side outbox, so delivery works
 unchanged. A built-in reverse connection is on the roadmap.
 

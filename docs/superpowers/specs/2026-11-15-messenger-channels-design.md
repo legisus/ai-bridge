@@ -100,9 +100,18 @@ security property and it is enforced by tooling, not by prompt text.
   reach the shell. Operators who accept that risk set `codex: true` per
   channel.
 - Child processes get an explicit environment: `PATH HOME USER LANG TMPDIR
-  BRIDGE_PORT AI_BRIDGE_*` run metadata, and nothing else. Messenger tokens
-  never reach a model or a login hook. Token values are redacted from
-  `channels.log`, error messages and delivered evidence.
+  BRIDGE_PORT AI_BRIDGE_*` run metadata, the model's own credentials
+  (`CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  CLAUDE_CONFIG_DIR XDG_CONFIG_HOME CODEX_HOME OPENAI_API_KEY`, without which
+  the model cannot start on a server), an operator `envPassthrough` list, and
+  nothing else. Messenger tokens never reach a model or a login hook. Token
+  values are redacted from `channels.log`, error messages and delivered
+  evidence. (Revised after the final review; the Nov 15 draft listed no auth
+  variables.)
+- A second fence at the CLI boundary: children run with
+  `AI_BRIDGE_RESTRICTED=1`, under which `cli.js` refuses the admin
+  subcommands and confines `--out`/`--file` to the outbox (symlink-safe).
+- Model calls disallow every built-in tool other than Bash.
 - Per-run cwd is the run's outbox directory, so `screenshot --out` and
   `pdf --out` land there without the model knowing any path.
 - Restricted runs never trigger learning, repair or recipe proposal from

@@ -30,6 +30,9 @@ assert(cfg.telegram.token === "999:ENV", "loadConfig: AI_BRIDGE_<CHANNEL>_TOKEN 
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t", dmPolicy: "allowlist", allowFrom: [42, "7"], codex: true } }), { mode: 0o600 });
 cfg = loadConfig({ env: {} });
 assert(cfg.telegram.dmPolicy === "allowlist" && JSON.stringify(cfg.telegram.allowFrom) === '["42","7"]' && cfg.telegram.codex === true, "loadConfig: explicit values kept, allowFrom stringified");
+assert(JSON.stringify(cfg.telegram.envPassthrough) === "[]", "loadConfig: envPassthrough defaults to []");
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t", envPassthrough: ["HTTPS_PROXY", 7] } }), { mode: 0o600 });
+assert(JSON.stringify(loadConfig({ env: {} }).telegram.envPassthrough) === '["HTTPS_PROXY","7"]', "loadConfig: envPassthrough kept as strings");
 
 // bad policy rejected
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t", dmPolicy: "yolo" } }), { mode: 0o600 });

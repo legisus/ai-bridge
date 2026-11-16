@@ -20,6 +20,9 @@ assert(JSON.stringify(Object.keys(env).sort()) === JSON.stringify(["AI_BRIDGE_AG
   "cleanEnv: keeps only PATH HOME USER LANG TMPDIR BRIDGE_PORT + run metadata");
 assert(!("AI_BRIDGE_TELEGRAM_TOKEN" in env) && !("AWS_SECRET_ACCESS_KEY" in env), "cleanEnv: secrets dropped");
 assert(cleanEnv({ PATH: "p" }).PATH === "p" && Object.keys(cleanEnv({})).length === 0, "cleanEnv: missing keys are simply absent");
+const auth = cleanEnv({ CLAUDE_CODE_OAUTH_TOKEN: "o", ANTHROPIC_API_KEY: "k", AI_BRIDGE_RESTRICTED: "1", AI_BRIDGE_TELEGRAM_TOKEN: "t", MY_PROXY: "p" }, ["MY_PROXY"]);
+assert(auth.CLAUDE_CODE_OAUTH_TOKEN === "o" && auth.ANTHROPIC_API_KEY === "k" && auth.AI_BRIDGE_RESTRICTED === "1" && auth.MY_PROXY === "p" && !("AI_BRIDGE_TELEGRAM_TOKEN" in auth),
+  "cleanEnv: keeps the model's own auth, the restricted marker and operator passthrough; never a messenger token");
 
 assert(PLAYBOOK_ADDENDUM.includes('before any irreversible action the task did not already name, stop and end your report with "NEEDS APPROVAL: <one line>"'), "addendum: stop-before-send line");
 assert(PLAYBOOK_ADDENDUM.includes("to deliver a file, fetch it in the page with eval returning {base64} and --out <name>, or use pdf --out / screenshot --out; files in the current directory are sent to the user"), "addendum: outbox delivery line");

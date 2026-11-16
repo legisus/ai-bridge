@@ -7,7 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { DIR } = require("../token");
-const { atomicWrite } = require("../atomic");
+const { atomicWrite, withLock } = require("../atomic");
 
 const PAIRING_FILE = path.join(DIR, "pairing.json");
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
@@ -27,10 +27,10 @@ function load({ now = Date.now() } = {}) {
   try { st = JSON.parse(fs.readFileSync(PAIRING_FILE, "utf8")); } catch { st = {}; }
   const pending = Array.isArray(st.pending) ? st.pending : [];
   const approved = Array.isArray(st.approved) ? st.approved : [];
+  // Expired pending entries are pruned from the returned view; the next mutation
+  // persists the pruned state (reads never write, so they need no lock).
   const fresh = pending.filter((p) => now - Date.parse(p.createdAt || 0) < PENDING_TTL_MS);
-  const out = { pending: fresh, approved };
-  if (fresh.length !== pending.length) save(out);
-  return out;
+  return { pending: fresh, approved };
 }
 
 function save(state) {
@@ -40,7 +40,8 @@ function save(state) {
 const same = (a, b) => a.channel === b.channel && (a.accountId || "default") === (b.accountId || "default") && String(a.senderId) === String(b.senderId);
 
 // Upsert a pending request. Returns { code, created }.
-function request({ channel, accountId = "default", senderId, meta = {} }) {
+function request({ channel, accountId = "default", senderId, meta = {} }, lockOpts) {
+  return withLock(PAIRING_FILE, () => {
   const st = load();
   const existing = st.pending.find((p) => same(p, { channel, accountId, senderId }));
   if (existing) { existing.meta = { ...existing.meta, ...meta }; save(st); return { code: existing.code, created: false }; }
@@ -55,6 +56,7 @@ function request({ channel, accountId = "default", senderId, meta = {} }) {
   st.pending.push({ channel, accountId, senderId: String(senderId), code, meta, createdAt: new Date().toISOString() });
   save(st);
   return { code, created: true };
+  }, lockOpts);
 }
 
 function isApproved({ channel, accountId = "default", senderId }) {
@@ -62,7 +64,8 @@ function isApproved({ channel, accountId = "default", senderId }) {
 }
 
 // Operator approves a pending code. Returns the entry or null.
-function approve(channel, code) {
+function approve(channel, code, lockOpts) {
+  return withLock(PAIRING_FILE, () => {
   const st = load();
   const idx = st.pending.findIndex((p) => p.channel === channel && p.code === String(code).toUpperCase());
   if (idx === -1) return null;
@@ -71,15 +74,18 @@ function approve(channel, code) {
   st.approved.push({ channel: p.channel, accountId: p.accountId, senderId: p.senderId, meta: p.meta, approvedAt: new Date().toISOString() });
   save(st);
   return { senderId: p.senderId, accountId: p.accountId, meta: p.meta || {} };
+  }, lockOpts);
 }
 
-function revoke(channel, senderId) {
-  const st = load();
-  const before = st.approved.length;
-  st.approved = st.approved.filter((a) => !(a.channel === channel && String(a.senderId) === String(senderId)));
-  if (st.approved.length === before) return false;
-  save(st);
-  return true;
+function revoke(channel, senderId, lockOpts) {
+  return withLock(PAIRING_FILE, () => {
+    const st = load();
+    const before = st.approved.length;
+    st.approved = st.approved.filter((a) => !(a.channel === channel && String(a.senderId) === String(senderId)));
+    if (st.approved.length === before) return false;
+    save(st);
+    return true;
+  }, lockOpts);
 }
 
 function metaLine(meta) {

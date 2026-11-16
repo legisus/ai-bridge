@@ -58,6 +58,17 @@ if (argv.length === 0) {
   process.exit(2);
 }
 
+// Restricted runs (AI_BRIDGE_RESTRICTED=1, set by the channels daemon for
+// messenger-originated tasks): admin subcommands and window-wide commands are
+// refused here, at the process boundary, and --out/--file are confined to the
+// run's outbox. Claude Code's tool allowlist is the first fence; this is the second.
+const RESTRICTED = process.env.AI_BRIDGE_RESTRICTED === "1";
+const RESTRICTED_DENY = new Set(["agent", "jobs", "recipe", "journal", "pairing", "channels", "claude-md", "download", "activateTab", "detachAll", "reloadExtension"]);
+if (RESTRICTED && RESTRICTED_DENY.has(argv[0])) {
+  console.error(`ERROR: restricted run: "${argv[0]}" is not available from a messenger task`);
+  process.exit(7);
+}
+
 // `bridge channels …` / `bridge pairing …` — messenger daemon and its allowlist.
 if (argv[0] === "channels") {
   require("./channels/main").main(argv.slice(1)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
@@ -93,6 +104,31 @@ for (let i = 1; i < argv.length; i++) {
   else if (argv[i] === "--direct" || argv[i] === "--stealth") flags.direct = true;   // explicit (default anyway); --stealth = pre-0.1.10 alias
   else if (argv[i] === "--debugger" || argv[i] === "--no-stealth") flags.debugger = true; // --no-stealth = pre-0.1.10 alias
   else params = JSON.parse(argv[i]);
+}
+// Confine a path to the outbox: the deepest existing ancestor must resolve (symlinks
+// followed) inside the outbox, and the remaining components may not climb out.
+function confinedToOutbox(p) {
+  const outbox = process.env.AI_BRIDGE_OUTBOX;
+  if (!outbox) return false;
+  let root; try { root = fs.realpathSync(outbox); } catch { return false; }
+  const abs = path.resolve(process.cwd(), p);
+  const rel = path.relative(abs, abs); void rel;
+  let existing = abs;
+  const tail = [];
+  while (!fs.existsSync(existing)) { tail.unshift(path.basename(existing)); existing = path.dirname(existing); if (existing === path.dirname(existing)) break; }
+  if (tail.some((seg) => seg === "..")) return false;
+  let real; try { real = fs.realpathSync(existing); } catch { return false; }
+  // the target itself must not be a symlink
+  try { if (fs.lstatSync(abs).isSymbolicLink()) return false; } catch {}
+  return real === root || real.startsWith(root + path.sep);
+}
+if (RESTRICTED) {
+  for (const [flag, value] of [["--out", flags.out], ["--file", flags.file]]) {
+    if (value && !confinedToOutbox(value)) {
+      console.error(`ERROR: restricted run: ${flag} must stay inside the run's outbox (${process.env.AI_BRIDGE_OUTBOX || "unset"})`);
+      process.exit(7);
+    }
+  }
 }
 if (flags.file) params.code = fs.readFileSync(flags.file, "utf8");
 

@@ -78,5 +78,15 @@ assert((fs.statSync(pairing.PAIRING_FILE).mode & 0o777) === 0o600, "persistence:
   assert(out.some((l) => /no pending/i.test(l)), "cli list: empty store prints 'no pending'");
 }
 
+// cross-process safety: mutations take the store lock
+{
+  fs.writeFileSync(pairing.PAIRING_FILE + ".lock", "other");
+  let threw = null; try { pairing.request({ channel: "x", accountId: "default", senderId: "lockme" }, { timeoutMs: 100 }); } catch (e) { threw = e; }
+  assert(threw && /busy|lock/.test(threw.message), "request: held store lock → throws instead of clobbering");
+  fs.unlinkSync(pairing.PAIRING_FILE + ".lock");
+  pairing.request({ channel: "x", accountId: "default", senderId: "lockme" });
+  assert(!fs.existsSync(pairing.PAIRING_FILE + ".lock"), "request: lock released after the write");
+}
+
 fs.rmSync(process.env.AI_BRIDGE_HOME, { recursive: true, force: true });
 process.exit(failures ? 1 : 0);

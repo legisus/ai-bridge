@@ -25,13 +25,25 @@ function readLock() {
   try { return Number(fs.readFileSync(LOCK_FILE, "utf8").trim()) || 0; } catch { return 0; }
 }
 
+// Exclusive create (O_EXCL) so two daemons starting together cannot both win;
+// a lock whose pid is dead (or our own) is reclaimed.
 function acquireLock() {
-  const pid = readLock();
-  if (pid && pid !== process.pid && pidAlive(pid)) throw new Error(`another channels daemon is running (pid ${pid}); stop it first or remove ${LOCK_FILE}`);
   if (!fs.existsSync(DIR)) fs.mkdirSync(DIR, { mode: 0o700, recursive: true });
-  fs.writeFileSync(LOCK_FILE, String(process.pid), { mode: 0o600 });
   const release = () => { try { if (readLock() === process.pid) fs.unlinkSync(LOCK_FILE); } catch {} };
-  return release;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const fd = fs.openSync(LOCK_FILE, "wx", 0o600);
+      fs.writeSync(fd, String(process.pid)); fs.closeSync(fd);
+      return release;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      const pid = readLock();
+      if (pid === process.pid) return release;
+      if (pid && pidAlive(pid)) throw new Error(`another channels daemon is running (pid ${pid}); stop it first or remove ${LOCK_FILE}`);
+      try { fs.unlinkSync(LOCK_FILE); } catch {}   // stale: dead pid or unreadable
+    }
+  }
+  throw new Error(`could not acquire ${LOCK_FILE}`);
 }
 
 function buildAdapters(config, deps) {

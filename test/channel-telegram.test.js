@@ -17,6 +17,7 @@ const requests = [];          // { method, body, headers, raw }
 let pendingUpdates = [];      // served once by getUpdates
 const responders = {};        // method -> [fn(req) → {status, json}] consumed in order
 let failGetUpdates = 0;
+let hangGetUpdates = 0;       // leave N getUpdates requests unanswered (client must time out)
 const server = http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
@@ -32,6 +33,7 @@ const server = http.createServer((req, res) => {
     const q = responders[method];
     if (q && q.length) { const r = q.shift()(rec); return reply(r.status, r.json); }
     if (method === "getUpdates") {
+      if (hangGetUpdates > 0) { hangGetUpdates--; return; /* never answer */ }
       if (failGetUpdates > 0) { failGetUpdates--; return reply(500, { ok: false, description: "boom" }); }
       const upd = pendingUpdates.filter((u) => u.update_id >= (body.offset || 0));
       pendingUpdates = pendingUpdates.filter((u) => u.update_id < (body.offset || 0));
@@ -50,7 +52,7 @@ const server = http.createServer((req, res) => {
   const apiBase = `http://127.0.0.1:${server.address().port}`;
   const sleeps = [];
   const deps = { fetch: globalThis.fetch, log: () => {}, sleep: async (ms) => { sleeps.push(ms); }, now: Date.now };
-  const adapter = makeAdapter({ token: TOKEN, apiBase, accountId: "default" }, deps);
+  const adapter = makeAdapter({ token: TOKEN, apiBase, accountId: "default", pollAbortMs: 200 }, deps);
 
   assert(adapter.id === "telegram" && adapter.accountId === "default", "adapter: id and accountId");
   assert(JSON.stringify(adapter.capabilities) === JSON.stringify({ buttons: true, media: true, edit: true, textLimit: 4000, chunkMode: "text", maxFileBytes: 50e6 }), "adapter: capabilities");
@@ -134,11 +136,61 @@ const server = http.createServer((req, res) => {
   await wait(300);
   assert(sleeps[0] === 1000 && sleeps[1] === 2000, `poll: backoff 1000 then 2000 on consecutive failures (got ${JSON.stringify(sleeps.slice(0, 3))})`);
 
-  // ---- stop
+  // ---- stop (before the scenarios that use their own adapters against the shared fake)
   await adapter.stop();
   const before = requests.filter((r) => r.method === "getUpdates").length;
   await wait(150);
   assert(requests.filter((r) => r.method === "getUpdates").length === before, "stop: no further polls");
+
+  // ---- handler failure: the update is retried, offset not advanced until it succeeds; after 3 failures it is skipped
+  {
+    sleeps.length = 0;
+    let attempts = 0;
+    const seen = [];
+    const a2 = makeAdapter({ token: TOKEN, apiBase, accountId: "acc2", pollAbortMs: 200 }, deps);
+    let off = 5000;
+    pendingUpdates = [
+      { update_id: 5000, message: { message_id: 50, from: user, chat: { id: 42, type: "private" }, date: 1, text: "flaky" } },
+      { update_id: 5001, message: { message_id: 51, from: user, chat: { id: 42, type: "private" }, date: 1, text: "doomed" } },
+      { update_id: 5002, message: { message_id: 52, from: user, chat: { id: 42, type: "private" }, date: 1, text: "fine" } },
+    ];
+    a2.start(async (evt) => {
+      seen.push(evt.text);
+      if (evt.text === "flaky" && attempts++ < 2) throw new Error("disk full");
+      if (evt.text === "doomed") throw new Error("always");
+    }, { getOffset: () => off, setOffset: async (v) => { off = v; } });
+    await wait(900);
+    assert(seen.filter((t) => t === "flaky").length === 3, "handler failure: failing update retried until it succeeds (3 attempts)");
+    assert(seen.indexOf("fine") > seen.lastIndexOf("doomed") && seen.filter((t) => t === "doomed").length === 3, "handler failure: an update that fails 3 times is skipped and the batch continues");
+    assert(off === 5003, "handler failure: offset ends past the whole batch");
+    assert(!seen.includes("fine") || seen.indexOf("fine") > seen.indexOf("flaky"), "handler failure: later updates wait for the failing one");
+    await a2.stop();
+  }
+
+  // ---- setOffset failure: logged, loop survives
+  {
+    let off = 6000, calls = 0, logged = [];
+    const d3 = { ...deps, log: (l) => logged.push(l) };
+    const a3b = makeAdapter({ token: TOKEN, apiBase, accountId: "acc3", pollAbortMs: 200 }, d3);
+    pendingUpdates = [{ update_id: 6000, message: { message_id: 60, from: user, chat: { id: 42, type: "private" }, date: 1, text: "x" } }];
+    a3b.start(async () => {}, { getOffset: () => off, setOffset: async (v) => { if (calls++ === 0) throw new Error("state write failed"); off = v; } });
+    await wait(600);
+    assert(off === 6001 && logged.some((l) => /state write failed/.test(l)), "setOffset failure: logged and retried, loop alive");
+    await a3b.stop();
+  }
+
+  // ---- hung long poll: client-side timeout, loop recovers
+  {
+    const a4 = makeAdapter({ token: TOKEN, apiBase, accountId: "acc4", pollAbortMs: 150 }, deps);
+    let off = 7000;
+    hangGetUpdates = 1;
+    pendingUpdates = [{ update_id: 7000, message: { message_id: 70, from: user, chat: { id: 42, type: "private" }, date: 1, text: "after hang" } }];
+    const got = [];
+    a4.start(async (evt) => { got.push(evt.text); }, { getOffset: () => off, setOffset: async (v) => { off = v; } });
+    await wait(1500);
+    assert(got.includes("after hang"), "hung poll: aborted client-side and the next poll delivers");
+    await a4.stop();
+  }
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });

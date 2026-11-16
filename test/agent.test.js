@@ -502,6 +502,87 @@ function mockRun(judgeVerdicts) {
     delete process.env.AI_BRIDGE_TELEGRAM_TOKEN;
   }
 
+  // 15) real child processes: a fake `claude` on PATH
+  {
+    const { spawnTracked, runModel } = require("../server/agent.js");
+    const { execFileSync } = require("child_process");
+    const os = require("os");
+    const path = require("path");
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-fakebin-"));
+    fs.copyFileSync(path.join(__dirname, "fixtures", "fake-claude.js"), path.join(bin, "claude"));
+    fs.chmodSync(path.join(bin, "claude"), 0o755);
+    const PATH = `${bin}:${process.env.PATH}`;
+    const logFile = path.join(bin, "argv.log");
+    const pidsFile = path.join(bin, "pids.json");
+    const base = (extra = {}) => ({ PATH, HOME: process.env.HOME, FAKE_CLAUDE_LOG: logFile, ...extra });
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+
+    // restricted run: all non-Bash tools disallowed, AI_BRIDGE_RESTRICTED set for children
+    fs.writeFileSync(logFile, "");
+    let res = await runModel({ model: "m", prompt: "p", allowedTools: ["Bash(x eval:*)"], timeoutMs: 10000, restricted: true, baseEnv: base({ FAKE_CLAUDE_MODE: "ok" }), env: { AI_BRIDGE_RESTRICTED: "1" } });
+    let argv = JSON.parse(fs.readFileSync(logFile, "utf8").trim().split("\n").pop());
+    const dis = argv[argv.indexOf("--disallowedTools") + 1] || "";
+    assert(res.result.startsWith("EVIDENCE") && ["Edit", "Write", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].every((t) => dis.split(",").includes(t)), "fake claude: restricted run disallows every non-Bash built-in tool");
+    assert(argv.includes("--allowedTools") && argv[argv.indexOf("--allowedTools") + 1] === "Bash(x eval:*)", "fake claude: allowedTools forwarded");
+
+    // judge/classifier (no tools): also no Read/Glob/Agent
+    fs.writeFileSync(logFile, "");
+    await runModel({ model: "m", prompt: "p", allowedTools: [], timeoutMs: 10000, baseEnv: base({ FAKE_CLAUDE_MODE: "ok" }) });
+    argv = JSON.parse(fs.readFileSync(logFile, "utf8").trim());
+    const dis2 = (argv[argv.indexOf("--disallowedTools") + 1] || "").split(",");
+    assert(["Bash", "Read", "Glob", "Grep", "Agent", "WebFetch"].every((t) => dis2.includes(t)), "fake claude: tool-less call disallows Bash and the read tools");
+
+    // abort mid-rung → AbortError → runAgent reports cancelled and journals it
+    const ctl = new AbortController();
+    const p = runAgent("hang task", { runId: "realcancel01", baseEnv: base({ FAKE_CLAUDE_MODE: "hang", FAKE_CLAUDE_PIDS: pidsFile }), signal: ctl.signal });
+    await new Promise((r) => setTimeout(r, 700));
+    const pids = JSON.parse(fs.readFileSync(pidsFile, "utf8"));
+    ctl.abort();
+    const r = await p;
+    await new Promise((r2) => setTimeout(r2, 300));
+    assert(r.verdict.verdict === "cancelled", "fake claude: abort → verdict cancelled (not error)");
+    assert(journal.readJournal({}).some((x) => x.runId === "realcancel01" && x.verdict === "cancelled"), "fake claude: cancelled run journaled");
+    assert(!alive(pids.parent) && !alive(pids.child), "fake claude: abort killed claude and its grandchild");
+
+    // timeout kills the whole group too
+    fs.unlinkSync(pidsFile);
+    let timedOut = null;
+    try { await runModel({ model: "m", prompt: "p", allowedTools: [], timeoutMs: 600, baseEnv: base({ FAKE_CLAUDE_MODE: "hang", FAKE_CLAUDE_PIDS: pidsFile }) }); } catch (e) { timedOut = e; }
+    await new Promise((r2) => setTimeout(r2, 300));
+    const pids2 = JSON.parse(fs.readFileSync(pidsFile, "utf8"));
+    assert(timedOut && /timed out/.test(timedOut.message) && !alive(pids2.parent) && !alive(pids2.child), "fake claude: timeout kills claude and its grandchild");
+
+    // without a signal the child stays in our process group (Ctrl-C still reaches it)
+    const child = spawnTracked(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    const pgid = (pid) => Number(execFileSync("ps", ["-o", "pgid=", "-p", String(pid)]).toString().trim());
+    assert(pgid(child.pid) === pgid(process.pid), "spawnTracked: no signal → same process group as the caller");
+    child.kill("SIGKILL");
+    const child2 = spawnTracked(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore", signal: new AbortController().signal });
+    assert(pgid(child2.pid) !== pgid(process.pid), "spawnTracked: with a signal → own process group");
+    process.kill(-child2.pid, "SIGKILL");
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
+
+  // 16) approval hook may answer "cancelled"; learning ignores channel-originated records
+  {
+    const jobs = require("../server/jobs.js");
+    jobs.putJob({ job: "wrc", mode: "audit", risk: "write", auditPasses: 0, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, history: [] });
+    const deps = { loadRecipe: () => ({ job: "wrc", version: 1, risk: "write", task: "t", steps: [{ do: "click", selector: "#x" }] }), runRecipe: async () => { throw new Error("must not run"); } };
+    let r = await runAgent("t", { job: "wrc", runId: "apprcanc001", approve: async () => "cancelled" }, mockRun([]).run, deps);
+    assert(r.verdict.verdict === "cancelled" && jobs.getJob("wrc").history.length === 0, "approve → cancelled: verdict cancelled, job untouched");
+
+    const task = "Open the dealer page for 9GYW724 and report the price";
+    const sig = journal.signatureOf({ task, domains: ["dealer.com"] });
+    for (const id of ["chl000001", "chl000002"]) {
+      journal.appendTrace(id, { cmd: "newTab", params: { url: "https://dealer.com/x" }, ok: true });
+      journal.appendJournal({ runId: id, task, signature: sig, verdict: "pass", mode: "regular", source: "channel:telegram", startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), domains: ["dealer.com"], stages: [], costUsd: 0 });
+    }
+    journal.appendTrace("chl000003", { cmd: "newTab", params: { url: "https://dealer.com/x" }, ok: true });
+    let proposed = 0;
+    r = await runAgent(task, { runId: "chl000003" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, { propose: async () => { proposed++; return { version: 1, steps: [] }; } });
+    assert(proposed === 0 && !r.learned, "learning: channel-originated passes do not count towards a recipe");
+  }
+
   console.log(failures === 0 ? "\nAll agent tests passed." : `\n${failures} test(s) FAILED.`);
   process.exit(failures ? 1 : 0);
 })();

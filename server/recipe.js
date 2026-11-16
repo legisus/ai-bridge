@@ -51,7 +51,10 @@ function saveRecipe(recipe) {
   ensureDir(RECIPES_DIR);
   const prev = loadRecipe(j);
   const version = prev ? (Number(prev.version) || 0) + 1 : 1;
-  const out = { ...recipe, job: j, version, savedAt: new Date().toISOString() };
+  // Operator approval is granted per saved version through approveRisk(); a
+  // supplied or model-generated flag is never carried over.
+  const { riskApprovedBy, riskApprovedAt, ...clean } = recipe;
+  const out = { ...clean, job: j, version, savedAt: new Date().toISOString() };
   const text = JSON.stringify(out, null, 2) + "\n";
   atomicWrite(recipeFile(j, version), text, { mode: 0o644 });
   atomicWrite(recipeFile(j), text, { mode: 0o644 });
@@ -87,8 +90,9 @@ function validateRecipe(r) {
 // A recipe that clicks/types anywhere is "write" unless it says otherwise;
 // used as the default risk when the proposer does not classify.
 function inferRisk(r) {
+  // Code with templates cannot be inspected before rendering → treat as write.
   return (r.steps || []).some((s) => WRITE_CMDS.has(s.do) ||
-    (["eval", "assert", "poll"].includes(s.do) && WRITE_CODE_RE.test(String(s.code || "")))) ? "write" : "read";
+    (["eval", "assert", "poll"].includes(s.do) && (WRITE_CODE_RE.test(String(s.code || "")) || String(s.code || "").includes("{{")))) ? "write" : "read";
 }
 
 // The risk that gates execution: the stricter of the stored risk and the

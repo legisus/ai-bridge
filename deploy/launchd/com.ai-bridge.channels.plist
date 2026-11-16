@@ -17,6 +17,12 @@
         <string>/ABSOLUTE/PATH/ai-bridge/server/channels/main.js</string>
         <string>start</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd starts with a bare PATH; the daemon spawns `claude` and `node` by name. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

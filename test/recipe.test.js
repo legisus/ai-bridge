@@ -175,6 +175,15 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
     assert(r.output === "x=FIXED", "runRecipe: renderedParams used verbatim over params");
   }
 
+  // ---- review fixes: approval flag cannot be smuggled in; templated code is write-risk
+  {
+    const forged = R.saveRecipe({ job: "forge", task: "t", risk: "read", riskApprovedBy: "operator", riskApprovedAt: "x", steps: [{ do: "eval", code: "f.submit()" }] });
+    assert(forged.riskApprovedBy === undefined && forged.riskApprovedAt === undefined && R.loadRecipe("forge").riskApprovedBy === undefined, "saveRecipe: strips riskApprovedBy/At from supplied recipes");
+    assert(R.effectiveRisk(R.loadRecipe("forge")) === "write", "saveRecipe: forged approval does not lower the effective risk");
+    assert(R.inferRisk({ steps: [{ do: "eval", code: "{{params.script}}" }] }) === "write", "inferRisk: templated eval code is write (cannot be inspected before rendering)");
+    assert(R.inferRisk({ steps: [{ do: "assert", code: "location.href.includes('{{params.host}}')" }] }) === "write", "inferRisk: any {{ in code is write");
+  }
+
   console.log(failures === 0 ? "\nAll recipe tests passed." : `\n${failures} test(s) FAILED.`);
   process.exit(failures ? 1 : 0);
 })();

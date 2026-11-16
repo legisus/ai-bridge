@@ -102,19 +102,32 @@ class Manager {
 
   // Items left running or awaiting approval by a previous daemon are never replayed.
   async recover() {
-    for (const item of this.state.uncertain()) {
+    for (const item of this.state.queue().filter((q) => q.status !== "queued")) {
       const adapter = this.adapterFor(item.channel);
-      this.journalDeclined(item, "daemon restarted while the task was running or awaiting approval; not replayed");
-      if (adapter) await this.send(adapter, item.chatId, `restarted; "${item.task}" was not replayed, send it again if still wanted`);
+      if (item.status === "done") {
+        // The run finished; delivery was interrupted. Its verdict is in the journal.
+        if (adapter) await this.send(adapter, item.chatId, `restarted; the result of "${item.task}" was lost before delivery (not delivered); see /journal`);
+      } else {
+        this.journalDeclined(item, "daemon restarted while the task was running or awaiting approval; not replayed");
+        if (adapter) await this.send(adapter, item.chatId, `restarted; "${item.task}" was not replayed, send it again if still wanted`);
+      }
       this.state.remove((q) => q.runId === item.runId);
-      this.log(`recovery: run ${item.runId} declined (was ${item.status})`);
+      this.log(`recovery: run ${item.runId} dropped (was ${item.status})`);
     }
   }
 
-  journalDeclined(item, feedback) {
+  journalDeclined(item, feedback) { this.journalRun(item, "declined", feedback); }
+
+  hasJournal(runId) {
+    try { return this.journal.readJournal({ days: 3650 }).some((r) => r.runId === runId); } catch { return false; }
+  }
+
+  // One journal record per run: skipped when runAgent (or a previous daemon) already wrote one.
+  journalRun(item, verdict, feedback) {
+    if (this.hasJournal(item.runId)) return;
     try {
       const rec = agent.journalRecord({ runId: item.runId, task: item.task, startedAt: item.acceptedAt || new Date().toISOString(), stages: [],
-        verdict: { verdict: "declined", feedback }, mode: "regular", evidence: "" });
+        verdict: { verdict, feedback }, mode: "regular", evidence: "" });
       rec.source = `channel:${item.channel}`;
       rec.feedback = feedback;
       this.journal.appendJournal(rec);
@@ -240,8 +253,8 @@ class Manager {
   // ---- approvals -----------------------------------------------------------------
 
   // Send an approval prompt bound to a run and wait for the decision.
-  async ask(adapter, item, { kind, text, signal }) {
-    const { id, promise } = this.approvals.create({ runId: item.runId, kind, digest: digestOf(text), channel: item.channel,
+  async ask(adapter, item, { kind, text, signal, digest }) {
+    const { id, promise } = this.approvals.create({ runId: item.runId, kind, digest: digest || digestOf(text), channel: item.channel,
       accountId: item.accountId, chatId: item.chatId, senderId: item.senderId, signal });
     const limit = adapter.capabilities.textLimit || 4000;
     let messageId = null;
@@ -255,7 +268,8 @@ class Manager {
       const body = (text.length + tail.length > limit ? text.slice(0, limit - tail.length - 1) + "…" : text) + tail;
       await adapter.sendText(item.chatId, body);
     }
-    const decision = await promise;
+    let decision = await promise;
+    if (signal && signal.aborted) decision = "cancelled";   // /cancel while waiting is a cancel, not a decline
     this.log(`approval ${id} (${kind}) for run ${item.runId}: ${decision}`);
     return decision;
   }
@@ -266,6 +280,7 @@ class Manager {
     if (!parsed) { await ack(); return; }                 // not ours
     if (parsed.invalid) { await ack(); return; }          // ours, malformed: claimed and ignored
     const prompt = this.prompts.get(parsed.id);
+    if (!this.authorized(adapter, { accountId: adapter.accountId, senderId: action.actorId })) { await ack("not paired"); return; }
     const result = this.approvals.resolve({ id: parsed.id, actorId: action.actorId, channel: adapter.id, accountId: adapter.accountId || "default",
       chatId: action.chatId, kind: parsed.kind, decision: parsed.decision });
     await ack(result === "forbidden" ? "not yours" : undefined);
@@ -279,7 +294,14 @@ class Manager {
 
   // ---- queue worker --------------------------------------------------------------
 
-  kick() { if (!this.draining && !this.stopped) setImmediate(() => this.drain()); }
+  kick() { if (!this.draining && !this.stopped) setImmediate(() => this.drain().catch((e) => this.log(`drain failed: ${e.message}`))); }
+
+  // Is this sender still allowed to act (policy + pairing, re-read now)?
+  authorized(adapter, { accountId, senderId }) {
+    const cfg = this.cfgFor(adapter);
+    const who = { channel: adapter.id, accountId: accountId || adapter.accountId || "default", senderId: String(senderId) };
+    return decide({ policy: cfg.dmPolicy, allowFrom: cfg.allowFrom, senderId: who.senderId, paired: this.pairing.isApproved(who) }) === "run";
+  }
 
   async drain() {
     if (this.draining || this.stopped) return;
@@ -304,16 +326,26 @@ class Manager {
     const setStatus = (s) => { item.status = s; this.state.setStatus(item.runId, s); };
     let dir = null;
     try {
+      if (!this.authorized(adapter, item)) {
+        this.journalDeclined(item, "sender no longer paired when the task came up");
+        await this.send(adapter, item.chatId, `🚫 you are no longer paired; "${this.quote(item.task)}" was dropped`);
+        return;
+      }
       setStatus("running");
       // Gate 1: intent.
       const intent = await classifyIntent(item.task, {
         keywords: cfg.intentKeywords || DEFAULT_KEYWORDS,
-        classify: async (prompt) => String((await this.runModel({ model: agent.MATCH_MODEL, prompt, allowedTools: [], timeoutMs: 60000, baseEnv: cleanEnv() })).result || ""),
+        classify: async (prompt) => String((await this.runModel({ model: agent.MATCH_MODEL, prompt, allowedTools: [], timeoutMs: 60000, baseEnv: cleanEnv(process.env, cfg.envPassthrough) })).result || ""),
       });
       if (intent === "write") {
         setStatus("awaiting-approval");
         const decision = await this.ask(adapter, item, { kind: "intent", signal: controller.signal,
           text: `This task looks like it will send, submit or change something:\n"${this.quote(item.task)}"\nApprove?` });
+        if (decision === "cancelled") {
+          this.journalRun(item, "cancelled", "cancelled while awaiting approval");
+          await this.send(adapter, item.chatId, `⏹ cancelled — "${this.quote(item.task)}" was not run`);
+          return;
+        }
         if (decision !== "approved") {
           this.journalDeclined(item, "task not approved");
           await this.send(adapter, item.chatId, `🚫 declined — "${this.quote(item.task)}" was not run`);
@@ -321,16 +353,22 @@ class Manager {
         }
         setStatus("running");
       }
-      if (controller.signal.aborted) { await this.send(adapter, item.chatId, "⏹ cancelled before it started"); return; }
+      if (controller.signal.aborted) {
+        this.journalRun(item, "cancelled", "cancelled before it started");
+        await this.send(adapter, item.chatId, "⏹ cancelled before it started");
+        return;
+      }
 
       dir = outbox.createOutbox(item.runId);
       const report = await this.runAgent(item.task, {
         runId: item.runId, restricted: true, codex: cfg.codex === true, cwd: dir, signal: controller.signal, source: `channel:${item.channel}`,
+        baseEnv: cleanEnv(process.env, cfg.envPassthrough),
         approve: async (req) => {
           setStatus("awaiting-approval");
-          const d = await this.ask(adapter, item, { kind: req.kind || "step", signal: controller.signal, text: `Approval needed: ${req.title}${req.detail ? "\n" + req.detail : ""}` });
+          const d = await this.ask(adapter, item, { kind: req.kind || "step", signal: controller.signal, digest: req.digest,
+            text: `Approval needed: ${req.title}${req.detail ? "\n" + req.detail : ""}` });
           setStatus("running");
-          return d;
+          return d;   // "approved" | "denied" | "cancelled"
         },
         onProgress: (st) => {
           const t = this.now();
@@ -341,9 +379,10 @@ class Manager {
       await this.deliver(adapter, item, report, dir);
     } catch (e) {
       this.log(`run ${item.runId} error: ${e.message}`);
-      await this.send(adapter, item.chatId, `❌ error — ${e.message}`);
+      try { await this.send(adapter, item.chatId, `❌ error — ${e.message}`); } catch {}
     } finally {
-      this.state.remove((q) => q.runId === item.runId);
+      try { this.state.remove((q) => q.runId === item.runId); }
+      catch (e) { this.log(`run ${item.runId}: could not remove from the queue: ${e.message}`); }
       this.current = null;
     }
   }

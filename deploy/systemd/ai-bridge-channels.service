@@ -9,6 +9,9 @@ After=ai-bridge.service
 After=network.target
 
 [Service]
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Claude Code on a server usually authenticates through the environment:
+# Environment=CLAUDE_CODE_OAUTH_TOKEN=…   (or run `claude login` as this user)
 ExecStart=/usr/bin/node /ABSOLUTE/PATH/ai-bridge/server/channels/main.js start
 Restart=always
 RestartSec=2

@@ -9,7 +9,7 @@ const { DIR } = require("../token");
 const { POLICIES } = require("./policy");
 
 const CONFIG_FILE = path.join(DIR, "channels.json");
-const DEFAULTS = { accountId: "default", dmPolicy: "pairing", allowFrom: [], codex: false };
+const DEFAULTS = { accountId: "default", dmPolicy: "pairing", allowFrom: [], codex: false, envPassthrough: [] };
 
 function loadConfig({ env = process.env, file = CONFIG_FILE } = {}) {
   let raw;
@@ -33,6 +33,7 @@ function loadConfig({ env = process.env, file = CONFIG_FILE } = {}) {
     if (!POLICIES.includes(c.dmPolicy)) throw new Error(`channel ${channel}: dmPolicy must be one of ${POLICIES.join(", ")} (got "${c.dmPolicy}")`);
     c.allowFrom = Array.isArray(c.allowFrom) ? c.allowFrom.map(String) : [];
     c.codex = c.codex === true;
+    c.envPassthrough = Array.isArray(c.envPassthrough) ? c.envPassthrough.map(String) : [];
     out[channel] = c;
   }
   return out;

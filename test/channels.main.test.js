@@ -48,6 +48,22 @@ const run = (args) => new Promise((resolve) => execFile(process.execPath, [cli, 
   await new Promise((res) => child.on("close", res));
   assert(!fs.existsSync(path.join(home, "channels.lock")), "channels start: lock removed on SIGTERM");
 
+  // acquireLock in-process: exclusive create, own pid tolerated, dead pid reclaimed
+  {
+    process.env.AI_BRIDGE_HOME = home;
+    const { acquireLock, LOCK_FILE } = require("../server/channels/main.js");
+    const rel = acquireLock();
+    assert(fs.readFileSync(LOCK_FILE, "utf8") === String(process.pid), "acquireLock: writes our pid");
+    const rel2 = acquireLock();
+    assert(fs.readFileSync(LOCK_FILE, "utf8") === String(process.pid), "acquireLock: re-acquire by the same pid is a no-op");
+    rel2(); rel();
+    assert(!fs.existsSync(LOCK_FILE), "acquireLock: release removes the lock");
+    fs.writeFileSync(LOCK_FILE, "999999");
+    const rel3 = acquireLock();
+    assert(fs.readFileSync(LOCK_FILE, "utf8") === String(process.pid), "acquireLock: dead pid reclaimed");
+    rel3();
+  }
+
   // pairing CLI through the dispatcher
   r = await run(["pairing", "list"]);
   assert(r.code === 0 && /no pending/.test(r.stdout), "pairing list: empty store prints 'no pending'");
