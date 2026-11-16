@@ -13,6 +13,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const { DIR } = require("./token");
+const { atomicWrite } = require("./atomic");
 const { selfArgs } = require("./runtime");
 
 const RECIPES_DIR = path.join(DIR, "recipes");
@@ -48,8 +49,8 @@ function saveRecipe(recipe) {
   const version = prev ? (Number(prev.version) || 0) + 1 : 1;
   const out = { ...recipe, job: j, version, savedAt: new Date().toISOString() };
   const text = JSON.stringify(out, null, 2) + "\n";
-  fs.writeFileSync(recipeFile(j, version), text);
-  fs.writeFileSync(recipeFile(j), text);
+  atomicWrite(recipeFile(j, version), text, { mode: 0o644 });
+  atomicWrite(recipeFile(j), text, { mode: 0o644 });
   return out;
 }
 

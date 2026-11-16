@@ -12,6 +12,7 @@ const fs = require("fs");
 const path = require("path");
 const { DIR } = require("./token");
 const { safeJob } = require("./recipe");
+const { atomicWrite } = require("./atomic");
 
 const JOBS_FILE = path.join(DIR, "jobs.json");
 const MODES = ["regular", "audit", "economy"];
@@ -29,8 +30,7 @@ function loadJobs() {
   try { return JSON.parse(fs.readFileSync(JOBS_FILE, "utf8")); } catch { return {}; }
 }
 function saveJobs(jobs) {
-  if (!fs.existsSync(DIR)) fs.mkdirSync(DIR, { mode: 0o700, recursive: true });
-  fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2) + "\n");
+  atomicWrite(JOBS_FILE, JSON.stringify(jobs, null, 2) + "\n");
 }
 function getJob(job) {
   const j = safeJob(job);
