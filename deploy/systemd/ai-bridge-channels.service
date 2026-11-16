@@ -1,0 +1,20 @@
+# Linux systemd user unit for the AI Browser Bridge messenger daemon (bridge channels start).
+# 1. Replace /ABSOLUTE/PATH/ai-bridge with your clone path and /usr/bin/node with `which node`.
+# 2. mkdir -p ~/.config/systemd/user && cp deploy/systemd/ai-bridge-channels.service ~/.config/systemd/user/
+# 3. systemctl --user daemon-reload && systemctl --user enable --now ai-bridge-channels
+[Unit]
+Description=AI Browser Bridge messenger daemon (Telegram → restricted browser agent)
+Requires=ai-bridge.service
+After=ai-bridge.service
+After=network.target
+
+[Service]
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Claude Code on a server usually authenticates through the environment:
+# Environment=CLAUDE_CODE_OAUTH_TOKEN=…   (or run `claude login` as this user)
+ExecStart=/usr/bin/node /ABSOLUTE/PATH/ai-bridge/server/channels/main.js start
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

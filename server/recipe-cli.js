@@ -15,6 +15,7 @@ function usage() {
   console.error('usage: bridge recipe propose <job> [--runs 3] [--model m] [--task "…"]');
   console.error("       bridge recipe run <job> [--params json] [--json] [--keep-open] [--verbose]");
   console.error("       bridge recipe show <job> | validate <file> | import <file>");
+  console.error("       bridge recipe approve <job>      # operator vouches for a recipe stored as risk=read whose code looks like a write");
   process.exit(2);
 }
 
@@ -33,6 +34,11 @@ async function main(argv) {
   }
   if (!sub || !arg) usage();
 
+  if (sub === "approve") {
+    const r = recipes.approveRisk(arg);
+    console.log(`approved risk for ${r.job} v${r.version}: effective risk is now ${recipes.effectiveRisk(r)}`);
+    return;
+  }
   if (sub === "show") {
     const r = recipes.loadRecipe(arg);
     if (!r) { console.error(`no recipe for job ${arg} (${recipes.recipeFile(arg)})`); process.exit(1); }
@@ -66,7 +72,7 @@ async function main(argv) {
     const job = recipes.safeJob(arg);
     if (!job) usage();
     const runs = opts.runs || 3;
-    const recs = journal.readJournal({}).filter((x) => x.job === job && x.verdict === "pass" && (x.mode || "regular") === "regular")
+    const recs = journal.readJournal({}).filter((x) => x.job === job && x.verdict === "pass" && (x.mode || "regular") === "regular" && !(x.source && String(x.source).startsWith("channel:")))
       .sort((a, b) => Date.parse(b.endedAt) - Date.parse(a.endedAt)).slice(0, runs);
     if (!recs.length) { console.error(`no passing regular runs for job ${job} in the journal; run it with: bridge agent "…" --job ${job}`); process.exit(1); }
     const traces = recs.map((x) => journal.readTrace(x.runId)).filter((t) => t.length);

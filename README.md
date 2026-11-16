@@ -224,6 +224,33 @@ Jobs whose recipes write to the outside world (`risk: write`) stay in audit —
 recipe plus judge every time — unless you allow economy with
 `bridge jobs set <job> --risk read`. Details: [docs/ECONOMY-MODE.md](docs/ECONOMY-MODE.md).
 
+## Messenger channels — text it a task
+
+`bridge channels start` connects your messengers to the bridge (Telegram
+first; Slack, Discord, Mattermost, Matrix, WhatsApp, iMessage, Teams, Google
+Chat and Signal follow). You text a task from your phone; it runs through
+`bridge agent` in your own logged-in Chrome on your own machine, and the
+verdict, evidence and any files come back in the chat.
+
+```bash
+echo '{ "telegram": { "token": "123456789:AA…" } }' > ~/.ai-browser-bridge/channels.json
+chmod 600 ~/.ai-browser-bridge/channels.json
+bridge channels start
+# message your bot → it replies with a pairing code → approve it from the terminal:
+bridge pairing approve telegram X7K2PQ
+```
+
+What makes this different from a cloud "personal agent": nobody holds a copy
+of your passwords, the agent acts in the browser you are already signed into,
+and risky steps ask for a tap **before** they happen — a task that looks like
+it will send, pay, book or delete is quoted back for approval, write-risk
+recipes ask every time, and the agent stops with `NEEDS APPROVAL` before any
+irreversible action it was not told to take. Messenger-originated runs are
+**restricted**: browser commands only, no admin subcommands, no Codex rung, a
+scrubbed child environment, no recipe learning. Unknown senders get a pairing
+code and nothing else. Details, the two-machine (server + laptop) recipe, and
+troubleshooting: **[docs/CHANNELS.md](docs/CHANNELS.md)**.
+
 ## Concurrency
 
 The server is a many-CLI → single-extension relay. Any number of CLI clients can
@@ -293,14 +320,16 @@ npm test    # spins up the server, a simulated extension, and the real CLI; asse
 ```
 extension/    Manifest V3 extension (service worker + options page)
 server/       relay server (server.js), CLI client (cli.js), token-saver agent (agent.js),
+              channels/ = messenger daemon (main.js), manager, policy, pairing, approvals,
+              state, outbox, restricted-run helpers, intent gate, telegram adapter,
               run journal + command traces (journal.js), DOM digest (snapshot.js),
               recipes + runner (recipe.js, recipe-cli.js), per-job economy state (jobs.js),
               native messaging host (native-host.js) + its registrar (register-native-host.js),
               main.js = dispatcher for the single-executable build
 scripts/      build-sea.js — Node SEA build of the `ai-bridge` binary (npm run build:sea)
 macos/        menu-bar app (Swift/AppKit) + build-app.sh → .app and .dmg (npm run build:mac)
-deploy/       launchd / systemd templates to run the server as a background service
-docs/         INSTALL.md (first-time setup) and CLAUDE-CODE.md (Claude Code integration)
+deploy/       launchd / systemd templates for the relay server and the channels daemon
+docs/         INSTALL.md (first-time setup), CLAUDE-CODE.md (Claude Code integration), CHANNELS.md (messengers)
 test/         protocol round-trip, agent ladder, native-host and binary tests
 ```
 

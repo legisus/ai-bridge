@@ -21,8 +21,9 @@ const assert = (cond, name) => {
 function mockRun(judgeVerdicts) {
   const calls = [];
   let judgeIdx = 0;
-  const run = async ({ engine, model, effort, prompt, env }) => {
-    calls.push({ engine, model, effort, prompt, env });
+  const run = async (opts) => {
+    const { model, prompt } = opts;
+    calls.push({ ...opts });
     if (model === JUDGE_MODEL && prompt.includes("strict verifier")) {
       const v = judgeVerdicts[judgeIdx++];
       return { result: v, usage: { input_tokens: 100, output_tokens: 20 }, total_cost_usd: 0.01 };
@@ -328,6 +329,258 @@ function mockRun(judgeVerdicts) {
     });
     assert(res.code === 2, "recursion guard: exits 2 under AI_BRIDGE_AGENT=1");
     assert(res.stderr.includes("recursive"), "recursion guard: explains the refusal");
+  }
+
+  // 12) cancellation: spawnTracked kills the process group; runAgent reports "cancelled" without touching job state
+  {
+    const { spawnTracked } = require("../server/agent.js");
+    const jobs = require("../server/jobs.js");
+    const ctl = new AbortController();
+    const script = `const {spawn}=require("child_process");const c=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});console.log(JSON.stringify({parent:process.pid,child:c.pid}));setInterval(()=>{},1000);`;
+    const child = spawnTracked(process.execPath, ["-e", script], { signal: ctl.signal, stdio: ["ignore", "pipe", "ignore"] });
+    const pids = await new Promise((resolve) => { let out = ""; child.stdout.on("data", (d) => { out += d; if (out.includes("}")) resolve(JSON.parse(out)); }); });
+    ctl.abort();
+    await new Promise((r) => setTimeout(r, 500));
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+    assert(!alive(pids.parent) && !alive(pids.child), "spawnTracked: abort kills parent and grandchild");
+
+    // ladder path: the model runner rejects with AbortError once the signal is aborted
+    const ctl2 = new AbortController();
+    const run = async (opts) => {
+      if (opts.signal && opts.signal.aborted) throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+      ctl2.abort();
+      return { result: "EVIDENCE REPORT\nTask: t\nFinal state: partial\nScreenshots: none\nBlockers: none", usage: {} };
+    };
+    jobs.putJob({ job: "canc", mode: "audit", risk: "read", auditPasses: 1, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, repairNeeded: true, history: [] });
+    let r = await runAgent("cancel me", { job: "canc", runId: "canc0000001", signal: ctl2.signal }, run, { loadRecipe: () => null });
+    assert(r.verdict.verdict === "cancelled" && /not undone/.test(r.verdict.feedback), "cancel: ladder abort → verdict cancelled");
+    assert(r.record.verdict === "cancelled" && journal.readJournal({}).some((x) => x.runId === "canc0000001" && x.verdict === "cancelled"), "cancel: journaled as cancelled");
+    let st = jobs.getJob("canc");
+    assert(st.mode === "audit" && st.auditPasses === 1 && st.repairNeeded === true && st.history.length === 0, "cancel: job state untouched");
+
+    // recipe path: runner reports kind "cancelled"
+    const ctl3 = new AbortController();
+    jobs.putJob({ job: "canc2", mode: "audit", risk: "read", auditPasses: 2, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, history: [] });
+    r = await runAgent("pull", { job: "canc2", runId: "canc0000002", signal: ctl3.signal }, mockRun([]).run, {
+      loadRecipe: () => ({ job: "canc2", version: 1, risk: "read", task: "pull", steps: [{ do: "newTab", url: "u" }] }),
+      runRecipe: async (rec, o) => { ctl3.abort(); return { ok: false, evidence: "aborted", steps: [], failure: { step: 0, do: "newTab", error: "cancelled", kind: "cancelled" } }; },
+    });
+    assert(r.verdict.verdict === "cancelled", "cancel: recipe abort → verdict cancelled");
+    st = jobs.getJob("canc2");
+    assert(st.mode === "audit" && st.auditPasses === 2 && !st.repairNeeded && st.history.length === 0, "cancel: recipe abort leaves job state untouched (no recipe-fail)");
+  }
+
+  // 13) approval gates: write-risk recipe asks first; NEEDS APPROVAL pauses the ladder
+  {
+    const jobs = require("../server/jobs.js");
+    const writeRecipe = { job: "wr", version: 2, risk: "write", task: "send it", steps: [{ do: "newTab", url: "u" }, { do: "click", selector: "#send" }] };
+    const seed = () => jobs.putJob({ job: "wr", mode: "audit", risk: "write", auditPasses: 1, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 2, history: [] });
+    let recipeRuns = 0;
+    const deps = { loadRecipe: () => writeRecipe, runRecipe: async () => { recipeRuns++; return { ok: true, evidence: "EVIDENCE REPORT\nFinal state: sent", steps: [] }; } };
+
+    // denied → declined, recipe never ran, job untouched, no model calls
+    seed();
+    let asked = [];
+    let m = mockRun([]);
+    let r = await runAgent("send it", { job: "wr", runId: "appr0000001", approve: async (req) => { asked.push(req); return "denied"; } }, m.run, deps);
+    assert(r.verdict.verdict === "declined" && recipeRuns === 0 && m.calls.length === 0, "recipe gate: denied → declined, nothing ran");
+    assert(asked.length === 1 && asked[0].kind === "recipe" && asked[0].title === "wr" && /^[0-9a-f]{64}$/.test(asked[0].digest), "recipe gate: approve called with kind recipe and a digest");
+    let st = jobs.getJob("wr");
+    assert(st.auditPasses === 1 && st.history.length === 0 && st.mode === "audit", "recipe gate: job state untouched on decline");
+    assert(journal.readJournal({}).some((x) => x.runId === "appr0000001" && x.verdict === "declined"), "recipe gate: journaled as declined");
+
+    // approved → recipe ran, then judged as usual
+    seed();
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("send it", { job: "wr", runId: "appr0000002", approve: async () => "approved" }, m.run, deps);
+    assert(r.verdict.verdict === "pass" && recipeRuns === 1, "recipe gate: approved → recipe ran");
+
+    // digest changes with params; same params → same digest
+    seed();
+    const d1 = []; await runAgent("send it", { job: "wr", runId: "appr0000003", params: { a: 1 }, approve: async (q) => { d1.push(q.digest); return "denied"; } }, mockRun([]).run, deps);
+    seed();
+    const d2 = []; await runAgent("send it", { job: "wr", runId: "appr0000004", params: { a: 2 }, approve: async (q) => { d2.push(q.digest); return "denied"; } }, mockRun([]).run, deps);
+    assert(d1[0] !== d2[0], "recipe gate: digest binds the rendered params");
+
+    // no approve hook → unchanged behaviour (recipe runs)
+    seed(); recipeRuns = 0;
+    r = await runAgent("send it", { job: "wr", runId: "appr0000005" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(recipeRuns === 1 && r.verdict.verdict === "pass", "recipe gate: without approve hook the recipe runs as before");
+
+    // ladder: NEEDS APPROVAL pauses; approved → same rung rerun with feedback; denied → declined
+    const needs = "did stuff\nEVIDENCE REPORT\nTask: t\nActions: 1. opened\nFinal state: compose open\nScreenshots: none\nBlockers: none\nNEEDS APPROVAL: click Send on the draft to Bob";
+    const scripted = (replies, judge) => {
+      const calls = []; let i = 0, j = 0;
+      const run = async (o) => {
+        calls.push(o);
+        if (o.model === JUDGE_MODEL && o.prompt.includes("strict verifier")) return { result: judge[j++], usage: {} };
+        return { result: replies[i++], usage: {} };
+      };
+      return { run, calls };
+    };
+    let s1 = scripted([needs, "EVIDENCE REPORT\nTask: t\nFinal state: sent\nScreenshots: none\nBlockers: none"], ['{"verdict":"pass","feedback":"ok"}']);
+    asked = [];
+    r = await runAgent("email Bob the draft", { runId: "appr0000006", approve: async (q) => { asked.push(q); return "approved"; } }, s1.run, {});
+    const ops = s1.calls.filter((c) => !c.prompt.includes("strict verifier"));
+    assert(asked.length === 1 && asked[0].kind === "step" && asked[0].title === "click Send on the draft to Bob", "step gate: approve called with the NEEDS APPROVAL line");
+    assert(ops.length === 2 && ops[0].model === ops[1].model && ops[1].prompt.includes("approved: click Send on the draft to Bob; proceed"), "step gate: same rung rerun with the approval in the prompt");
+    assert(r.verdict.verdict === "pass" && r.stages.some((x) => x.stage === "ops:opus-5.5(approved)"), "step gate: rerun stage labelled (approved), then judged");
+
+    let s2 = scripted([needs], []);
+    r = await runAgent("email Bob the draft", { runId: "appr0000007", approve: async () => "denied" }, s2.run, {});
+    assert(r.verdict.verdict === "declined" && s2.calls.length === 1, "step gate: denied → declined after one ops call, no judge");
+
+    // without approve hook the NEEDS APPROVAL evidence just goes to the judge
+    let s3 = scripted([needs], ['{"verdict":"fail","feedback":"not sent"}', '{"verdict":"fail","feedback":"x"}', '{"verdict":"fail","feedback":"y"}']);
+    r = await runAgent("email Bob the draft", { runId: "appr0000008", only: true }, s3.run, {});
+    assert(r.verdict.verdict === "fail" && s3.calls.length === 2, "step gate: no hook → evidence judged as before");
+  }
+
+  // 14) restricted runs: browser-only tools, no codex, clean env, cwd, progress, no learning, source
+  {
+    const { allowedTools, cleanEnv } = require("../server/channels/restricted.js");
+    const { SELF_CMD } = require("../server/runtime.js");
+    const os = require("os");
+    process.env.AI_BRIDGE_TELEGRAM_TOKEN = "supersecret";
+    const cwd = fs.mkdtempSync(require("path").join(os.tmpdir(), "ai-bridge-cwd-"));
+
+    // three failing judges → only two ops rungs (no codex)
+    let m = mockRun(['{"verdict":"fail","feedback":"a"}', '{"verdict":"fail","feedback":"b"}', '{"verdict":"fail","feedback":"c"}']);
+    const progress = [];
+    let r = await runAgent("read the title", { runId: "restr000001", restricted: true, cwd, source: "channel:telegram", onProgress: (p) => progress.push(p.stage) }, m.run, {});
+    const ops = m.calls.filter((c) => !c.prompt.includes("strict verifier"));
+    assert(ops.length === 2 && ops.every((c) => c.engine !== "codex"), "restricted: codex rung skipped");
+    assert(JSON.stringify(ops[0].allowedTools) === JSON.stringify(allowedTools(SELF_CMD)), "restricted: allowedTools is the browser-only list");
+    assert(!ops[0].allowedTools.some((t) => /agent|jobs|recipe/.test(t)), "restricted: no admin subcommand pattern");
+    assert(ops[0].baseEnv && !("AI_BRIDGE_TELEGRAM_TOKEN" in ops[0].baseEnv) && ops[0].baseEnv.PATH === process.env.PATH, "restricted: baseEnv is scrubbed (no token, PATH kept)");
+    assert(ops[0].cwd === cwd && ops[0].env.AI_BRIDGE_OUTBOX === cwd, "restricted: cwd and AI_BRIDGE_OUTBOX point at the outbox");
+    assert(ops[0].prompt.includes("NEEDS APPROVAL") && ops[0].prompt.includes("Do not use download"), "restricted: playbook addendum included");
+    assert(progress[0] === "ops:opus-5.5" && progress[1] === "judge:fable-5.1", "restricted: onProgress reports stages in order");
+    assert(r.record.source === "channel:telegram", "restricted: source recorded on the journal record");
+
+    // codex opt-in
+    m = mockRun(['{"verdict":"fail","feedback":"a"}', '{"verdict":"fail","feedback":"b"}', '{"verdict":"fail","feedback":"c"}']);
+    await runAgent("read the title", { runId: "restr000002", restricted: true, codex: true, cwd }, m.run, {});
+    assert(m.calls.filter((c) => c.engine === "codex").length === 1, "restricted: codex: true re-enables the last rung");
+
+    // unrestricted baseline still uses the blanket pattern and process.env
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    await runAgent("read the title", { runId: "restr000003" }, m.run, {});
+    assert(m.calls[0].allowedTools[0] === `Bash(${SELF_CMD}:*)` && m.calls[0].baseEnv === undefined, "unrestricted: blanket tool pattern, inherited env");
+
+    // recipe + login hook receive the scrubbed env
+    const jobs = require("../server/jobs.js");
+    jobs.putJob({ job: "rst", mode: "audit", risk: "read", auditPasses: 0, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, loginCmd: "true", history: [] });
+    const seen = {};
+    let first = true;
+    const deps = {
+      loadRecipe: () => ({ job: "rst", version: 1, risk: "read", task: "t", steps: [{ do: "newTab", url: "u" }] }),
+      runRecipe: async (rec, o) => { seen.recipe = o.baseEnv; if (first) { first = false; return { ok: false, evidence: "", steps: [], failure: { step: 0, do: "assert", error: "LOGIN REQUIRED", kind: "auth" } }; } return { ok: true, evidence: "EVIDENCE REPORT\nFinal state: ok", steps: [] }; },
+      runLogin: async (cmd, o) => { seen.login = o.baseEnv; return { ok: true }; },
+    };
+    await runAgent("t", { job: "rst", runId: "restr000004", restricted: true, cwd }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(seen.recipe && !("AI_BRIDGE_TELEGRAM_TOKEN" in seen.recipe) && seen.login && !("AI_BRIDGE_TELEGRAM_TOKEN" in seen.login), "restricted: recipe runner and login hook get the scrubbed env");
+
+    // learning: seeded history makes an unrestricted run propose; the same restricted run does not
+    const task = "Fetch the KBB value page for 9GYW724 and report the number";
+    const seedTrace = (id) => journal.appendTrace(id, { cmd: "newTab", params: { url: "https://www.kbb.com/x" }, ok: true });
+    const sig = journal.signatureOf({ task, domains: ["kbb.com"] });
+    for (const id of ["learn000001", "learn000002"]) {
+      seedTrace(id);
+      journal.appendJournal({ runId: id, task, signature: sig, verdict: "pass", mode: "regular", startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), domains: ["kbb.com"], stages: [], costUsd: 0 });
+    }
+    let proposed = 0;
+    const learnDeps = { propose: async ({ job, task: t }) => { proposed++; return { job, task: t, version: 1, risk: "read", steps: [{ do: "newTab", url: "u" }], _usage: { input: 1, output: 1 } }; } };
+    seedTrace("learn000003");
+    await runAgent(task, { runId: "learn000003" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, learnDeps);
+    assert(proposed === 1, "learning: unrestricted third pass proposes a recipe");
+    seedTrace("learn000004");
+    r = await runAgent(task, { runId: "learn000004", restricted: true, cwd, job: "none" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, learnDeps);
+    seedTrace("learn000005");
+    r = await runAgent(task, { runId: "learn000005", restricted: true, cwd }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, learnDeps);
+    assert(proposed === 1 && !r.learned, "learning: restricted runs never propose or repair");
+    delete process.env.AI_BRIDGE_TELEGRAM_TOKEN;
+  }
+
+  // 15) real child processes: a fake `claude` on PATH
+  {
+    const { spawnTracked, runModel } = require("../server/agent.js");
+    const { execFileSync } = require("child_process");
+    const os = require("os");
+    const path = require("path");
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-fakebin-"));
+    fs.copyFileSync(path.join(__dirname, "fixtures", "fake-claude.js"), path.join(bin, "claude"));
+    fs.chmodSync(path.join(bin, "claude"), 0o755);
+    const PATH = `${bin}:${process.env.PATH}`;
+    const logFile = path.join(bin, "argv.log");
+    const pidsFile = path.join(bin, "pids.json");
+    const base = (extra = {}) => ({ PATH, HOME: process.env.HOME, FAKE_CLAUDE_LOG: logFile, ...extra });
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+
+    // restricted run: all non-Bash tools disallowed, AI_BRIDGE_RESTRICTED set for children
+    fs.writeFileSync(logFile, "");
+    let res = await runModel({ model: "m", prompt: "p", allowedTools: ["Bash(x eval:*)"], timeoutMs: 10000, restricted: true, baseEnv: base({ FAKE_CLAUDE_MODE: "ok" }), env: { AI_BRIDGE_RESTRICTED: "1" } });
+    let argv = JSON.parse(fs.readFileSync(logFile, "utf8").trim().split("\n").pop());
+    const dis = argv[argv.indexOf("--disallowedTools") + 1] || "";
+    assert(res.result.startsWith("EVIDENCE") && ["Edit", "Write", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "NotebookEdit"].every((t) => dis.split(",").includes(t)), "fake claude: restricted run disallows every non-Bash built-in tool");
+    assert(argv.includes("--allowedTools") && argv[argv.indexOf("--allowedTools") + 1] === "Bash(x eval:*)", "fake claude: allowedTools forwarded");
+
+    // judge/classifier (no tools): also no Read/Glob/Agent
+    fs.writeFileSync(logFile, "");
+    await runModel({ model: "m", prompt: "p", allowedTools: [], timeoutMs: 10000, baseEnv: base({ FAKE_CLAUDE_MODE: "ok" }) });
+    argv = JSON.parse(fs.readFileSync(logFile, "utf8").trim());
+    const dis2 = (argv[argv.indexOf("--disallowedTools") + 1] || "").split(",");
+    assert(["Bash", "Read", "Glob", "Grep", "Agent", "WebFetch"].every((t) => dis2.includes(t)), "fake claude: tool-less call disallows Bash and the read tools");
+
+    // abort mid-rung → AbortError → runAgent reports cancelled and journals it
+    const ctl = new AbortController();
+    const p = runAgent("hang task", { runId: "realcancel01", baseEnv: base({ FAKE_CLAUDE_MODE: "hang", FAKE_CLAUDE_PIDS: pidsFile }), signal: ctl.signal });
+    await new Promise((r) => setTimeout(r, 700));
+    const pids = JSON.parse(fs.readFileSync(pidsFile, "utf8"));
+    ctl.abort();
+    const r = await p;
+    await new Promise((r2) => setTimeout(r2, 300));
+    assert(r.verdict.verdict === "cancelled", "fake claude: abort → verdict cancelled (not error)");
+    assert(journal.readJournal({}).some((x) => x.runId === "realcancel01" && x.verdict === "cancelled"), "fake claude: cancelled run journaled");
+    assert(!alive(pids.parent) && !alive(pids.child), "fake claude: abort killed claude and its grandchild");
+
+    // timeout kills the whole group too
+    fs.unlinkSync(pidsFile);
+    let timedOut = null;
+    try { await runModel({ model: "m", prompt: "p", allowedTools: [], timeoutMs: 600, baseEnv: base({ FAKE_CLAUDE_MODE: "hang", FAKE_CLAUDE_PIDS: pidsFile }) }); } catch (e) { timedOut = e; }
+    await new Promise((r2) => setTimeout(r2, 300));
+    const pids2 = JSON.parse(fs.readFileSync(pidsFile, "utf8"));
+    assert(timedOut && /timed out/.test(timedOut.message) && !alive(pids2.parent) && !alive(pids2.child), "fake claude: timeout kills claude and its grandchild");
+
+    // without a signal the child stays in our process group (Ctrl-C still reaches it)
+    const child = spawnTracked(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    const pgid = (pid) => Number(execFileSync("ps", ["-o", "pgid=", "-p", String(pid)]).toString().trim());
+    assert(pgid(child.pid) === pgid(process.pid), "spawnTracked: no signal → same process group as the caller");
+    child.kill("SIGKILL");
+    const child2 = spawnTracked(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore", signal: new AbortController().signal });
+    assert(pgid(child2.pid) !== pgid(process.pid), "spawnTracked: with a signal → own process group");
+    process.kill(-child2.pid, "SIGKILL");
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
+
+  // 16) approval hook may answer "cancelled"; learning ignores channel-originated records
+  {
+    const jobs = require("../server/jobs.js");
+    jobs.putJob({ job: "wrc", mode: "audit", risk: "write", auditPasses: 0, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, history: [] });
+    const deps = { loadRecipe: () => ({ job: "wrc", version: 1, risk: "write", task: "t", steps: [{ do: "click", selector: "#x" }] }), runRecipe: async () => { throw new Error("must not run"); } };
+    let r = await runAgent("t", { job: "wrc", runId: "apprcanc001", approve: async () => "cancelled" }, mockRun([]).run, deps);
+    assert(r.verdict.verdict === "cancelled" && jobs.getJob("wrc").history.length === 0, "approve → cancelled: verdict cancelled, job untouched");
+
+    const task = "Open the dealer page for 9GYW724 and report the price";
+    const sig = journal.signatureOf({ task, domains: ["dealer.com"] });
+    for (const id of ["chl000001", "chl000002"]) {
+      journal.appendTrace(id, { cmd: "newTab", params: { url: "https://dealer.com/x" }, ok: true });
+      journal.appendJournal({ runId: id, task, signature: sig, verdict: "pass", mode: "regular", source: "channel:telegram", startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), domains: ["dealer.com"], stages: [], costUsd: 0 });
+    }
+    journal.appendTrace("chl000003", { cmd: "newTab", params: { url: "https://dealer.com/x" }, ok: true });
+    let proposed = 0;
+    r = await runAgent(task, { runId: "chl000003" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, { propose: async () => { proposed++; return { version: 1, steps: [] }; } });
+    assert(proposed === 0 && !r.learned, "learning: channel-originated passes do not count towards a recipe");
   }
 
   console.log(failures === 0 ? "\nAll agent tests passed." : `\n${failures} test(s) FAILED.`);

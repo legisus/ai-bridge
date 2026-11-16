@@ -13,6 +13,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const { DIR } = require("./token");
+const { atomicWrite } = require("./atomic");
 const { selfArgs } = require("./runtime");
 
 const RECIPES_DIR = path.join(DIR, "recipes");
@@ -21,6 +22,10 @@ const PSEUDO = new Set(["assert", "poll", "sleep"]);
 const AUTH_RE = /login required|log ?in|sign ?in|authenticat|session (has )?expired|logged out|password/i;
 function isAuthFailure(text) { return AUTH_RE.test(String(text || "")); }
 const WRITE_CMDS = new Set(["click", "insertText", "type", "key", "download"]);
+// eval/assert/poll code that mutates the page or talks to the server is a write too.
+const WRITE_CODE_RE = /\.click\(|\.submit\(|fetch\(|XMLHttpRequest|dispatchEvent|\.value\s*=/;
+const { BROWSER_COMMANDS } = require("./channels/restricted");
+const KNOWN_CMDS = new Set([...BROWSER_COMMANDS, "sleep", "assert", "poll", "download"]);
 
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { mode: 0o700, recursive: true }); }
 function safeJob(job) {
@@ -46,10 +51,13 @@ function saveRecipe(recipe) {
   ensureDir(RECIPES_DIR);
   const prev = loadRecipe(j);
   const version = prev ? (Number(prev.version) || 0) + 1 : 1;
-  const out = { ...recipe, job: j, version, savedAt: new Date().toISOString() };
+  // Operator approval is granted per saved version through approveRisk(); a
+  // supplied or model-generated flag is never carried over.
+  const { riskApprovedBy, riskApprovedAt, ...clean } = recipe;
+  const out = { ...clean, job: j, version, savedAt: new Date().toISOString() };
   const text = JSON.stringify(out, null, 2) + "\n";
-  fs.writeFileSync(recipeFile(j, version), text);
-  fs.writeFileSync(recipeFile(j), text);
+  atomicWrite(recipeFile(j, version), text, { mode: 0o644 });
+  atomicWrite(recipeFile(j), text, { mode: 0o644 });
   return out;
 }
 
@@ -62,6 +70,7 @@ function validateRecipe(r) {
   if (!Array.isArray(r.steps) || !r.steps.length) errs.push("steps: must be a non-empty array");
   else r.steps.forEach((s, i) => {
     if (!s || typeof s !== "object" || typeof s.do !== "string") { errs.push(`step ${i}: missing "do"`); return; }
+    if (!KNOWN_CMDS.has(s.do)) { errs.push(`step ${i}: unknown command "${s.do}"`); return; }
     if (s.do === "assert" && typeof s.code !== "string") errs.push(`step ${i}: assert needs "code"`);
     if (s.do === "poll" && typeof s.code !== "string") errs.push(`step ${i}: poll needs "code"`);
     if (s.do === "sleep" && typeof s.ms !== "number") errs.push(`step ${i}: sleep needs "ms"`);
@@ -81,7 +90,30 @@ function validateRecipe(r) {
 // A recipe that clicks/types anywhere is "write" unless it says otherwise;
 // used as the default risk when the proposer does not classify.
 function inferRisk(r) {
-  return (r.steps || []).some((s) => WRITE_CMDS.has(s.do)) ? "write" : "read";
+  // Code with templates cannot be inspected before rendering → treat as write.
+  return (r.steps || []).some((s) => WRITE_CMDS.has(s.do) ||
+    (["eval", "assert", "poll"].includes(s.do) && (WRITE_CODE_RE.test(String(s.code || "")) || String(s.code || "").includes("{{")))) ? "write" : "read";
+}
+
+// The risk that gates execution: the stricter of the stored risk and the
+// inferred one, unless an operator explicitly approved the stored "read".
+function effectiveRisk(r) {
+  if (r.risk === "write") return "write";
+  if (inferRisk(r) === "write" && r.riskApprovedBy !== "operator") return "write";
+  return "read";
+}
+
+// Operator vouches for the current version's risk: rewrite current + versioned
+// files in place (saveRecipe would bump the version, so it is not used here).
+function approveRisk(job) {
+  const j = safeJob(job);
+  const cur = loadRecipe(j);
+  if (!cur) throw new Error(`no recipe for job ${job}`);
+  const out = { ...cur, riskApprovedBy: "operator", riskApprovedAt: new Date().toISOString() };
+  const text = JSON.stringify(out, null, 2) + "\n";
+  atomicWrite(recipeFile(j, out.version), text, { mode: 0o644 });
+  atomicWrite(recipeFile(j), text, { mode: 0o644 });
+  return out;
 }
 
 // ---- templating -------------------------------------------------------------
@@ -126,14 +158,14 @@ function coerce(v) { return typeof v === "string" && /^-?\d+$/.test(v) ? Number(
 // ---- bridge exec -------------------------------------------------------------
 
 // Run one bridge CLI command; resolves {ok, result|error, ms}. Injectable for tests.
-function execBridge(cmd, params, { timeoutMs = 60000, debugger: dbg = false, env = {} } = {}) {
+function execBridge(cmd, params, { timeoutMs = 60000, debugger: dbg = false, env = {}, baseEnv } = {}) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const args = [cmd, JSON.stringify(params || {}), "--timeout", String(timeoutMs)];
     if (dbg) args.push("--debugger");
     const child = spawn(process.execPath, selfArgs(args), {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...env, ...(dbg ? { AI_BRIDGE_DEBUGGER: "1" } : {}) },
+      env: { ...(baseEnv || process.env), ...env, ...(dbg ? { AI_BRIDGE_DEBUGGER: "1" } : {}) },
     });
     let out = "", err = "";
     child.stdout.on("data", (d) => { out += d; });
@@ -154,10 +186,17 @@ function execBridge(cmd, params, { timeoutMs = 60000, debugger: dbg = false, env
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Execute a recipe. Returns {ok, steps, vars, output, evidence, failure?}.
-async function runRecipe(recipe, { params = {}, env = {}, exec = execBridge, now, verbose = false, keepOpen = false } = {}) {
-  // Params may themselves be templates (e.g. "{{date:-7:MM/DD/YYYY}}") so a
-  // recurring job never carries fixed dates.
-  const ctx = { params: renderDeep({ ...(recipe.params || {}), ...params }, {}, now) };
+// Params may themselves be templates (e.g. "{{date:-7:MM/DD/YYYY}}") so a
+// recurring job never carries fixed dates. Rendered once, here, so the same
+// snapshot can be hashed for an approval and then executed verbatim.
+function renderParams(recipe, params = {}, now) {
+  return renderDeep({ ...(recipe.params || {}), ...params }, {}, now);
+}
+
+async function runRecipe(recipe, { params = {}, renderedParams, env = {}, exec: execIn = execBridge, now, verbose = false, keepOpen = false, signal, baseEnv } = {}) {
+  const ctx = { params: renderedParams || renderParams(recipe, params, now) };
+  const exec = (cmd, p, o = {}) => execIn(cmd, p, { ...o, baseEnv });
+  const aborted = () => !!(signal && signal.aborted);
   const steps = [];
   let failure = null;
   const log = (m) => { if (verbose) console.error(`[recipe] ${m}`); };
@@ -174,6 +213,12 @@ async function runRecipe(recipe, { params = {}, env = {}, exec = execBridge, now
     const t0 = Date.now();
     const rec = { i, do: s.do, ok: false, ms: 0 };
     if (s.note) rec.note = s.note;
+    if (aborted()) {
+      rec.error = "cancelled";
+      failure = { step: i, do: s.do, error: "cancelled", note: s.note, kind: "cancelled" };
+      steps.push(rec);
+      break;
+    }
     try {
       const { do: kind, save, optional, timeoutMs, note, debugger: dbg, ...p } = s;
       const timeout = timeoutMs || 60000;
@@ -221,7 +266,7 @@ async function runRecipe(recipe, { params = {}, env = {}, exec = execBridge, now
   }
 
   // Repair context: where did the page end up?
-  if (failure && ctx.tab != null) {
+  if (failure && failure.kind !== "cancelled" && ctx.tab != null) {
     const snap = await exec("snapshot", { tabId: coerce(ctx.tab), maxText: 2500, maxElements: 120 }, { timeoutMs: 30000, env });
     failure.digest = snap.ok ? snap.result : { error: snap.error };
   }
@@ -336,7 +381,7 @@ function extractJson(text) {
 }
 
 module.exports = {
-  RECIPES_DIR, recipeFile, safeJob, loadRecipe, saveRecipe, validateRecipe, inferRisk,
-  render, renderDeep, formatDate, execBridge, runRecipe, buildEvidence,
+  RECIPES_DIR, recipeFile, safeJob, loadRecipe, saveRecipe, validateRecipe, inferRisk, effectiveRisk, approveRisk,
+  KNOWN_CMDS, render, renderDeep, renderParams, formatDate, execBridge, runRecipe, buildEvidence,
   RECIPE_SPEC, compactTrace, proposalPrompt, extractJson, AUTH_RE, isAuthFailure,
 };
