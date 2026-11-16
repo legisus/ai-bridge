@@ -240,6 +240,13 @@ function parseVerdict(text) {
   return null;
 }
 
+// "NEEDS APPROVAL: <one line>" at the end of an ops report = the model stopped
+// before an irreversible step it was not told to take.
+function needsApprovalLine(evidence) {
+  const m = /^NEEDS APPROVAL:\s*(.+)$/m.exec(String(evidence || ""));
+  return m ? m[1].trim() : null;
+}
+
 function extractEvidence(resultText) {
   const idx = resultText.indexOf("EVIDENCE REPORT");
   return idx === -1 ? resultText : resultText.slice(idx);
@@ -336,9 +343,19 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
 
   if (mode !== "regular") {
     const t0 = Date.now();
-    const recipeOpts = { params: opts.params || {}, env: childEnv, verbose, signal, baseEnv };
-    recipeResult = await D.runRecipe(recipe, recipeOpts);
-    stages.push({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
+    const rendered = recipes.renderParams(recipe, opts.params || {});
+    const recipeOpts = { renderedParams: rendered, env: childEnv, verbose, signal, baseEnv };
+    // Approval gate: a recipe that writes asks first, every time, when a hook is present.
+    if (opts.approve && recipes.effectiveRisk(recipe) === "write") {
+      const digest = crypto.createHash("sha256").update(`${job}:${recipe.version}:${JSON.stringify(rendered)}`).digest("hex");
+      const decision = await opts.approve({ kind: "recipe", title: job, detail: `recipe v${recipe.version} (risk write)`, digest });
+      if (decision !== "approved") {
+        blocker = "declined";
+        finalVerdict = { verdict: "declined", feedback: "write-risk recipe not approved; nothing was run" };
+      }
+    }
+    recipeResult = blocker ? { ok: false, evidence: "", steps: [], failure: { step: -1, do: "approval", error: "declined", kind: "declined" } } : await D.runRecipe(recipe, recipeOpts);
+    if (!blocker) stages.push({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
     if (!recipeResult.ok && recipeResult.failure.kind === "cancelled") { blocker = "cancelled"; finalVerdict = { ...CANCELLED }; lastEvidence = recipeResult.evidence || ""; }
     // Session expired? Run the job's login hook (if any) and replay once. A
     // model cannot log in either, so without a hook this run ends here.
@@ -401,9 +418,12 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     if (startIdx < 0) throw new Error(`unknown --start model "${opts.start}"; use one of ${OPS_LADDER.map(r => r.label).join(", ")}`);
     // --only: stay on the start rung (no escalation to pricier models on a fail)
     const rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
+    const playbookExtra = "";
+    const opsTools = [`Bash(${SELF_CMD}:*)`];
     for (const rung of rungs) {
       const opsPrompt = [
         OPS_PLAYBOOK,
+        playbookExtra,
         feedback ? `A previous attempt failed review. Judge feedback:\n${feedback}` : "",
         `TASK:\n${task}`,
       ].filter(Boolean).join("\n\n");
@@ -413,13 +433,32 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         model: rung.model,
         effort: rung.effort,
         prompt: opsPrompt,
-        allowedTools: [`Bash(${SELF_CMD}:*)`],
+        allowedTools: opsTools,
         timeoutMs,
         verbose,
         env: childEnv,
       }));
       lastEvidence = extractEvidence(String(opsRes.result || ""));
       stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
+
+      // Stop-before-send: the model paused before an irreversible step. Ask,
+      // then rerun the same rung with the answer (or stop here).
+      const pending = opts.approve ? needsApprovalLine(lastEvidence) : null;
+      if (pending) {
+        const decision = await opts.approve({ kind: "step", title: pending, detail: "the agent stopped before this action", digest: crypto.createHash("sha256").update(pending).digest("hex") });
+        if (decision !== "approved") {
+          blocker = "declined";
+          finalVerdict = { verdict: "declined", feedback: `not approved: ${pending}` };
+          break;
+        }
+        const again = await run(runOpts({
+          engine: rung.engine, model: rung.model, effort: rung.effort,
+          prompt: [OPS_PLAYBOOK, playbookExtra, `Your previous attempt stopped with: NEEDS APPROVAL: ${pending}\napproved: ${pending}; proceed`, `TASK:\n${task}`].filter(Boolean).join("\n\n"),
+          allowedTools: opsTools, timeoutMs, verbose, env: childEnv,
+        }));
+        lastEvidence = extractEvidence(String(again.result || ""));
+        stages.push({ stage: `ops:${rung.label}(approved)`, ...usageOf(again) });
+      }
 
       const verdict = await judge(lastEvidence);
       finalVerdict = verdict;
@@ -433,7 +472,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         break;
       }
     }
-    if (state) state = jobs.transition(state, { kind: finalVerdict.verdict === "pass" ? "regular-pass" : "regular-fail" });
+    if (state && blocker !== "declined") state = jobs.transition(state, { kind: finalVerdict.verdict === "pass" ? "regular-pass" : "regular-fail" });
     if (state && finalVerdict.verdict === "pass") state = rememberVariant(state, task);
   }
 
@@ -442,7 +481,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     blocker = "cancelled";
     finalVerdict = { ...CANCELLED };
   }
-  if (blocker === "cancelled") { fellBack = false; }
+  if (blocker === "cancelled" || blocker === "declined") { fellBack = false; }
 
   // ---- repair a broken recipe from this (successful) fallback run -------------
   let repaired = null;
@@ -477,7 +516,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     } catch (e) { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
   }
 
-  if (state && blocker !== "cancelled") {
+  if (state && blocker !== "cancelled" && blocker !== "declined") {
     try {
       D.putJob(jobs.pushHistory(state, { runId, mode: journalMode, verdict: finalVerdict.verdict, canary: planned.canary || undefined,
         repaired: repaired && repaired.version ? repaired.version : undefined }));
@@ -676,4 +715,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, runLoginCmd, spawnTracked, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };
+module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, runLoginCmd, spawnTracked, journalRecord, parseVerdict, extractEvidence, needsApprovalLine, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };

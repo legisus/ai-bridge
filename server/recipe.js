@@ -22,6 +22,10 @@ const PSEUDO = new Set(["assert", "poll", "sleep"]);
 const AUTH_RE = /login required|log ?in|sign ?in|authenticat|session (has )?expired|logged out|password/i;
 function isAuthFailure(text) { return AUTH_RE.test(String(text || "")); }
 const WRITE_CMDS = new Set(["click", "insertText", "type", "key", "download"]);
+// eval/assert/poll code that mutates the page or talks to the server is a write too.
+const WRITE_CODE_RE = /\.click\(|\.submit\(|fetch\(|XMLHttpRequest|dispatchEvent|\.value\s*=/;
+const { BROWSER_COMMANDS } = require("./channels/restricted");
+const KNOWN_CMDS = new Set([...BROWSER_COMMANDS, "sleep", "assert", "poll", "download"]);
 
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { mode: 0o700, recursive: true }); }
 function safeJob(job) {
@@ -63,6 +67,7 @@ function validateRecipe(r) {
   if (!Array.isArray(r.steps) || !r.steps.length) errs.push("steps: must be a non-empty array");
   else r.steps.forEach((s, i) => {
     if (!s || typeof s !== "object" || typeof s.do !== "string") { errs.push(`step ${i}: missing "do"`); return; }
+    if (!KNOWN_CMDS.has(s.do)) { errs.push(`step ${i}: unknown command "${s.do}"`); return; }
     if (s.do === "assert" && typeof s.code !== "string") errs.push(`step ${i}: assert needs "code"`);
     if (s.do === "poll" && typeof s.code !== "string") errs.push(`step ${i}: poll needs "code"`);
     if (s.do === "sleep" && typeof s.ms !== "number") errs.push(`step ${i}: sleep needs "ms"`);
@@ -82,7 +87,29 @@ function validateRecipe(r) {
 // A recipe that clicks/types anywhere is "write" unless it says otherwise;
 // used as the default risk when the proposer does not classify.
 function inferRisk(r) {
-  return (r.steps || []).some((s) => WRITE_CMDS.has(s.do)) ? "write" : "read";
+  return (r.steps || []).some((s) => WRITE_CMDS.has(s.do) ||
+    (["eval", "assert", "poll"].includes(s.do) && WRITE_CODE_RE.test(String(s.code || "")))) ? "write" : "read";
+}
+
+// The risk that gates execution: the stricter of the stored risk and the
+// inferred one, unless an operator explicitly approved the stored "read".
+function effectiveRisk(r) {
+  if (r.risk === "write") return "write";
+  if (inferRisk(r) === "write" && r.riskApprovedBy !== "operator") return "write";
+  return "read";
+}
+
+// Operator vouches for the current version's risk: rewrite current + versioned
+// files in place (saveRecipe would bump the version, so it is not used here).
+function approveRisk(job) {
+  const j = safeJob(job);
+  const cur = loadRecipe(j);
+  if (!cur) throw new Error(`no recipe for job ${job}`);
+  const out = { ...cur, riskApprovedBy: "operator", riskApprovedAt: new Date().toISOString() };
+  const text = JSON.stringify(out, null, 2) + "\n";
+  atomicWrite(recipeFile(j, out.version), text, { mode: 0o644 });
+  atomicWrite(recipeFile(j), text, { mode: 0o644 });
+  return out;
 }
 
 // ---- templating -------------------------------------------------------------
@@ -155,10 +182,15 @@ function execBridge(cmd, params, { timeoutMs = 60000, debugger: dbg = false, env
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Execute a recipe. Returns {ok, steps, vars, output, evidence, failure?}.
-async function runRecipe(recipe, { params = {}, env = {}, exec: execIn = execBridge, now, verbose = false, keepOpen = false, signal, baseEnv } = {}) {
-  // Params may themselves be templates (e.g. "{{date:-7:MM/DD/YYYY}}") so a
-  // recurring job never carries fixed dates.
-  const ctx = { params: renderDeep({ ...(recipe.params || {}), ...params }, {}, now) };
+// Params may themselves be templates (e.g. "{{date:-7:MM/DD/YYYY}}") so a
+// recurring job never carries fixed dates. Rendered once, here, so the same
+// snapshot can be hashed for an approval and then executed verbatim.
+function renderParams(recipe, params = {}, now) {
+  return renderDeep({ ...(recipe.params || {}), ...params }, {}, now);
+}
+
+async function runRecipe(recipe, { params = {}, renderedParams, env = {}, exec: execIn = execBridge, now, verbose = false, keepOpen = false, signal, baseEnv } = {}) {
+  const ctx = { params: renderedParams || renderParams(recipe, params, now) };
   const exec = (cmd, p, o = {}) => execIn(cmd, p, { ...o, baseEnv });
   const aborted = () => !!(signal && signal.aborted);
   const steps = [];
@@ -345,7 +377,7 @@ function extractJson(text) {
 }
 
 module.exports = {
-  RECIPES_DIR, recipeFile, safeJob, loadRecipe, saveRecipe, validateRecipe, inferRisk,
-  render, renderDeep, formatDate, execBridge, runRecipe, buildEvidence,
+  RECIPES_DIR, recipeFile, safeJob, loadRecipe, saveRecipe, validateRecipe, inferRisk, effectiveRisk, approveRisk,
+  KNOWN_CMDS, render, renderDeep, renderParams, formatDate, execBridge, runRecipe, buildEvidence,
   RECIPE_SPEC, compactTrace, proposalPrompt, extractJson, AUTH_RE, isAuthFailure,
 };

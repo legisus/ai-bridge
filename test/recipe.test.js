@@ -145,6 +145,36 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
     assert(r2.ok === false && r2.failure.kind === "cancelled" && m2.calls.length === 0, "cancel: already-aborted signal → zero bridge calls");
   }
 
+  // ---- risk hardening: effectiveRisk, inferRisk on eval code, unknown commands, approveRisk, renderParams
+  {
+    const evalSubmit = { job: "rk", task: "t", steps: [{ do: "newTab", url: "u" }, { do: "eval", code: "document.forms[0].submit()" }] };
+    assert(R.inferRisk(evalSubmit) === "write", "inferRisk: eval containing .submit( is write");
+    assert(R.inferRisk({ steps: [{ do: "eval", code: "document.title" }] }) === "read", "inferRisk: harmless eval is read");
+    assert(R.inferRisk({ steps: [{ do: "poll", code: "fetch('/x',{method:'POST'})" }] }) === "write", "inferRisk: poll with fetch( is write");
+    assert(R.effectiveRisk({ ...evalSubmit, risk: "read" }) === "write", "effectiveRisk: stored read but inferred write → write");
+    assert(R.effectiveRisk({ ...evalSubmit, risk: "read", riskApprovedBy: "operator" }) === "read", "effectiveRisk: operator-approved read stays read");
+    assert(R.effectiveRisk({ steps: [{ do: "eval", code: "1" }], risk: "write" }) === "write", "effectiveRisk: stored write is write");
+    const errs = R.validateRecipe({ job: "rk", task: "t", steps: [{ do: "rm" }] });
+    assert(errs.length === 1 && /unknown command "rm"/.test(errs[0]), `validate: unknown command flagged (got ${JSON.stringify(errs)})`);
+    assert(R.validateRecipe({ job: "rk", task: "t", steps: [{ do: "download", url: "u" }, { do: "sleep", ms: 1 }] }).length === 0, "validate: download and sleep are known");
+
+    // approveRisk rewrites both files in place without bumping the version
+    const saved = R.saveRecipe({ job: "rk", task: "t", risk: "read", steps: evalSubmit.steps });
+    const v = saved.version;
+    const ap = R.approveRisk("rk");
+    assert(ap.version === v && ap.riskApprovedBy === "operator", "approveRisk: same version, flag set");
+    assert(R.loadRecipe("rk").riskApprovedBy === "operator" && JSON.parse(fs.readFileSync(R.recipeFile("rk", v), "utf8")).riskApprovedBy === "operator", "approveRisk: current and versioned files both carry the flag");
+    assert(!fs.existsSync(R.recipeFile("rk", v + 1)), "approveRisk: no new version file");
+
+    // renderParams renders once; runRecipe honours renderedParams verbatim
+    const rp = R.renderParams({ params: { from: "{{date:-7:YYYY-MM-DD}}", n: 3 } }, { n: 5 }, now);
+    assert(rp.from === "2026-11-08" && rp.n === 5, "renderParams: templates rendered, overrides applied");
+    const m = mockExec({ eval: (p) => p.code });
+    const r = await R.runRecipe({ job: "rp", version: 1, steps: [{ do: "eval", code: "x={{params.from}}", save: "v" }], output: "v" },
+      { exec: m.exec, renderedParams: { from: "FIXED" }, params: { from: "ignored" } });
+    assert(r.output === "x=FIXED", "runRecipe: renderedParams used verbatim over params");
+  }
+
   console.log(failures === 0 ? "\nAll recipe tests passed." : `\n${failures} test(s) FAILED.`);
   process.exit(failures ? 1 : 0);
 })();

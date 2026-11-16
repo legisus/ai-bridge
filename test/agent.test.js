@@ -369,6 +369,72 @@ function mockRun(judgeVerdicts) {
     assert(st.mode === "audit" && st.auditPasses === 2 && !st.repairNeeded && st.history.length === 0, "cancel: recipe abort leaves job state untouched (no recipe-fail)");
   }
 
+  // 13) approval gates: write-risk recipe asks first; NEEDS APPROVAL pauses the ladder
+  {
+    const jobs = require("../server/jobs.js");
+    const writeRecipe = { job: "wr", version: 2, risk: "write", task: "send it", steps: [{ do: "newTab", url: "u" }, { do: "click", selector: "#send" }] };
+    const seed = () => jobs.putJob({ job: "wr", mode: "audit", risk: "write", auditPasses: 1, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 2, history: [] });
+    let recipeRuns = 0;
+    const deps = { loadRecipe: () => writeRecipe, runRecipe: async () => { recipeRuns++; return { ok: true, evidence: "EVIDENCE REPORT\nFinal state: sent", steps: [] }; } };
+
+    // denied → declined, recipe never ran, job untouched, no model calls
+    seed();
+    let asked = [];
+    let m = mockRun([]);
+    let r = await runAgent("send it", { job: "wr", runId: "appr0000001", approve: async (req) => { asked.push(req); return "denied"; } }, m.run, deps);
+    assert(r.verdict.verdict === "declined" && recipeRuns === 0 && m.calls.length === 0, "recipe gate: denied → declined, nothing ran");
+    assert(asked.length === 1 && asked[0].kind === "recipe" && asked[0].title === "wr" && /^[0-9a-f]{64}$/.test(asked[0].digest), "recipe gate: approve called with kind recipe and a digest");
+    let st = jobs.getJob("wr");
+    assert(st.auditPasses === 1 && st.history.length === 0 && st.mode === "audit", "recipe gate: job state untouched on decline");
+    assert(journal.readJournal({}).some((x) => x.runId === "appr0000001" && x.verdict === "declined"), "recipe gate: journaled as declined");
+
+    // approved → recipe ran, then judged as usual
+    seed();
+    m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    r = await runAgent("send it", { job: "wr", runId: "appr0000002", approve: async () => "approved" }, m.run, deps);
+    assert(r.verdict.verdict === "pass" && recipeRuns === 1, "recipe gate: approved → recipe ran");
+
+    // digest changes with params; same params → same digest
+    seed();
+    const d1 = []; await runAgent("send it", { job: "wr", runId: "appr0000003", params: { a: 1 }, approve: async (q) => { d1.push(q.digest); return "denied"; } }, mockRun([]).run, deps);
+    seed();
+    const d2 = []; await runAgent("send it", { job: "wr", runId: "appr0000004", params: { a: 2 }, approve: async (q) => { d2.push(q.digest); return "denied"; } }, mockRun([]).run, deps);
+    assert(d1[0] !== d2[0], "recipe gate: digest binds the rendered params");
+
+    // no approve hook → unchanged behaviour (recipe runs)
+    seed(); recipeRuns = 0;
+    r = await runAgent("send it", { job: "wr", runId: "appr0000005" }, mockRun(['{"verdict":"pass","feedback":"ok"}']).run, deps);
+    assert(recipeRuns === 1 && r.verdict.verdict === "pass", "recipe gate: without approve hook the recipe runs as before");
+
+    // ladder: NEEDS APPROVAL pauses; approved → same rung rerun with feedback; denied → declined
+    const needs = "did stuff\nEVIDENCE REPORT\nTask: t\nActions: 1. opened\nFinal state: compose open\nScreenshots: none\nBlockers: none\nNEEDS APPROVAL: click Send on the draft to Bob";
+    const scripted = (replies, judge) => {
+      const calls = []; let i = 0, j = 0;
+      const run = async (o) => {
+        calls.push(o);
+        if (o.model === JUDGE_MODEL && o.prompt.includes("strict verifier")) return { result: judge[j++], usage: {} };
+        return { result: replies[i++], usage: {} };
+      };
+      return { run, calls };
+    };
+    let s1 = scripted([needs, "EVIDENCE REPORT\nTask: t\nFinal state: sent\nScreenshots: none\nBlockers: none"], ['{"verdict":"pass","feedback":"ok"}']);
+    asked = [];
+    r = await runAgent("email Bob the draft", { runId: "appr0000006", approve: async (q) => { asked.push(q); return "approved"; } }, s1.run, {});
+    const ops = s1.calls.filter((c) => !c.prompt.includes("strict verifier"));
+    assert(asked.length === 1 && asked[0].kind === "step" && asked[0].title === "click Send on the draft to Bob", "step gate: approve called with the NEEDS APPROVAL line");
+    assert(ops.length === 2 && ops[0].model === ops[1].model && ops[1].prompt.includes("approved: click Send on the draft to Bob; proceed"), "step gate: same rung rerun with the approval in the prompt");
+    assert(r.verdict.verdict === "pass" && r.stages.some((x) => x.stage === "ops:opus-5.5(approved)"), "step gate: rerun stage labelled (approved), then judged");
+
+    let s2 = scripted([needs], []);
+    r = await runAgent("email Bob the draft", { runId: "appr0000007", approve: async () => "denied" }, s2.run, {});
+    assert(r.verdict.verdict === "declined" && s2.calls.length === 1, "step gate: denied → declined after one ops call, no judge");
+
+    // without approve hook the NEEDS APPROVAL evidence just goes to the judge
+    let s3 = scripted([needs], ['{"verdict":"fail","feedback":"not sent"}', '{"verdict":"fail","feedback":"x"}', '{"verdict":"fail","feedback":"y"}']);
+    r = await runAgent("email Bob the draft", { runId: "appr0000008", only: true }, s3.run, {});
+    assert(r.verdict.verdict === "fail" && s3.calls.length === 2, "step gate: no hook → evidence judged as before");
+  }
+
   console.log(failures === 0 ? "\nAll agent tests passed." : `\n${failures} test(s) FAILED.`);
   process.exit(failures ? 1 : 0);
 })();
