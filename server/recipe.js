@@ -127,14 +127,14 @@ function coerce(v) { return typeof v === "string" && /^-?\d+$/.test(v) ? Number(
 // ---- bridge exec -------------------------------------------------------------
 
 // Run one bridge CLI command; resolves {ok, result|error, ms}. Injectable for tests.
-function execBridge(cmd, params, { timeoutMs = 60000, debugger: dbg = false, env = {} } = {}) {
+function execBridge(cmd, params, { timeoutMs = 60000, debugger: dbg = false, env = {}, baseEnv } = {}) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const args = [cmd, JSON.stringify(params || {}), "--timeout", String(timeoutMs)];
     if (dbg) args.push("--debugger");
     const child = spawn(process.execPath, selfArgs(args), {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...env, ...(dbg ? { AI_BRIDGE_DEBUGGER: "1" } : {}) },
+      env: { ...(baseEnv || process.env), ...env, ...(dbg ? { AI_BRIDGE_DEBUGGER: "1" } : {}) },
     });
     let out = "", err = "";
     child.stdout.on("data", (d) => { out += d; });
@@ -155,10 +155,12 @@ function execBridge(cmd, params, { timeoutMs = 60000, debugger: dbg = false, env
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Execute a recipe. Returns {ok, steps, vars, output, evidence, failure?}.
-async function runRecipe(recipe, { params = {}, env = {}, exec = execBridge, now, verbose = false, keepOpen = false } = {}) {
+async function runRecipe(recipe, { params = {}, env = {}, exec: execIn = execBridge, now, verbose = false, keepOpen = false, signal, baseEnv } = {}) {
   // Params may themselves be templates (e.g. "{{date:-7:MM/DD/YYYY}}") so a
   // recurring job never carries fixed dates.
   const ctx = { params: renderDeep({ ...(recipe.params || {}), ...params }, {}, now) };
+  const exec = (cmd, p, o = {}) => execIn(cmd, p, { ...o, baseEnv });
+  const aborted = () => !!(signal && signal.aborted);
   const steps = [];
   let failure = null;
   const log = (m) => { if (verbose) console.error(`[recipe] ${m}`); };
@@ -175,6 +177,12 @@ async function runRecipe(recipe, { params = {}, env = {}, exec = execBridge, now
     const t0 = Date.now();
     const rec = { i, do: s.do, ok: false, ms: 0 };
     if (s.note) rec.note = s.note;
+    if (aborted()) {
+      rec.error = "cancelled";
+      failure = { step: i, do: s.do, error: "cancelled", note: s.note, kind: "cancelled" };
+      steps.push(rec);
+      break;
+    }
     try {
       const { do: kind, save, optional, timeoutMs, note, debugger: dbg, ...p } = s;
       const timeout = timeoutMs || 60000;
@@ -222,7 +230,7 @@ async function runRecipe(recipe, { params = {}, env = {}, exec = execBridge, now
   }
 
   // Repair context: where did the page end up?
-  if (failure && ctx.tab != null) {
+  if (failure && failure.kind !== "cancelled" && ctx.tab != null) {
     const snap = await exec("snapshot", { tabId: coerce(ctx.tab), maxText: 2500, maxElements: 120 }, { timeoutMs: 30000, env });
     failure.digest = snap.ok ? snap.result : { error: snap.error };
   }

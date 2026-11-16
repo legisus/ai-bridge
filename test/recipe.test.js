@@ -132,6 +132,19 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
   assert(back.mode === "audit" && back.history.length === 1 && fs.existsSync(J.JOBS_FILE), "jobs: persisted + reloaded");
   assert(J.formatTable(J.loadJobs()).includes("toll") && J.formatTable(J.loadJobs()).includes("0/3"), "jobs: table");
 
+  // ---- cancellation via AbortSignal
+  {
+    const ctl = new AbortController();
+    const m = mockExec({ newTab: () => { ctl.abort(); return { id: 11 }; }, closeTab: {} });
+    const r = await R.runRecipe({ job: "c", version: 1, steps: [{ do: "newTab", url: "u" }, { do: "eval", code: "1" }] }, { exec: m.exec, signal: ctl.signal });
+    assert(r.ok === false && r.failure.kind === "cancelled" && r.failure.step === 1, "cancel: aborted after step 0 → failure at step 1, kind cancelled");
+    assert(m.calls.some((c) => c.cmd === "closeTab" && c.params.tabId === 11) && !m.calls.some((c) => c.cmd === "eval"), "cancel: tab closed, next step never ran");
+    const pre = new AbortController(); pre.abort();
+    const m2 = mockExec({});
+    const r2 = await R.runRecipe({ job: "c", version: 1, steps: [{ do: "newTab", url: "u" }] }, { exec: m2.exec, signal: pre.signal });
+    assert(r2.ok === false && r2.failure.kind === "cancelled" && m2.calls.length === 0, "cancel: already-aborted signal → zero bridge calls");
+  }
+
   console.log(failures === 0 ? "\nAll recipe tests passed." : `\n${failures} test(s) FAILED.`);
   process.exit(failures ? 1 : 0);
 })();

@@ -330,6 +330,45 @@ function mockRun(judgeVerdicts) {
     assert(res.stderr.includes("recursive"), "recursion guard: explains the refusal");
   }
 
+  // 12) cancellation: spawnTracked kills the process group; runAgent reports "cancelled" without touching job state
+  {
+    const { spawnTracked } = require("../server/agent.js");
+    const jobs = require("../server/jobs.js");
+    const ctl = new AbortController();
+    const script = `const {spawn}=require("child_process");const c=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});console.log(JSON.stringify({parent:process.pid,child:c.pid}));setInterval(()=>{},1000);`;
+    const child = spawnTracked(process.execPath, ["-e", script], { signal: ctl.signal, stdio: ["ignore", "pipe", "ignore"] });
+    const pids = await new Promise((resolve) => { let out = ""; child.stdout.on("data", (d) => { out += d; if (out.includes("}")) resolve(JSON.parse(out)); }); });
+    ctl.abort();
+    await new Promise((r) => setTimeout(r, 500));
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+    assert(!alive(pids.parent) && !alive(pids.child), "spawnTracked: abort kills parent and grandchild");
+
+    // ladder path: the model runner rejects with AbortError once the signal is aborted
+    const ctl2 = new AbortController();
+    const run = async (opts) => {
+      if (opts.signal && opts.signal.aborted) throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+      ctl2.abort();
+      return { result: "EVIDENCE REPORT\nTask: t\nFinal state: partial\nScreenshots: none\nBlockers: none", usage: {} };
+    };
+    jobs.putJob({ job: "canc", mode: "audit", risk: "read", auditPasses: 1, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, repairNeeded: true, history: [] });
+    let r = await runAgent("cancel me", { job: "canc", runId: "canc0000001", signal: ctl2.signal }, run, { loadRecipe: () => null });
+    assert(r.verdict.verdict === "cancelled" && /not undone/.test(r.verdict.feedback), "cancel: ladder abort → verdict cancelled");
+    assert(r.record.verdict === "cancelled" && journal.readJournal({}).some((x) => x.runId === "canc0000001" && x.verdict === "cancelled"), "cancel: journaled as cancelled");
+    let st = jobs.getJob("canc");
+    assert(st.mode === "audit" && st.auditPasses === 1 && st.repairNeeded === true && st.history.length === 0, "cancel: job state untouched");
+
+    // recipe path: runner reports kind "cancelled"
+    const ctl3 = new AbortController();
+    jobs.putJob({ job: "canc2", mode: "audit", risk: "read", auditPasses: 2, auditRequired: 3, canaryEvery: 5, runsSinceCanary: 0, recipeVersion: 1, history: [] });
+    r = await runAgent("pull", { job: "canc2", runId: "canc0000002", signal: ctl3.signal }, mockRun([]).run, {
+      loadRecipe: () => ({ job: "canc2", version: 1, risk: "read", task: "pull", steps: [{ do: "newTab", url: "u" }] }),
+      runRecipe: async (rec, o) => { ctl3.abort(); return { ok: false, evidence: "aborted", steps: [], failure: { step: 0, do: "newTab", error: "cancelled", kind: "cancelled" } }; },
+    });
+    assert(r.verdict.verdict === "cancelled", "cancel: recipe abort → verdict cancelled");
+    st = jobs.getJob("canc2");
+    assert(st.mode === "audit" && st.auditPasses === 2 && !st.repairNeeded && st.history.length === 0, "cancel: recipe abort leaves job state untouched (no recipe-fail)");
+  }
+
   console.log(failures === 0 ? "\nAll agent tests passed." : `\n${failures} test(s) FAILED.`);
   process.exit(failures ? 1 : 0);
 })();

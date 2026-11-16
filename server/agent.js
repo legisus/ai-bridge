@@ -108,9 +108,35 @@ Reply with ONLY a JSON object, no other text:
 {"verdict": "pass" or "fail", "feedback": "<if fail: what is missing and what the next attempt should do differently; if pass: brief confirmation>"}`;
 }
 
+
+// ---- child processes --------------------------------------------------------
+
+function abortError() { return Object.assign(new Error("cancelled"), { name: "AbortError" }); }
+
+// Spawn a child in its own process group so an AbortSignal can kill it together
+// with everything it spawned (claude → bash → bridge CLI …). `baseEnv` replaces
+// process.env as the environment base (restricted runs pass a scrubbed one).
+function spawnTracked(cmd, args, { signal, cwd, baseEnv, env, stdio } = {}) {
+  if (signal && signal.aborted) throw abortError();
+  const child = spawn(cmd, args, {
+    stdio: stdio || ["ignore", "pipe", "pipe"],
+    cwd: cwd || undefined,
+    detached: process.platform !== "win32",
+    env: { ...(baseEnv || process.env), AI_BRIDGE_AGENT: "1", ...(env || {}) },
+  });
+  if (signal) {
+    const kill = () => {
+      try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+    };
+    signal.addEventListener("abort", kill, { once: true });
+    child.once("close", () => signal.removeEventListener("abort", kill));
+  }
+  return child;
+}
+
 // Spawn `claude -p` and resolve with the parsed --output-format json result.
 // Injectable via deps for testing.
-function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env }) {
+function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env, signal, cwd, baseEnv }) {
   return new Promise((resolve, reject) => {
     const args = ["-p", prompt, "--model", model, "--output-format", "json"];
     if (allowedTools && allowedTools.length) {
@@ -123,10 +149,9 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env }) {
     // AI_BRIDGE_AGENT marks every process spawned by the agent (and their
     // children), so a recursive `bridge agent` call can be refused at startup
     // no matter how the ops model spells the command.
-    const child = spawn("claude", args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, AI_BRIDGE_AGENT: "1", ...(env || {}) },
-    });
+    let child;
+    try { child = spawnTracked("claude", args, { signal, cwd, baseEnv, env, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { return reject(e); }
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
@@ -158,22 +183,21 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env }) {
 // ladder treats both engines alike. The sandbox allows network so the bridge
 // CLI can reach the localhost relay; cwd stays the caller's so screenshots land
 // where Claude ops sessions put them.
-function runCodex({ model, effort, prompt, timeoutMs, verbose, env }) {
+function runCodex({ model, effort, prompt, timeoutMs, verbose, env, signal, cwd, baseEnv }) {
   const fs = require("fs");
   const os = require("os");
   return new Promise((resolve, reject) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-codex-"));
     const outPath = path.join(tmp, "last.txt");
+    const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
     const args = ["exec", "--skip-git-repo-check", "--ephemeral",
       "-m", model, "-c", `model_reasoning_effort="${effort || "medium"}"`,
       "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
-      "-C", process.cwd(), "-o", outPath, prompt];
-    const child = spawn("codex", args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, AI_BRIDGE_AGENT: "1", ...(env || {}) },
-    });
+      "-C", cwd || process.cwd(), "-o", outPath, prompt];
+    let child;
+    try { child = spawnTracked("codex", args, { signal, cwd, baseEnv, env, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { cleanup(); return reject(e); }
     let err = "";
-    const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       cleanup();
@@ -191,6 +215,7 @@ function runCodex({ model, effort, prompt, timeoutMs, verbose, env }) {
       let out = "";
       try { out = fs.readFileSync(outPath, "utf8").trim(); } catch {}
       cleanup();
+      if (signal && signal.aborted) return reject(abortError());
       if (code !== 0) return reject(new Error(`codex (${model}) exited ${code}: ${err.trim().slice(-400)}`));
       resolve({ result: out, usage: {} });
     });
@@ -251,17 +276,24 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     loadJobs: jobs.loadJobs, readJournal: journal.readJournal, readTrace: journal.readTrace,
     propose: proposeRecipe, runLogin: runLoginCmd, ...deps,
   };
-  let blocker = null; // "auth" when the site wants a login nobody here can give
+  let blocker = null; // "auth" when the site wants a login nobody here can give; "cancelled" on abort
+  const signal = opts.signal;
+  const baseEnv = opts.baseEnv;
+  const CANCELLED = { verdict: "cancelled", feedback: "stopped by user; actions already performed were not undone" };
+  // Common options for every model call of this run.
+  const runOpts = (o) => ({ ...o, signal, baseEnv, cwd: opts.cwd });
 
-  // ---- which job is this? explicit --job, or matched from the task text -------
   const auto = !opts.noAuto && opts.job !== "none";
   let job = opts.job && opts.job !== "none" ? String(opts.job).trim() : null;
-  let autoMatch = null;
+  let autoMatch = null, childEnv, state = null, recipe = null, planned = { mode: "regular", judge: true }, newPhrasing = false;
+  let mode = "regular", fellBack = false, mismatch = false, recipeResult = null;
+  try {
+  // ---- which job is this? explicit --job, or matched from the task text -------
   if (!job && auto) {
     const found = jobs.findJobForTask(task, D.loadJobs());
     if (found.match) autoMatch = found.match;
     else if (found.uncertain.length) {
-      const res = await run({ model: MATCH_MODEL, prompt: jobs.classifyPrompt(task, found.uncertain), allowedTools: [], timeoutMs, verbose });
+      const res = await run(runOpts({ model: MATCH_MODEL, prompt: jobs.classifyPrompt(task, found.uncertain), allowedTools: [], timeoutMs, verbose }));
       stages.push({ stage: `match:${MATCH_MODEL}`, ...usageOf(res) });
       const obj = recipes.extractJson(String(res.result || ""));
       if (obj && obj.job && found.uncertain.some((u) => u.job === obj.job) && (obj.confidence == null || obj.confidence >= 0.7)) {
@@ -272,19 +304,19 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
   // Child model processes inherit these; the CLI tags every bridge command
   // with them and the server writes traces/<runId>.jsonl.
-  let childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}) };
+  childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}) };
 
   const judge = async (evidence) => {
-    let judgeRes = await run({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose });
+    let judgeRes = await run(runOpts({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose }));
     stages.push({ stage: "judge:fable-5.1", ...usageOf(judgeRes) });
     let verdict = parseVerdict(String(judgeRes.result || ""));
     if (!verdict) {
       // one re-ask on malformed JSON
-      judgeRes = await run({
+      judgeRes = await run(runOpts({
         model: JUDGE_MODEL,
         prompt: judgePrompt(task, evidence) + "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
         allowedTools: [], timeoutMs, verbose,
-      });
+      }));
       stages.push({ stage: "judge:fable-5.1(retry)", ...usageOf(judgeRes) });
       verdict = parseVerdict(String(judgeRes.result || "")) ||
         { verdict: "fail", feedback: String(judgeRes.result || "judge output unreadable") };
@@ -293,31 +325,30 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   };
 
   // ---- economy / audit path -------------------------------------------------
-  let state = job ? D.getJob(job) : null;
-  const recipe = job && state && state.mode !== "regular" && !state.repairNeeded ? D.loadRecipe(job) : null;
-  const planned = jobs.plan(state, !!recipe);
+  state = job ? D.getJob(job) : null;
+  recipe = job && state && state.mode !== "regular" && !state.repairNeeded ? D.loadRecipe(job) : null;
+  planned = jobs.plan(state, !!recipe);
   // A wording this job has not been judged with yet is verified once, even in
   // economy mode; after a pass it is remembered and later runs are free.
-  const newPhrasing = !!autoMatch && !autoMatch.exact;
+  newPhrasing = !!autoMatch && !autoMatch.exact;
   if (planned.mode === "economy" && newPhrasing && !planned.judge) { planned.judge = true; planned.phrasing = true; }
-  let mode = planned.mode;
-  let fellBack = false;
-  let mismatch = false;
-  let recipeResult = null;
+  mode = planned.mode;
 
   if (mode !== "regular") {
     const t0 = Date.now();
-    recipeResult = await D.runRecipe(recipe, { params: opts.params || {}, env: childEnv, verbose });
+    const recipeOpts = { params: opts.params || {}, env: childEnv, verbose, signal, baseEnv };
+    recipeResult = await D.runRecipe(recipe, recipeOpts);
     stages.push({ stage: `recipe:${job}@v${recipe.version}${planned.canary ? "(canary)" : ""}`, input: 0, output: 0, costUsd: 0, ms: Date.now() - t0 });
+    if (!recipeResult.ok && recipeResult.failure.kind === "cancelled") { blocker = "cancelled"; finalVerdict = { ...CANCELLED }; lastEvidence = recipeResult.evidence || ""; }
     // Session expired? Run the job's login hook (if any) and replay once. A
     // model cannot log in either, so without a hook this run ends here.
-    if (!recipeResult.ok && recipeResult.failure.kind === "auth") {
+    if (!blocker && !recipeResult.ok && recipeResult.failure.kind === "auth") {
       if (state.loginCmd) {
         const t1 = Date.now();
-        const login = await D.runLogin(state.loginCmd, { timeoutMs: 5 * 60 * 1000, verbose });
+        const login = await D.runLogin(state.loginCmd, { timeoutMs: 5 * 60 * 1000, verbose, baseEnv });
         stages.push({ stage: "login-hook", input: 0, output: 0, costUsd: 0, ms: Date.now() - t1, ok: login.ok });
         if (login.ok) {
-          recipeResult = await D.runRecipe(recipe, { params: opts.params || {}, env: childEnv, verbose });
+          recipeResult = await D.runRecipe(recipe, recipeOpts);
           stages.push({ stage: `recipe:${job}@v${recipe.version}(after login)`, input: 0, output: 0, costUsd: 0 });
         } else if (verbose) console.error(`[agent] login hook failed: ${login.error}`);
       }
@@ -377,7 +408,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         `TASK:\n${task}`,
       ].filter(Boolean).join("\n\n");
 
-      const opsRes = await run({
+      const opsRes = await run(runOpts({
         engine: rung.engine,
         model: rung.model,
         effort: rung.effort,
@@ -386,7 +417,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         timeoutMs,
         verbose,
         env: childEnv,
-      });
+      }));
       lastEvidence = extractEvidence(String(opsRes.result || ""));
       stages.push({ stage: `ops:${rung.label}`, ...usageOf(opsRes) });
 
@@ -405,6 +436,13 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     if (state) state = jobs.transition(state, { kind: finalVerdict.verdict === "pass" ? "regular-pass" : "regular-fail" });
     if (state && finalVerdict.verdict === "pass") state = rememberVariant(state, task);
   }
+
+  } catch (e) {
+    if (!(e && e.name === "AbortError")) throw e;
+    blocker = "cancelled";
+    finalVerdict = { ...CANCELLED };
+  }
+  if (blocker === "cancelled") { fellBack = false; }
 
   // ---- repair a broken recipe from this (successful) fallback run -------------
   let repaired = null;
@@ -439,7 +477,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     } catch (e) { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
   }
 
-  if (state) {
+  if (state && blocker !== "cancelled") {
     try {
       D.putJob(jobs.pushHistory(state, { runId, mode: journalMode, verdict: finalVerdict.verdict, canary: planned.canary || undefined,
         repaired: repaired && repaired.version ? repaired.version : undefined }));
@@ -460,10 +498,10 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
 // Per-job login hook: a shell command (bridge jobs set <job> --login-cmd "…")
 // that restores the site session in the user's Chrome, e.g. by driving the
 // login form with stored credentials. Resolves {ok, error?, output}.
-function runLoginCmd(cmd, { timeoutMs = 5 * 60 * 1000, verbose = false } = {}) {
+function runLoginCmd(cmd, { timeoutMs = 5 * 60 * 1000, verbose = false, baseEnv } = {}) {
   return new Promise((resolve) => {
     if (verbose) console.error(`[agent] running login hook: ${cmd}`);
-    shellExec(cmd, { timeout: timeoutMs, env: { ...process.env, AI_BRIDGE_AGENT: "1" }, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    shellExec(cmd, { timeout: timeoutMs, env: { ...(baseEnv || process.env), AI_BRIDGE_AGENT: "1" }, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (verbose && (stdout || stderr)) console.error(String(stdout || "") + String(stderr || ""));
       if (err) return resolve({ ok: false, error: (String(stderr || "").trim() || err.message).slice(-400), output: String(stdout || "") });
       resolve({ ok: true, output: String(stdout || "") });
@@ -638,4 +676,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, runLoginCmd, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };
+module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, runLoginCmd, spawnTracked, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };
