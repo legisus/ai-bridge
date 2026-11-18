@@ -15,6 +15,7 @@
 - Branch `feat/bound-bots` stacked on `feat/channels-sessions` (PR #7); PR only; commits under the user's identity, no `Co-Authored-By: Claude`.
 - Owner key `channel:accountId:senderId` everywhere; adapters and configs resolved by `(channel, accountId)`, never by channel alone.
 - `accountId` matches `/^[a-z0-9_-]{1,24}$/`, unique per channel, default `default` (one bot at most).
+- Session model default is **fable** (`claude-fable-5-1`) everywhere: `boundSession.model` when `model` is absent, and `SessionStore.create(owner, name, modelKey = "fable")` (the sessions suite's "row defaults" and "/new reply" expectations change from opus to fable in Task 1; `MODELS` keeps `opus|fable|haiku`).
 - Env keys: `AI_BRIDGE_<CHANNEL>_TOKEN` → default bot; `AI_BRIDGE_<CHANNEL>_<ACCOUNTID>_TOKEN` (upper-cased, `[^A-Z0-9]` → `_`) → that bot; collisions and duplicate effective tokens are errors; overrides apply before the token-presence check.
 - `cleanEnv` denies any key matching `/^AI_BRIDGE_.*_TOKEN$/i` even when in `envPassthrough`.
 - Bound bot replies (exact copy, from the spec): refusal `this bot is bound to session turo: plain text goes to it, /pause and /resume control it, /stop starts it over`; no row `no conversation yet; just send a message`; wrong name `this bot only has the conversation "turo"`; stop `stopped turo; your next message starts a fresh conversation`; paused `session turo is paused; /resume`; cap `cannot start the conversation: too many sessions on this bot (max 10); the operator can clear them`; model conflict `this conversation runs on <a>, the bot is configured for <b>; /stop to start over on <b>`; retry refusal `cannot retry: that message was not for this conversation; send a new message`; execution drop `🚫 dropped — this bot is bound to session turo`; missing transcript `❌ [turo] this session's conversation is no longer available (Claude keeps transcripts ~30 days); /stop, then send a new message`.
@@ -32,8 +33,8 @@
 ### Task 1: Config — bots list, env overrides, validation, redaction, token deny
 
 **Files:**
-- Modify: `server/channels/config.js`, `server/channels/restricted.js` (`cleanEnv`)
-- Test: `test/channels.config.test.js`, `test/channels.restricted.test.js`
+- Modify: `server/channels/config.js`, `server/channels/restricted.js` (`cleanEnv`), `server/channels/sessions.js` (default model key `fable`), `server/channels/manager.js` (`/new` usage text unchanged; default comes from the store)
+- Test: `test/channels.config.test.js`, `test/channels.restricted.test.js`, `test/channels.sessions.test.js` (`create: row defaults` expects `claude-fable-5-1`; add `create(owner, "x", "opus")` → opus), `test/channels.manager.sessions.test.js` (`created session turo (fable)` in the `/new Turo` expectation and `(fable, …)` in `/sessions` listings where the model was not given)
 
 **Interfaces:**
 - Consumes: `normalizeName`, `MODELS` from `server/channels/sessions.js`.
@@ -48,7 +49,7 @@
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { dmPolicy: "allowlist", allowFrom: [1], bots: [
   { accountId: "default", token: "A:1" }, { accountId: "turo", token: "B:2", session: "Turo" }, { accountId: "mail", token: "C:3", session: "mail", model: "haiku", dmPolicy: "pairing", apiBase: "http://x" } ] } }), { mode: 0o600 });
 cfg = loadConfig({ env: {} });
-assert(cfg.telegram.bots.length === 3 && cfg.telegram.bots[1].accountId === "turo" && cfg.telegram.bots[1].dmPolicy === "allowlist" && JSON.stringify(cfg.telegram.bots[1].allowFrom) === '["1"]' && JSON.stringify(cfg.telegram.bots[1].boundSession) === '{"name":"turo","model":"claude-opus-5-5"}', "bots: channel defaults merged into each bot, session name normalised, model default opus");
+assert(cfg.telegram.bots.length === 3 && cfg.telegram.bots[1].accountId === "turo" && cfg.telegram.bots[1].dmPolicy === "allowlist" && JSON.stringify(cfg.telegram.bots[1].allowFrom) === '["1"]' && JSON.stringify(cfg.telegram.bots[1].boundSession) === '{"name":"turo","model":"claude-fable-5-1"}', "bots: channel defaults merged into each bot, session name normalised, model default fable");
 assert(cfg.telegram.bots[0].boundSession === null && cfg.telegram.bots[2].dmPolicy === "pairing" && cfg.telegram.bots[2].apiBase === "http://x" && cfg.telegram.bots[2].boundSession.model === "claude-haiku-5-5", "bots: unbound bot, per-bot overrides kept");
 assert(cfg.telegram.token === "A:1" && cfg.telegram.accountId === "default", "bots: flat token/accountId alias the default bot");
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t", accountId: "solo", apiBase: "http://y" } }), { mode: 0o600 });
@@ -115,7 +116,7 @@ git commit -m "feat(channels): several bots per channel in channels.json; messen
 - Consumes: Task 1's `cfg.<channel>.bots`.
 - Produces:
   - `buildAdapters(config, deps)` → one adapter per bot: `make()({ ...bot }, deps)`; each adapter has `id` (channel) and `accountId` (bot).
-  - `status()` prints per bot: `channel telegram/turo: dmPolicy pairing, allowFrom (none), codex off, session turo (opus)` (`session none` when unbound).
+  - `status()` prints per bot: `channel telegram/turo: dmPolicy pairing, allowFrom (none), codex off, session turo (fable)` (`session none` when unbound).
   - `Manager.adapterFor(channel, accountId = "default")` → the adapter with both ids, or `undefined`; `cfgFor(adapter)` → `config[adapter.id].bots.find(b => b.accountId === adapter.accountId)` merged bot config (falls back to the channel object when `bots` is absent, so tests that build a Manager with a flat config keep working). `recover`, `runOne`, `/retry`, recovery notices and the queued-item drop paths all use `adapterFor(item.channel, item.accountId)`; a missing adapter → `journalDeclined(item, "no adapter for this bot")` + remove, never another bot.
   - `Approvals.resolve`: ownership (`actorId`, `channel`, `accountId`, `chatId`, `kind`) is checked **before** `stale`, so a foreign caller gets `forbidden` even for settled/expired records.
   - `handleAction`: a stored prompt is edited only when `prompt.adapter === adapter` (same object); otherwise no edit (ack still answered).
@@ -133,7 +134,7 @@ git commit -m "feat(channels): several bots per channel in channels.json; messen
   assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale", "resolve: the owner still gets stale after settlement");
 }
 ```
-`test/channels.main.test.js` (status block): write a config with `bots: [{accountId:"default",token:"x"},{accountId:"turo",token:"y",session:"turo"}]` and assert `r.stdout` contains `channel telegram/default:` and `channel telegram/turo: dmPolicy pairing, allowFrom (none), codex off, session turo (opus)` and not `"y"`; `buildAdapters(config)` returns two adapters with `accountId` `default` and `turo` (unit assertion via `require("../server/channels/main.js").buildAdapters`).
+`test/channels.main.test.js` (status block): write a config with `bots: [{accountId:"default",token:"x"},{accountId:"turo",token:"y",session:"turo"}]` and assert `r.stdout` contains `channel telegram/default:` and `channel telegram/turo: dmPolicy pairing, allowFrom (none), codex off, session turo (fable)` and not `"y"`; `buildAdapters(config)` returns two adapters with `accountId` `default` and `turo` (unit assertion via `require("../server/channels/main.js").buildAdapters`).
 `test/channels.manager.test.js` (new block; `fakeAdapter({ accountId })` gains the option): config `{ fake: { token: TOKEN, dmPolicy: "pairing", bots: [{ accountId: "default", token: TOKEN }, { accountId: "b", token: TOKEN + "b" }] } }`, two adapters `a1` (default) and `a2` (b), senders paired on both; emit a task on `a2` → the ack is sent by `a2`, `runAgent` runs it, `ra.finish` → verdict text arrives on `a2` only; then restart test: seed a running item with `accountId: "b"` → the recovery notice goes to `a2`; and `handleAction` stale-id test: create an approval via a task on `a1` (write intent), decline it, then emit the same button data as an action on `a2` from the same actor → no `edit` recorded on `a2`, no run. Names: `two bots: item of account b runs and replies through adapter b`, `two bots: recovery notice through the item's own adapter`, `handleAction: stale id from another bot edits nothing`.
 
 - [ ] **Step 2: Run the tests to verify they fail**

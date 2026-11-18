@@ -46,7 +46,7 @@ session commands for ad-hoc work. Several bots run under one daemon, one Chrome,
     "bots": [
       { "accountId": "default", "token": "123:AA…" },
       { "accountId": "turo",   "token": "456:BB…", "session": "turo" },
-      { "accountId": "taziky", "token": "789:CC…", "session": "taziky", "model": "haiku" },
+      { "accountId": "taziky", "token": "789:CC…", "session": "taziky", "model": "fable" },
       { "accountId": "mail",   "token": "012:DD…", "session": "mail" }
     ]
   }
@@ -68,13 +68,15 @@ validates each **merged** bot (`{ ...channelDefaults, ...bot }`):
   → that bot. Two account ids that map to the same env key are an error, as are two bots with
   the same effective token.
 - `session` is normalised with the session store's `normalizeName` (error if invalid or
-  reserved); `model` is `opus|fable|haiku` (default `opus`). `cfg.boundSession = { name, model }`
+  reserved); `model` is `opus|fable|haiku` (default `fable` = `claude-fable-5-1`, the user's
+  choice on 2026-11-18 for every bot session; the sessions store's own default for `/new`
+  becomes `fable` too; "Fable 5.2" is not a model id the CLI recognises). `cfg.boundSession = { name, model }`
   on the merged bot config, or `null`.
 - `redact(text, config)` covers every bot's token (flat and in `bots`). `cleanEnv` denies any
   key matching `/^AI_BRIDGE_.*_TOKEN$/` even when listed in `envPassthrough` (messenger
   credentials never reach a child). Config errors name the file and the key, never raw content.
 - `bridge channels status` prints one line per bot: `channel telegram/turo: dmPolicy pairing,
-  allowFrom (none), codex off, session turo (opus)`.
+  allowFrom (none), codex off, session turo (fable)`.
 - The daemon builds one adapter per bot (`makeAdapter({ token, accountId, apiBase, … })`);
   offsets and dedup rings are already keyed by `channel:accountId`; one daemon lock, one serial
   worker. The manager keeps `adapters` as a list and resolves `adapterFor(channel, accountId)`
@@ -137,7 +139,7 @@ validates each **merged** bot (`{ ...channelDefaults, ...bot }`):
 - `/stop` on a bound bot keeps "forget + start over"; `/stop all` is refused there.
 - Bot names for the user's three jobs: `@ai_bridge_turo_bot`, `@ai_bridge_taziky_bot`,
   `@ai_bridge_mail_bot` (accountIds `turo`, `taziky`, `mail`; sessions of the same names;
-  model `opus`). `@ai_bridge_mykola_bot` stays the general (unbound, `default`) bot.
+  model `fable`). `@ai_bridge_mykola_bot` stays the general (unbound, `default`) bot.
 - `bridge pairing list` / `approve` output shows `telegram/turo` (channel/account) so the
   operator sees which bot a code belongs to; the approve syntax is unchanged.
 
