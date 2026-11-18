@@ -31,6 +31,14 @@ const run = (args, extraEnv = {}, cwd = outbox) => new Promise((resolve) => exec
   assert(r.code === 7, "restricted: --out through a symlinked dir inside the outbox refused");
   r = await run(["eval", '{"tabId":1}', "--file", "/etc/hosts"]);
   assert(r.code === 7, "restricted: --file outside the outbox refused");
+  for (const bad of ["CLAUDE.md", "claude.md", "sub/CLAUDE.local.md", ".mcp.json", ".claude/settings.json", "x/.claude/hooks.json", ".hidden.png", "AGENTS.md", "settings.local.json", "leftover"]) {
+    r = await run(["eval", '{"tabId":1,"code":"1"}', "--out", bad]);
+    assert(r.code === 7 && /instruction or configuration file/.test(r.stderr), `restricted: --out ${bad} refused (instruction file)`);
+  }
+  r = await run(["eval", '{"tabId":1}', "--file", "CLAUDE.md"]);
+  assert(r.code === 7, "restricted: --file CLAUDE.md refused");
+  r = await run(["eval", '{"tabId":1,"code":"1"}', "--out", "settings-page.png"]);
+  assert(r.code !== 7, "restricted: a name that merely contains 'settings' passes");
   // allowed shapes get past the boundary and fail later on the (absent) relay
   r = await run(["eval", '{"tabId":1,"code":"1"}', "--out", "shot.png"]);
   assert(r.code !== 7 && !/restricted/.test(r.stderr), "restricted: relative --out inside the outbox passes the boundary");
