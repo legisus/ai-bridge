@@ -15,7 +15,7 @@ const { chunk } = require("./chunk");
 const outbox = require("./outbox");
 const { cleanEnv, isInstructionPath } = require("./restricted");
 const { classifyIntent, DEFAULT_KEYWORDS } = require("./intent");
-const { SessionStore, parseRoute, MODELS } = require("./sessions");
+const { SessionStore, parseRoute, MODELS, DEFAULT_MODEL_KEY } = require("./sessions");
 const { redact } = require("./config");
 const agent = require("../agent");
 const journal = require("../journal");
@@ -344,7 +344,7 @@ class Manager {
       case "/new": {
         if (args.length < 1 || args.length > 2) return this.send(adapter, chatId, "usage: /new <name> [opus|fable|haiku]");
         try {
-          const row = this.sessions.create(owner, args[0], args[1] || "opus");
+          const row = this.sessions.create(owner, args[0], args[1] || DEFAULT_MODEL_KEY);
           this.log(`session ${row.id} (${row.name}) created by ${this.ownerKeyOf(row)}`);
           return this.send(adapter, chatId, `created session ${row.name} (${modelKey(row.model)}); it is now current. Plain text goes to it; /use agent to go back.`);
         } catch (e) {

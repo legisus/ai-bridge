@@ -27,4 +27,10 @@ assert(auth.CLAUDE_CODE_OAUTH_TOKEN === "o" && auth.ANTHROPIC_API_KEY === "k" &&
 assert(PLAYBOOK_ADDENDUM.includes('before any irreversible action the task did not already name, stop and end your report with "NEEDS APPROVAL: <one line>"'), "addendum: stop-before-send line");
 assert(PLAYBOOK_ADDENDUM.includes("to deliver a file, fetch it in the page with eval returning {base64} and --out <name>, or use pdf --out / screenshot --out; files in the current directory are sent to the user"), "addendum: outbox delivery line");
 
+
+// messenger credentials never reach a child, passthrough or not
+{
+  const env = cleanEnv({ PATH: "p", AI_BRIDGE_TELEGRAM_TOKEN: "t1", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "t2", ai_bridge_x_token: "t3", MGR: "m" }, ["AI_BRIDGE_TELEGRAM_TURO_TOKEN", "ai_bridge_x_token", "MGR"]);
+  assert(env.PATH === "p" && env.MGR === "m" && !("AI_BRIDGE_TELEGRAM_TOKEN" in env) && !("AI_BRIDGE_TELEGRAM_TURO_TOKEN" in env) && !("ai_bridge_x_token" in env), "cleanEnv: messenger token keys denied even via passthrough");
+}
 process.exit(failures ? 1 : 0);

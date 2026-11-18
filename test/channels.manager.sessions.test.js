@@ -33,10 +33,10 @@ pairing.save({ pending: [], approved: [
 
   // ---- 1) /new, /sessions, /use, replies, labelled acks, routing
   await say("/new Turo");
-  assert(last() === "created session turo (opus); it is now current. Plain text goes to it; /use agent to go back.", "new: created and current");
+  assert(last() === "created session turo (fable); it is now current. Plain text goes to it; /use agent to go back.", "new: created and current");
   await say("/new tz fable"); await say("/use turo");
   await say("/sessions");
-  assert(last() === "* turo (opus, 0 turns, active, never)\n  tz (fable, 0 turns, active, never)\ncurrent: turo", "sessions: list with current marker");
+  assert(last() === "* turo (fable, 0 turns, active, never)\n  tz (fable, 0 turns, active, never)\ncurrent: turo", "sessions: list with current marker");
   for (const [cmd, reply] of [["/new turo", "session name already used"], ["/new agent", "invalid session name: 1–24 chars of a-z 0-9 _ -"], ["/new x gpt", "unknown model; use opus, fable or haiku"], ["/new a b c", "usage: /new <name> [opus|fable|haiku]"], ["/use nope", "no session named nope; /sessions"], ["@nope hi", "no session named nope; /sessions"], ["@turo", "usage: @turo <message>"], ["/pause nope", "no session named nope; /sessions"]]) {
     await say(cmd); assert(last() === reply, `reply: ${cmd}`);
   }
@@ -124,7 +124,7 @@ pairing.save({ pending: [], approved: [
   await say("/help");
   assert(/\/new <name> \[opus\|fable\|haiku\]/.test(last()) && /@<name> <text>/.test(last()) && /\/stop \[name\]\|all/.test(last()), "help: lists session commands");
   await say("/sessions");
-  assert(/^  tz \(fable, 0 turns, paused, never\)\n  turo \(opus, 0 turns, paused, never\)\ncurrent: agent$/.test(last()), "sessions: paused rows in creation order (turo was recreated), current agent");
+  assert(/^  tz \(fable, 0 turns, paused, never\)\n  turo \(fable, 0 turns, paused, never\)\ncurrent: agent$/.test(last()), "sessions: paused rows in creation order (turo was recreated), current agent");
 
   await m.stop();
 

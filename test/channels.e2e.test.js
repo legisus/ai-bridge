@@ -125,7 +125,7 @@ const runAgent = (task, opts) => { runCalls.push({ task, opts }); return new Pro
   // ---- 4) sessions over Telegram: /new → labelled turn → /stop all
   m = build(); await m.start();
   push("/new turo"); await wait(250);
-  assert(msgs().pop().text.startsWith("created session turo (opus)"), "e2e: /new acknowledged");
+  assert(msgs().pop().text.startsWith("created session turo (fable)"), "e2e: /new acknowledged");
   push("what is on example.com"); await wait(250);
   assert(turnCalls.length === 1 && turnCalls[0].opts.resume === false && turnCalls[0].opts.text === "what is on example.com" && msgs().pop().text.startsWith("⏳ [turo] working on it"), "e2e: plain text became a session turn");
   releaseTurn({ text: "Example Domain" }); await wait(250);
