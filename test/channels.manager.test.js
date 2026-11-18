@@ -54,7 +54,7 @@ function fakeRunAgent() {
   return { fn, calls, finish, busy: () => pendingResolve !== null };
 }
 
-function build({ adapter, runAgent, config, stateFile, classify } = {}) {
+function build({ adapter, runAgent, config, stateFile, classify, processLooksLikeOurs, killProcessGroup } = {}) {
   const state = new ChannelState(stateFile || path.join(process.env.AI_BRIDGE_HOME, `state-${Math.random().toString(36).slice(2)}.json`));
   process.env.MGR_PASS = "yes"; process.env.AI_BRIDGE_TELEGRAM_TOKEN = TOKEN;
   const m = new Manager({
@@ -66,7 +66,7 @@ function build({ adapter, runAgent, config, stateFile, classify } = {}) {
     runModel: async ({ prompt }) => ({ result: classify ? await classify(prompt) : "read" }),
     bridgePing: async () => ({ ok: true, text: '{"pong":true,"version":"test"}' }),
     jobsTable: () => "job   mode\n toll  economy",
-    log: () => {}, now,
+    log: () => {}, now, processLooksLikeOurs, killProcessGroup,
   });
   return { m, state };
 }
@@ -377,6 +377,63 @@ function build({ adapter, runAgent, config, stateFile, classify } = {}) {
     assert(a.texts().some((t) => t.includes('"was done"') && /lost|not delivered/.test(t)), "recovery: done item → 'result lost' notice");
     assert(journal.readJournal({}).filter((r) => r.runId === "runD00000004").length === 1, "recovery: no duplicate journal record for a run that already has one");
     assert(state.queue().length === 0 && ra.calls.length === 0, "recovery: done item removed, nothing run");
+    await m.stop();
+  }
+
+  {
+    // recovery kills the orphaned process group of a session turn that was running when the daemon died
+    const { spawn } = require("child_process");
+    const orphan = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore", detached: true });
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover3.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "o1", item: { runId: "runO00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "orphaned turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runO00000001", "running"); seed.update("runO00000001", { pid: orphan.pid, pidStartedAt: new Date().toISOString() });
+    seed.accept({ accountKey: "fake:default", eventId: "o2", item: { runId: "runO00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "queued turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    const { m } = build({ adapter: a, runAgent: ra, stateFile });
+    await m.start(); await tick(150);
+    let alive = true; try { process.kill(orphan.pid, 0); } catch (e) { alive = e.code !== "ESRCH"; }
+    assert(!alive, "recovery: orphaned turn process killed before draining");
+    const rec = journal.readJournal({}).find((r) => r.runId === "runO00000001");
+    assert(rec && rec.verdict === "declined" && rec.mode === "session" && rec.session === "turo" && rec.sessionId === "abc" && rec.source === "channel:fake", "recovery: declined record keeps the session fields");
+    assert(a.texts().some((t) => /not replayed/.test(t)) && ra.calls.length === 1 && ra.calls[0].task === "queued turn", "recovery: orphan reported, queued item ran (owner not held)");
+    await m.stop();
+  }
+  {
+    // recovery: an orphan that cannot be stopped → item kept, owner held, queued session turns dropped.
+    // A real (own) child stands in for the orphan; the injected group killer is a no-op, so
+    // nothing outside this test is ever signalled and the child stays alive.
+    const { spawn } = require("child_process");
+    const stuck = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover4.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "h1", item: { runId: "runH00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "stuck turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runH00000001", "running"); seed.update("runH00000001", { pid: stuck.pid, pidStartedAt: new Date().toISOString() });
+    seed.accept({ accountKey: "fake:default", eventId: "h2", item: { runId: "runH00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "later turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.accept({ accountKey: "fake:default", eventId: "h3", item: { runId: "runH00000003", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "one-shot" } });
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    let signalled = 0;
+    const { m, state } = build({ adapter: a, runAgent: ra, stateFile, processLooksLikeOurs: () => true, killProcessGroup: () => { signalled++; } });
+    await m.start(); await tick(700);
+    assert(signalled === 1 && state.queue().some((q) => q.runId === "runH00000001" && q.status === "running" && q.pid === stuck.pid), "recovery held: unresolved orphan item kept for the next restart");
+    assert(a.texts().some((t) => /could not be stopped/.test(t)) && !state.queue().some((q) => q.runId === "runH00000002") && journal.readJournal({}).some((r) => r.runId === "runH00000002" && r.verdict === "declined" && r.mode === "session"), "recovery held: owner's queued session turn dropped with a declined session record");
+    assert(ra.calls.length === 1 && ra.calls[0].task === "one-shot", "recovery held: the owner's one-shot task still runs");
+    await m.stop();
+    stuck.kill("SIGKILL");
+  }
+  {
+    // recovery never signals pid 0/1 or a pid that is not ours, whatever the stored item says
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover5.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "g1", item: { runId: "runG00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "bad pid", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runG00000001", "running"); seed.update("runG00000001", { pid: 1 });
+    seed.accept({ accountKey: "fake:default", eventId: "g2", item: { runId: "runG00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "stranger", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runG00000002", "running"); seed.update("runG00000002", { pid: process.pid });   // alive, but "not ours"
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    let signalled = 0;
+    const { m, state } = build({ adapter: a, runAgent: ra, stateFile, processLooksLikeOurs: () => false, killProcessGroup: () => { signalled++; } });
+    await m.start(); await tick(100);
+    assert(signalled === 0 && state.queue().length === 0 && a.texts().filter((t) => /not replayed/.test(t)).length === 2, "recovery: pid 1 and a foreign pid are never signalled; items dropped as not replayed");
     await m.stop();
   }
 

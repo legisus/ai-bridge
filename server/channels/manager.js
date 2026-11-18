@@ -41,7 +41,8 @@ const rid = () => crypto.randomBytes(6).toString("hex");
 
 class Manager {
   constructor({ config, adapters, state, pairing = pairingStore, approvals, limiter, runAgent = agent.runAgent, runModel = agent.runModel,
-    bridgePing, jobsTable, log = () => {}, now = Date.now, journalApi = journal } = {}) {
+    bridgePing, jobsTable, log = () => {}, now = Date.now, journalApi = journal, processLooksLikeOurs = defaultProcessLooksLikeOurs,
+    killProcessGroup = defaultKillProcessGroup } = {}) {
     this.config = config || {};
     this.adapters = adapters || [];
     this.state = state || new ChannelState();
@@ -62,7 +63,12 @@ class Manager {
     this.lastProgressAt = 0;
     this.draining = false;
     this.stopped = false;
+    this.processLooksLikeOurs = processLooksLikeOurs;
+    this.killProcessGroup = killProcessGroup;
+    this.heldOwners = new Set();   // owner keys whose previous turn could not be stopped after a restart
   }
+
+  ownerKeyOf(item) { return `${item.channel}:${item.accountId || "default"}:${item.senderId}`; }
 
   adapterFor(channel) { return this.adapters.find((a) => a.id === channel); }
   cfgFor(adapter) { return this.config[adapter.id] || {}; }
@@ -101,19 +107,52 @@ class Manager {
   }
 
   // Items left running or awaiting approval by a previous daemon are never replayed.
+  // A session turn's child (own process group, so it outlived the daemon) is stopped
+  // first; if it cannot be confirmed gone the item stays for the next restart and the
+  // owner's queued session turns are dropped rather than run behind it.
   async recover() {
     for (const item of this.state.queue().filter((q) => q.status !== "queued")) {
       const adapter = this.adapterFor(item.channel);
-      if (item.status === "done") {
+      if (item.status === "done" || this.hasJournal(item.runId)) {
         // The run finished; delivery was interrupted. Its verdict is in the journal.
         if (adapter) await this.send(adapter, item.chatId, `restarted; the result of "${item.task}" was lost before delivery (not delivered); see /journal`);
       } else {
+        if (Number.isInteger(item.pid) && item.pid > 0 && !(await this.stopOrphan(item.pid))) {
+          const key = this.ownerKeyOf(item);
+          this.heldOwners.add(key);
+          this.log(`recovery: run ${item.runId} pid ${item.pid} still alive; holding ${key}'s queued session turns`);
+          if (adapter) await this.send(adapter, item.chatId, `restarted; a previous turn (run ${item.runId}) is still running and could not be stopped; your queued session messages were dropped — send them again later`);
+          continue;   // kept, with its pid, for the next restart
+        }
         this.journalDeclined(item, "daemon restarted while the task was running or awaiting approval; not replayed");
         if (adapter) await this.send(adapter, item.chatId, `restarted; "${item.task}" was not replayed, send it again if still wanted`);
       }
       this.state.remove((q) => q.runId === item.runId);
       this.log(`recovery: run ${item.runId} dropped (was ${item.status})`);
     }
+    for (const item of this.state.queue().filter((q) => q.status === "queued" && q.sessionId && this.heldOwners.has(this.ownerKeyOf(q)))) {
+      this.journalDeclined(item, "held: an earlier turn of yours could not be stopped after a restart");
+      this.state.remove((q) => q.runId === item.runId);
+      this.log(`recovery: run ${item.runId} dropped (owner held)`);
+    }
+  }
+
+  // Stop a leftover turn's process group the way an abort does (killGroup semantics);
+  // true when it is confirmed gone — or was never ours: a reused pid is left alone.
+  // pid 0/1/negative are never signalled (kill(-1) would reach every process of the user).
+  async stopOrphan(pid) {
+    if (!(Number.isInteger(pid) && pid > 1)) return true;
+    const alive = () => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+    if (!alive()) return true;
+    let ours = false;
+    try { ours = !!this.processLooksLikeOurs(pid); } catch { ours = false; }
+    if (!ours) return true;
+    try { this.killProcessGroup(pid); } catch {}
+    for (let i = 0; i < 10; i++) {
+      if (!alive()) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return !alive();
   }
 
   journalDeclined(item, feedback) { this.journalRun(item, "declined", feedback); }
@@ -127,9 +166,10 @@ class Manager {
     if (this.hasJournal(item.runId)) return;
     try {
       const rec = agent.journalRecord({ runId: item.runId, task: item.task, startedAt: item.acceptedAt || new Date().toISOString(), stages: [],
-        verdict: { verdict, feedback }, mode: "regular", evidence: "" });
+        verdict: { verdict, feedback }, mode: item.sessionId ? "session" : "regular", evidence: "" });
       rec.source = `channel:${item.channel}`;
       rec.feedback = feedback;
+      if (item.sessionId) { rec.session = item.sessionName; rec.sessionId = item.sessionId; }
       this.journal.appendJournal(rec);
     } catch (e) { this.log(`journal write failed: ${e.message}`); }
   }
@@ -404,6 +444,21 @@ class Manager {
     for (const s of skipped) await this.send(adapter, item.chatId, `skipped: ${s.name} (${s.reason})`);
     outbox.finish(dir, delivered, files);
   }
+}
+
+// Is this pid one of our model children (claude/node)? A pid can be reused after a
+// crash; a stranger is never signalled.
+// Same signal an abort sends (agent.js killGroup): the whole process group, then the
+// pid itself as a fallback. Guarded against pid ≤ 1 by the caller.
+function defaultKillProcessGroup(pid) {
+  if (!(Number.isInteger(pid) && pid > 1)) return;
+  try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
+}
+
+function defaultProcessLooksLikeOurs(pid) {
+  const { execFileSync } = require("child_process");
+  try { return /claude|node/i.test(execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { stdio: ["ignore", "pipe", "ignore"] }).toString()); }
+  catch { return false; }
 }
 
 async function defaultPing() {
