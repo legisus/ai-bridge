@@ -331,7 +331,7 @@ const { TOKEN, advanceClock, tick, fakeAdapter, fakeRunAgent, build } = require(
     const seed = new ChannelState(stateFile);
     seed.accept({ accountKey: "fake:default", eventId: "o1", item: { runId: "runO00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "orphaned turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
     seed.setStatus("runO00000001", "running"); seed.update("runO00000001", { pid: orphan.pid, pidStartedAt: new Date().toISOString() });
-    seed.accept({ accountKey: "fake:default", eventId: "o2", item: { runId: "runO00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "queued turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.accept({ accountKey: "fake:default", eventId: "o2", item: { runId: "runO00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "queued turn" } });   // a one-shot behind the orphan
     const a = fakeAdapter(); const ra = fakeRunAgent();
     const { m } = build({ adapter: a, runAgent: ra, stateFile });
     await m.start(); await tick(150);

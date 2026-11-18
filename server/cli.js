@@ -125,12 +125,7 @@ function confinedToOutbox(p) {
 // Names Claude Code (or the channel daemon) would read back as instructions or
 // configuration: a restricted run may never create them, even inside its outbox,
 // because a session directory is the cwd of every later turn.
-const INSTRUCTION_FILES = new Set(["claude.md", "claude.local.md", "agents.md", ".mcp.json", "settings.json", "settings.local.json", "leftover"]);
-function instructionPath(p) {
-  const parts = String(p).split(/[\\/]+/).filter(Boolean);
-  const base = (parts[parts.length - 1] || "").toLowerCase();
-  return base.startsWith(".") || INSTRUCTION_FILES.has(base) || parts.some((seg) => seg.toLowerCase() === ".claude");
-}
+const { isInstructionPath: instructionPath } = require("./channels/restricted");
 if (RESTRICTED) {
   for (const [flag, value] of [["--out", flags.out], ["--file", flags.file]]) {
     if (value && !confinedToOutbox(value)) {

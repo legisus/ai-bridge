@@ -30,9 +30,19 @@ function cleanEnv(src = process.env, extraKeys = []) {
   return out;
 }
 
+// Names Claude Code (or the channel daemon) would read back as instructions or
+// configuration. A restricted run may never create them, and a session directory
+// containing one is quarantined before the next turn.
+const INSTRUCTION_FILES = new Set(["claude.md", "claude.local.md", "agents.md", ".mcp.json", "settings.json", "settings.local.json", "leftover"]);
+function isInstructionPath(p) {
+  const parts = String(p).split(/[\\/]+/).filter(Boolean);
+  const base = (parts[parts.length - 1] || "").toLowerCase();
+  return base.startsWith(".") || INSTRUCTION_FILES.has(base) || parts.some((seg) => seg.toLowerCase() === ".claude");
+}
+
 const PLAYBOOK_ADDENDUM = `Additional rules for this run (it was requested from a messenger):
 - You are limited to browser commands; administrative bridge subcommands are unavailable.
 - before any irreversible action the task did not already name, stop and end your report with "NEEDS APPROVAL: <one line>" describing exactly what you are about to do; you will be re-run with an answer.
 - to deliver a file, fetch it in the page with eval returning {base64} and --out <name>, or use pdf --out / screenshot --out; files in the current directory are sent to the user. Do not use download.`;
 
-module.exports = { BROWSER_COMMANDS, KEEP_AUTH, allowedTools, cleanEnv, PLAYBOOK_ADDENDUM };
+module.exports = { BROWSER_COMMANDS, KEEP_AUTH, INSTRUCTION_FILES, allowedTools, cleanEnv, isInstructionPath, PLAYBOOK_ADDENDUM };

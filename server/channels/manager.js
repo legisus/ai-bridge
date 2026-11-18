@@ -5,13 +5,15 @@
 // evidence chunks, outbox files), commands, cancel, restart recovery, logging.
 // Adapters do transport only.
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { decide, RateLimiter } = require("./policy");
 const pairingStore = require("./pairing");
 const { Approvals, encode, decode, digestOf } = require("./approvals");
 const { ChannelState } = require("./state");
 const { chunk } = require("./chunk");
 const outbox = require("./outbox");
-const { cleanEnv } = require("./restricted");
+const { cleanEnv, isInstructionPath } = require("./restricted");
 const { classifyIntent, DEFAULT_KEYWORDS } = require("./intent");
 const { SessionStore, parseRoute, MODELS } = require("./sessions");
 const { redact } = require("./config");
@@ -47,6 +49,11 @@ Anything else is a task for the browser agent, or for your current session.`;
 
 const rid = () => crypto.randomBytes(6).toString("hex");
 const modelKey = (model) => Object.keys(MODELS).find((k) => MODELS[k] === model) || model;
+// "claude-haiku-5-5" → "haiku-5.5" (the ladder's label where one exists).
+const stageLabel = (model) => {
+  const rung = agent.OPS_LADDER.find((r) => r.model === model);
+  return rung ? rung.label : String(model).replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, "-$1.$2");
+};
 
 class Manager {
   constructor({ config, adapters, state, pairing = pairingStore, approvals, limiter, runAgent = agent.runAgent, runModel = agent.runModel,
@@ -522,6 +529,7 @@ class Manager {
         return;
       }
       setStatus("running");
+      if (item.sessionId) { await this.runSessionTurn(adapter, cfg, item, controller, setStatus); return; }
       // Gate 1: intent.
       const intent = await classifyIntent(item.task, {
         keywords: cfg.intentKeywords || DEFAULT_KEYWORDS,
@@ -574,6 +582,179 @@ class Manager {
       try { this.state.remove((q) => q.runId === item.runId); }
       catch (e) { this.log(`run ${item.runId}: could not remove from the queue: ${e.message}`); }
       this.current = null;
+    }
+  }
+
+  // ---- session turns -------------------------------------------------------------
+
+  // Entries of a session directory that Claude would read back as instructions.
+  instructionFilesIn(dir) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { return []; }
+    return names.filter((n) => n !== outbox.RESERVED_NAME && isInstructionPath(n)).sort();
+  }
+
+  // One inbound message to a session: context intent gate → re-check (authorization,
+  // row, generation, signal) → Claude turn → stop-before-send rounds → journal → done →
+  // labelled delivery of the reply and this turn's files. Called inside runOne's
+  // lifecycle block, so the queue item and `current` are cleaned up by runOne.
+  async runSessionTurn(adapter, cfg, item, controller, setStatus) {
+    const owner = { channel: item.channel, accountId: item.accountId, senderId: item.senderId, chatId: item.chatId };
+    const label = this.label(item);
+    const signal = controller.signal;
+    const say = (text) => this.send(adapter, item.chatId, text, { label });
+    // Status lines read "⏹ [turo] cancelled": emoji first, then the label.
+    const status = (emoji, text) => this.send(adapter, item.chatId, `${emoji} ${label.trim()} ${text}`);
+    const name = item.sessionName;
+    const dir = this.sessions.dirOf(item.sessionId);
+    const startedAt = item.acceptedAt || new Date().toISOString();
+    const stages = [];
+    const calls = [];
+    const declinedNow = [];
+
+    const writeJournal = (verdict, feedback, text) => {
+      if (this.hasJournal(item.runId)) return;
+      try {
+        const rec = agent.journalRecord({ runId: item.runId, task: item.task, startedAt, stages, verdict: { verdict, feedback }, mode: "session", evidence: text || "" });
+        rec.source = `channel:${item.channel}`;
+        rec.session = name; rec.sessionId = item.sessionId; rec.calls = calls.slice();
+        if (feedback) rec.feedback = feedback;
+        this.journal.appendJournal(rec);
+      } catch (e) { this.log(`journal write failed: ${e.message}`); }
+    };
+    // Why this turn may not (or no longer) run; null when it may.
+    const recheck = () => {
+      if (!this.authorized(adapter, item)) return "unpaired";
+      const row = this.sessions.get(owner, { id: item.sessionId });
+      if (!row || row.state !== "active" || row.gen !== item.sessionGen) return "paused";
+      if (signal.aborted) return "aborted";
+      return null;
+    };
+    const dropFor = async (why) => {
+      if (why === "aborted") { writeJournal("cancelled", "cancelled before the turn started"); await status("⏹", "cancelled"); return; }
+      const feedback = why === "unpaired" ? "sender no longer paired when the turn came up" : "session paused or stopped before the turn ran";
+      writeJournal("declined", feedback);
+      await status("🚫", why === "unpaired" ? "you are no longer paired" : "dropped — session paused or stopped");
+    };
+
+    if (this.heldOwners.has(this.ownerKeyOf(item))) {
+      writeJournal("declined", "held: an earlier turn of yours could not be stopped after a restart");
+      await status("🚫", "dropped — an earlier turn of yours could not be stopped after a restart");
+      return;
+    }
+    if (!this.sessions.get(owner, { id: item.sessionId })) return dropFor("paused");
+
+    // A file the model saved earlier must never become Claude's instructions now.
+    const bad = this.instructionFilesIn(dir);
+    if (bad.length) {
+      outbox.stash(dir, bad, path.join(dir, outbox.RESERVED_NAME, `quarantine-${item.runId}`));
+      this.log(`run ${item.runId}: instruction file(s) in session ${item.sessionId}: ${bad.join(", ")} — quarantined, turn refused`);
+      writeJournal("fail", `instruction file in the session directory: ${bad.join(", ")}`);
+      await status("❌", `refused: the session directory contained an instruction file (${bad.join(", ")}); moved to leftover/quarantine-${item.runId}`);
+      return;
+    }
+    const since = outbox.snapshot(dir);   // once; continuations add to the same turn
+
+    // Gate: intent, with the conversation's earlier messages as context.
+    const intent = await classifyIntent(item.task, {
+      keywords: cfg.intentKeywords || DEFAULT_KEYWORDS, context: item.context || [],
+      classify: async (prompt) => String((await this.runModel({ model: agent.MATCH_MODEL, prompt, allowedTools: [], timeoutMs: 60000, baseEnv: cleanEnv(process.env, cfg.envPassthrough) })).result || ""),
+    });
+    if (intent === "write") {
+      setStatus("awaiting-approval");
+      const decision = await this.ask(adapter, item, { kind: "intent", signal, label,
+        text: `This message looks like it will send, submit or change something:\n"${this.quote(item.task)}"\nApprove?` });
+      if (decision === "cancelled") { writeJournal("cancelled", "cancelled while awaiting approval"); await status("⏹", `cancelled — "${this.quote(item.task)}" was not run`); return; }
+      if (decision !== "approved") { writeJournal("declined", "message not approved"); await status("🚫", `declined — "${this.quote(item.task)}" was not run`); return; }
+      setStatus("running");
+    }
+
+    let why = recheck();
+    if (why) return dropFor(why);
+    const row = this.sessions.get(owner, { id: item.sessionId });
+    const resume = row.started;                // decided before the durable flag flips
+    if (!resume) this.sessions.markStarted(row.id);
+    const stage = stageLabel(row.model);
+    let verdict = null, feedback = "", text = "", errorText = null, lastWhat = null;
+    const timer = this.timers.setInterval(() => { status("…", "thinking").catch(() => {}); }, PROGRESS_EVERY_MS);
+    const spawn = async ({ turnText, authorized, resumeNow, retryFresh, stageName }) => {
+      const res = await this.runTurn({
+        model: row.model, text: turnText, claudeSessionId: row.claudeSessionId, resume: resumeNow, retryFresh, cwd: dir,
+        systemPrompt: agent.turnNote({ turn: row.turns + 1, authorized, declined: row.declined || [] }),
+        envPassthrough: cfg.envPassthrough, signal,
+        onSpawn: (pid) => this.state.update(item.runId, { pid, pidStartedAt: new Date().toISOString() }),
+      });
+      stages.push({ stage: stageName, ...res.usage });
+      calls.push(...(res.calls || []));
+      return res.text;
+    };
+    try {
+      text = await spawn({ turnText: item.task, authorized: null, resumeNow: resume, retryFresh: row.turns === 0, stageName: `turn:${stage}` });
+      let rounds = 0;
+      for (;;) {
+        const what = agent.lastNeedsApprovalLine(text);
+        if (!what) { verdict = "reply"; break; }
+        lastWhat = what;
+        if (rounds >= 3) { declinedNow.push(what); verdict = "declined"; feedback = `not approved within the limit: ${what}`; break; }
+        rounds++;
+        setStatus("awaiting-approval");
+        const decision = await this.ask(adapter, item, { kind: "step", signal, label, text: `Approval needed: ${what}`, digest: crypto.createHash("sha256").update(what).digest("hex") });
+        if (decision === "cancelled") { verdict = "cancelled"; feedback = "stopped by user; actions already performed were not undone"; break; }
+        if (decision !== "approved") { declinedNow.push(what); verdict = "declined"; feedback = `not approved: ${what}`; break; }
+        setStatus("running");
+        why = recheck();
+        if (why) { verdict = why === "aborted" ? "cancelled" : "declined"; feedback = why === "unpaired" ? "sender no longer paired before the continuation" : why === "aborted" ? "stopped by user" : "session paused or stopped before the continuation"; break; }
+        text = await spawn({ turnText: `approved: ${what}; proceed and report`, authorized: what, resumeNow: true, retryFresh: false, stageName: `turn:${stage}(approved)` });
+      }
+    } catch (e) {
+      if (signal.aborted || (e && e.name === "AbortError")) { verdict = "cancelled"; feedback = "stopped by user; actions already performed were not undone"; }
+      else if (/No conversation found with session ID/.test(String(e && e.message))) {
+        verdict = "fail"; feedback = "transcript missing";
+        errorText = `this session's conversation is no longer available (Claude keeps transcripts ~30 days); /stop ${name} and /new ${name} to start over`;
+      } else { verdict = "fail"; feedback = String(e && e.message); errorText = `error — ${feedback}`; this.log(`run ${item.runId} error: ${feedback}`); }
+    } finally {
+      this.timers.clearInterval(timer);
+      try { this.state.update(item.runId, { pid: null }); } catch {}
+    }
+
+    // Terminal: journal first, then the row, then `done`, then the user.
+    writeJournal(verdict, feedback, text);
+    if (verdict === "reply" || verdict === "declined") {
+      this.sessions.complete(item.sessionId, item.sessionGen, { declined: declinedNow, countTurn: true });
+    }
+    setStatus("done");
+    this.log(`run ${item.runId} [${name}] ${verdict}${feedback ? `: ${feedback}` : ""}`);
+    if (verdict === "reply") return this.deliverTurn(adapter, item, text, dir, since);
+    if (verdict === "cancelled") return status("⏹", "cancelled");
+    if (verdict === "declined") {
+      if (why === "unpaired") return status("🚫", "you are no longer paired");
+      if (why === "paused") return status("🚫", "dropped — session paused or stopped");
+      if (/within the limit/.test(feedback)) return status("⏹", `stopped: "${lastWhat}" was not approved within the limit`);
+      return status("🚫", `not approved: ${lastWhat}`);
+    }
+    await status("❌", errorText || `error — ${feedback}`);
+    if (!/no longer available/.test(errorText || "")) await say("reply /retry to send it again");
+  }
+
+  // The reply, then the files this turn produced (by the pre-turn snapshot). Undelivered
+  // ones move to leftover/<runId>/ and are reported once; the session dir is kept.
+  async deliverTurn(adapter, item, text, dir, since) {
+    const label = this.label(item);
+    await this.send(adapter, item.chatId, text, { label });
+    const { files, skipped } = outbox.collect(dir, { since, maxFileBytes: Math.min(45e6, adapter.capabilities.maxFileBytes || 45e6) });
+    const delivered = [];
+    const kept = [];
+    try {
+      for (const f of files) {
+        if (!adapter.capabilities.media || !adapter.sendFile) { kept.push({ name: f.name, reason: "this channel cannot receive files" }); continue; }
+        try { await adapter.sendFile(item.chatId, f, label + f.name); delivered.push(f.name); }
+        catch (e) { this.log(`file ${f.name} not delivered: ${e.message}`); kept.push({ name: f.name, reason: "send failed" }); }
+      }
+      for (const s of skipped) kept.push(s);
+    } finally { outbox.finish(dir, delivered, files, { keepDir: true }); }
+    if (kept.length) {
+      outbox.stash(dir, kept.map((k) => k.name), path.join(dir, outbox.RESERVED_NAME, item.runId));
+      await this.send(adapter, item.chatId, `kept ${kept.length} file(s) in leftover/${item.runId}: ${kept.map((k) => `${k.name} (${k.reason})`).join(", ")}`, { label });
     }
   }
 
