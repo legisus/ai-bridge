@@ -53,6 +53,8 @@ assert(rows[0].signature === "job:a" && rows[0].candidate === true && rows[0].ru
 assert(Math.abs(rows[0].costUsd - 0.7) < 1e-9 && rows[0].avgTokens === 1100, "summarize: totals + avg tokens");
 assert(rows[1].signature === "job:b" && rows[1].candidate === false, "summarize: single run is not a candidate");
 assert(rows[0].lastVerdict === "pass" && Date.parse(rows[0].lastRun) > Date.parse(iso(0.9)), "summarize: lastRun is the newest");
+const withSessions = recent.concat([{ runId: "s1", task: "turn", mode: "session", session: "turo", verdict: "reply", costUsd: 5, startedAt: iso(0.5), endedAt: iso(0.5), stages: [] }]);
+assert(J.summarize(withSessions).length === rows.length && J.summarize(withSessions).every((r) => !r.modes.session) && Math.abs(J.summarize(withSessions)[0].costUsd - 0.7) < 1e-9, "summarize: session records are ignored");
 const report = J.formatReport(rows, { days: 30 });
 assert(report.includes("* = economy-mode candidate") && /\*\s+4\s+75%/.test(report), "formatReport: marks candidate row");
 assert(J.formatReport([], { days: 7 }).includes("no agent runs"), "formatReport: empty");
