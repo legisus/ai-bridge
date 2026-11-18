@@ -24,9 +24,10 @@ const ACCOUNT_RE = /^[a-z0-9_-]{1,24}$/;
 const DEFAULT_MODEL_KEY = "fable";
 
 const envWord = (s) => String(s).toUpperCase().replace(/[^A-Z0-9]/g, "_");
-function envKeyFor(channel, accountId) {
-  return accountId === "default" ? `AI_BRIDGE_${envWord(channel)}_TOKEN` : `AI_BRIDGE_${envWord(channel)}_${envWord(accountId)}_TOKEN`;
-}
+// Account-specific key (AI_BRIDGE_TELEGRAM_TURO_TOKEN, …_DEFAULT_TOKEN) and the generic one
+// (AI_BRIDGE_TELEGRAM_TOKEN: the default bot, or the lone bot of the one-bot form).
+function envKeyFor(channel, accountId) { return `AI_BRIDGE_${envWord(channel)}_${envWord(accountId)}_TOKEN`; }
+function genericKeyFor(channel) { return `AI_BRIDGE_${envWord(channel)}_TOKEN`; }
 
 // Parse errors never echo the file's content: only the parser's position survives.
 function parseError(file, e) {
@@ -62,9 +63,14 @@ function loadConfig({ env = process.env, file = CONFIG_FILE } = {}) {
     const listForm = c.bots !== undefined;
     if (listForm && c.token !== undefined) throw new Error(`channel ${channel}: use either token or bots, not both`);
     if (listForm && !Array.isArray(c.bots)) throw new Error(`channel ${channel}: bots must be a list`);
+    if (listForm && c.bots.length === 0) throw new Error(`channel ${channel}: bots must not be empty`);
     const { bots: rawBots, token: flatToken, accountId: flatAccount, apiBase: flatApi, session: flatSession, model: flatModel, ...channelKeys } = c;
+    if (listForm && (flatSession !== undefined || flatModel !== undefined || flatAccount !== undefined)) {
+      throw new Error(`channel ${channel}: session, model and accountId belong on each bot entry when bots is used`);
+    }
     const defaults = normalizeShared({ ...DEFAULTS, ...channelKeys, ...(flatApi !== undefined ? { apiBase: flatApi } : {}) });   // apiBase is a per-channel default too
-    if (!POLICIES.includes(defaults.dmPolicy)) throw new Error(`channel ${channel}: dmPolicy must be one of ${POLICIES.join(", ")} (got "${defaults.dmPolicy}")`);
+    // Bad values are never echoed: a misplaced token would otherwise reach the console.
+    if (!POLICIES.includes(defaults.dmPolicy)) throw new Error(`channel ${channel}: dmPolicy must be one of ${POLICIES.join(", ")}`);
 
     const entries = listForm ? rawBots : [{ accountId: flatAccount, token: flatToken, apiBase: flatApi, session: flatSession, model: flatModel }];
     const bots = [];
@@ -78,20 +84,21 @@ function loadConfig({ env = process.env, file = CONFIG_FILE } = {}) {
       seenIds.add(accountId);
       const { session, model, ...botKeys } = b;
       const bot = normalizeShared({ ...defaults, ...botKeys, accountId });
-      if (!POLICIES.includes(bot.dmPolicy)) throw new Error(`channel ${channel}/${accountId}: dmPolicy must be one of ${POLICIES.join(", ")} (got "${bot.dmPolicy}")`);
-      // env overrides, before the token check (env-only credentials are fine)
+      if (!POLICIES.includes(bot.dmPolicy)) throw new Error(`channel ${channel}/${accountId}: dmPolicy must be one of ${POLICIES.join(", ")}`);
+      // env overrides, before the token check (env-only credentials are fine); the
+      // account-specific key wins over the generic one
       const specific = envKeyFor(channel, accountId);
-      const generic = envKeyFor(channel, "default");
-      const envTok = env[specific] || (!listForm || accountId === "default" ? env[generic] : undefined);
+      const generic = genericKeyFor(channel);
+      const genericApplies = !listForm || accountId === "default";
+      const envTok = env[specific] || (genericApplies ? env[generic] : undefined);
       if (envTok) bot.token = envTok;
-      const keyUsed = listForm ? specific : (env[specific] ? specific : generic);
-      if (envKeys.has(keyUsed) && envKeys.get(keyUsed) !== accountId) throw new Error(`channel ${channel}: env keys collide for accounts "${envKeys.get(keyUsed)}" and "${accountId}" (${keyUsed})`);
-      envKeys.set(keyUsed, accountId);
-      if (!bot.token) throw new Error(`channel ${channel}/${accountId}: no token in ${file} and ${specific} is not set`);
+      if (envKeys.has(specific) && envKeys.get(specific) !== accountId) throw new Error(`channel ${channel}: env keys collide for accounts "${envKeys.get(specific)}" and "${accountId}" (${specific})`);
+      envKeys.set(specific, accountId);
+      if (!bot.token) throw new Error(`channel ${channel}/${accountId}: no token in ${file} and ${genericApplies ? `${generic} / ` : ""}${specific} is not set`);
       bot.token = String(bot.token);
       bot.boundSession = null;
-      if (session !== undefined && session !== null && session !== "") {
-        const name = normalizeName(session);
+      if (session !== undefined && session !== null) {
+        const name = normalizeName(session);   // "" is invalid too: a binding, once written, is never silently dropped
         if (!name) throw new Error(`channel ${channel}/${accountId}: session "${session}" is not a valid session name`);
         const key = String(model === undefined || model === null || model === "" ? DEFAULT_MODEL_KEY : model).toLowerCase();
         if (!Object.prototype.hasOwnProperty.call(MODELS, key)) throw new Error(`channel ${channel}/${accountId}: model "${model}" is unknown; use ${Object.keys(MODELS).join(", ")}`);
@@ -133,4 +140,4 @@ function redact(text, config) {
   return s;
 }
 
-module.exports = { CONFIG_FILE, DEFAULTS, DEFAULT_MODEL_KEY, envKeyFor, loadConfig, redact };
+module.exports = { CONFIG_FILE, DEFAULTS, DEFAULT_MODEL_KEY, envKeyFor, genericKeyFor, loadConfig, redact };

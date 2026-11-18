@@ -80,6 +80,10 @@ assert(cfg.telegram.bots[0].token === "S:1", "one-bot form: the account-specific
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { bots: [{ accountId: "default" }, { accountId: "turo", session: "turo" }] } }), { mode: 0o600 });
 cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "D:0", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "T:1" } });
 assert(cfg.telegram.bots[0].token === "D:0" && cfg.telegram.bots[1].token === "T:1", "bots: env overrides apply before the token check (env-only credentials); generic → default only");
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_DEFAULT_TOKEN: "DT:1", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "T:1" } });
+assert(cfg.telegram.bots[0].token === "DT:1", "bots: AI_BRIDGE_TELEGRAM_DEFAULT_TOKEN reaches the default bot");
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "G:0", AI_BRIDGE_TELEGRAM_DEFAULT_TOKEN: "DT:2", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "T:1" } });
+assert(cfg.telegram.bots[0].token === "DT:2", "bots: the account-specific key wins over the generic one for the default bot too");
 err = null; try { loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "SAME", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "SAME" } }); } catch (e) { err = e; }
 assert(err && /same token/.test(err.message) && !/SAME/.test(err.message), "bots: duplicate tokens produced by overrides are rejected without echoing the token");
 for (const [name, body, re] of [
@@ -94,7 +98,17 @@ for (const [name, body, re] of [
   ["bad model", { telegram: { bots: [{ accountId: "a", token: "x", session: "s", model: "gpt" }] } }, /model "gpt"/],
   ["bad bot policy", { telegram: { bots: [{ accountId: "a", token: "x", dmPolicy: "yolo" }] } }, /dmPolicy/],
   ["bots not a list", { telegram: { bots: { accountId: "a", token: "x" } } }, /bots must be a list/],
+  ["empty bots", { telegram: { bots: [] } }, /bots must not be empty/],
+  ["channel-level session with bots", { telegram: { session: "x", bots: [{ accountId: "a", token: "x" }] } }, /belong on each bot entry/],
+  ["channel-level accountId with bots", { telegram: { accountId: "a", bots: [{ accountId: "a", token: "x" }] } }, /belong on each bot entry/],
+  ["empty session", { telegram: { bots: [{ accountId: "a", token: "x", session: "" }] } }, /session "" is not a valid session name/],
 ]) { fs.writeFileSync(CONFIG_FILE, JSON.stringify(body), { mode: 0o600 }); err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; } assert(err && re.test(err.message), `loadConfig: ${name} rejected`); }
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t", dmPolicy: TA } }), { mode: 0o600 });
+err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; }
+assert(err && /dmPolicy must be one of/.test(err.message) && !err.message.includes(TA), "loadConfig: a bad dmPolicy value is not echoed (it might be a misplaced token)");
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { bots: [{ accountId: "a", token: "x", dmPolicy: TB }] } }), { mode: 0o600 });
+err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; }
+assert(err && /telegram\/a/.test(err.message) && !err.message.includes(TB), "loadConfig: a bad per-bot dmPolicy value is not echoed either");
 fs.writeFileSync(CONFIG_FILE, `{"telegram":{"token":"${TA}"} x`, { mode: 0o600 });
 err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; }
 assert(err && /invalid JSON/.test(err.message) && /position \d+/.test(err.message) && !err.message.includes(TA), "loadConfig: malformed JSON reports a position, never the content");

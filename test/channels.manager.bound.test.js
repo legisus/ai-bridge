@@ -121,9 +121,27 @@ process.env.MGR_PASS2 = "yes2";
   assert(!prompt.text.includes(TOKEN) && !prompt.text.includes(TOKEN.slice(0, 8)) && /<red/.test(prompt.text), "redact: approval prompt body, redacted before quoting (the placeholder, not the token, is what the cut truncates)");
   await a0.emitAction({ actorId: "42", chatId: "42", messageId: 1, data: prompt.buttons[1].data }); await idle();
   assert(lastRec().task.includes("<redacted>") && !JSON.stringify(lastRec()).includes(TOKEN), "redact: journal task of a declined one-shot");
-  await say(a0, "read the page"); await until(() => ra.calls.length === 1);
-  ra.finish({ evidence: `EVIDENCE REPORT\nTask: t\nFinal state: used ${TOKEN}` }); await idle();
-  assert(lastRec().runId === ra.calls[0].opts.runId && lastRec().verdict === "pass" && lastRec().evidence.includes("<redacted>") && !JSON.stringify(lastRec()).includes(TOKEN) && lastRec().source === "channel:fake", "redact: a completed one-shot's journal record is written by the manager, redacted, before delivery");
+  await say(a0, `read the page about ${TOKEN}`); await until(() => ra.calls.length === 1);
+  assert(ra.calls[0].opts.noJournal === true, "one-shot: runAgent is told not to journal (the manager does)");
+  let journaledAtDelivery = null;
+  const origSend0 = a0.sendText.bind(a0);
+  a0.sendText = async (c, t) => { if (t.startsWith("✅ pass")) journaledAtDelivery = journal.readJournal({}).some((r) => r.runId === ra.calls[0].opts.runId); return origSend0(c, t); };
+  const longEvidence = "EVIDENCE REPORT\n" + "x".repeat(3995 - 16) + TOKEN + " tail";
+  ra.finish({ evidence: longEvidence, record: { runId: ra.calls[0].opts.runId, task: `read the page about ${TOKEN}`, signature: `auto:|read the page about ${TOKEN}`, mode: "regular", verdict: "pass", startedAt: "x", endedAt: "y", stages: [], costUsd: 0, domains: [], evidence: longEvidence.slice(0, 4000) } });
+  await idle();
+  a0.sendText = origSend0;
+  const rec1 = lastRec();
+  assert(journaledAtDelivery === true && rec1.runId === ra.calls[0].opts.runId && rec1.verdict === "pass" && rec1.source === "channel:fake", "redact: a completed one-shot's journal record is written by the manager before delivery");
+  assert(!JSON.stringify(rec1).includes(TOKEN) && !JSON.stringify(rec1).includes(TOKEN.slice(0, 5)) && /<red/.test(rec1.evidence) && rec1.signature.includes("<redacted>"), "redact: signature recomputed from the redacted task; evidence redacted before truncation");
+
+  // ---- bound /cancel does not depend on the session store
+  await say(a1, "c1"); await until(() => rt.calls.length === callsBefore + 3);
+  const origGet = sessions.get.bind(sessions); sessions.get = () => { throw new Error("channels-sessions.json unreadable: EACCES"); };
+  const curC = m.current;
+  await say(a1, "/cancel");
+  sessions.get = origGet;
+  assert(curC && curC.controller.signal.aborted === true && last() === "stopped; actions already performed were not undone", "bound: /cancel aborts the running turn even when the session store cannot be read");
+  rt.finish(null, Object.assign(new Error("cancelled"), { name: "AbortError" })); await idle();
 
   await m.stop();
   fs.rmSync(process.env.AI_BRIDGE_HOME, { recursive: true, force: true });

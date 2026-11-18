@@ -74,18 +74,18 @@ inbox", "reply to the first guest", "shorter" work as a conversation. There is
 no judge and no model ladder: you read the reply.
 
 ```
-/new turo              created session turo (opus); it is now current …
+/new turo              created session turo (fable); it is now current …
 open my turo inbox     ⏳ [turo] working on it (run 7f3a…)
                        [turo] Three unread messages: …
 /new mail haiku        a second session, on a cheaper model
 @turo reply to Ann     one message to turo without switching
 /use mail              plain text now goes to mail
-/sessions              * mail (haiku, 0 turns, active, never) / turo (opus, 2 turns, active, 3m ago)
+/sessions              * mail (haiku, 0 turns, active, never) / turo (fable, 2 turns, active, 3m ago)
 ```
 
 | Command | Does |
 |---|---|
-| `/new <name> [opus\|fable\|haiku]` | create a session (default model opus) and make it current |
+| `/new <name> [opus\|fable\|haiku]` | create a session (default model fable) and make it current |
 | `/sessions` | list your sessions; `*` marks the current one |
 | `/use <name>` / `/use agent` | where plain text goes: a session, or the one-shot agent |
 | `/pause [name]` | stop that session's running turn, drop its queued turns, refuse new ones until `/resume` |
@@ -118,10 +118,12 @@ to a session in `channels.json`:
 On a bound bot every plain message (even one starting with `@`) goes to that one
 conversation, which is created on your first message; replies are labelled as
 usual. `/pause`, `/resume`, `/stop` (start the conversation over), `/sessions`,
-`/retry`, `/cancel`, `/status`, `/journal`, `/help` work; `/new`, `/use`,
-`/stop all` and `@name` are refused with a one-line explanation. Each bot pairs
-separately (the code message says which conversation the bot is), and a sender
-paired on one bot has nothing on another until paired there. The session model
+`/retry`, `/cancel`, `/status`, `/journal`, `/help` work; `/new`, `/use` and
+`/stop all` are refused with a one-line explanation, and `@name` is not parsed
+there (text starting with `@` is sent as written). Where pairing is required it
+is per bot (the code message says which conversation the bot is), so a sender
+paired on one bot has nothing on another until paired there; an `allowFrom` or
+`open` policy inherited from the channel authorises a sender on every bot. The session model
 is `fable` unless the bot sets `"model"`; a row created earlier under the same
 name on another model is refused until you `/stop` it. The general bot (no
 `session`) keeps the full session commands.
@@ -329,9 +331,10 @@ unchanged. A built-in reverse connection is on the roadmap.
   one-shot tasks meanwhile.
 - **`this bot is bound to session turo: …`** — that bot is one conversation;
   use the general bot for `/new`, `/use` and `@name`.
-- **`accounts "a" and "b" have the same token` / `env keys collide`** — two
+- **`same token for accounts "a" and "b"` / `env keys collide`** — two
   entries in `bots` resolve to one credential or one environment key; fix the
-  `accountId`s or tokens.
+  `accountId`s or tokens. **`model needs a session`** — `model` only makes
+  sense on a bound bot.
 - **`channels-sessions.json is corrupt`** at start — the daemon refuses to run
   with a damaged sessions file rather than forget your sessions; fix the JSON or
   move the file aside.

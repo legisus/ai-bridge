@@ -376,21 +376,26 @@ class Manager {
   async handleBoundCommand(adapter, evt, owner, bound, cmd, args) {
     const chatId = evt.chatId;
     const say = async (t) => { await this.send(adapter, chatId, t); return true; };   // true = handled
-    const row = this.sessions.get(owner, { name: bound.name });
+    // The store is read only by the commands that need the row, so /cancel (and the
+    // shared commands) keep working when channels-sessions.json cannot be read.
+    const rowOf = () => this.sessions.get(owner, { name: bound.name });
     const onlyOne = `this bot only has the conversation "${bound.name}"`;
     const noRow = "no conversation yet; just send a message";
     const nameOk = args.length === 0 || (args.length === 1 && String(args[0]).toLowerCase() === bound.name);
+    let row;
     switch (cmd) {
       case "/new": case "/use": return say(this.boundRefusal(bound));
       case "/start": return say(this.boundRefusal(bound) + "\n" + HELP_BOUND);
       case "/help": return say(HELP_BOUND);
       case "/status": {
+        row = rowOf();
         const up = Math.round((this.now() - this.startedAt) / 1000);
         return say(`uptime: ${up}s\nqueue: ${this.state.queue().length}\ncurrent: ${this.currentLine(owner)}\nbound: ${bound.name} (${modelKey(bound.model)})\nconversation: ${row ? `${row.state}, ${row.turns} turns` : "none yet"}`);
       }
-      case "/sessions": return say(row ? `* ${row.name} (${modelKey(row.model)}, ${row.turns} turns, ${row.state}, ${this.ageLabel(row)})\ncurrent: ${row.name}` : noRow);
+      case "/sessions": { row = rowOf(); return say(row ? `* ${row.name} (${modelKey(row.model)}, ${row.turns} turns, ${row.state}, ${this.ageLabel(row)})\ncurrent: ${row.name}` : noRow); }
       case "/pause": {
         if (!nameOk) return say(onlyOne);
+        row = rowOf();
         if (!row) return say(noRow);
         this.sessions.pause(owner, row.id);
         const r = this.abortAndDrop(owner, row.id, `session ${row.name} paused`);
@@ -398,6 +403,7 @@ class Manager {
       }
       case "/resume": {
         if (!nameOk) return say(onlyOne);
+        row = rowOf();
         if (!row) return say(noRow);
         this.sessions.resume(owner, row.id);
         return say(`resumed ${row.name}`);
@@ -405,6 +411,7 @@ class Manager {
       case "/stop": {
         if (args[0] && String(args[0]).toLowerCase() === "all") return say(this.boundRefusal(bound));
         if (!nameOk) return say(onlyOne);
+        row = rowOf();
         if (!row) return say(noRow);
         this.sessions.stop(owner, row.id);
         this.abortAndDrop(owner, row.id, `session ${row.name} stopped`);
@@ -413,6 +420,7 @@ class Manager {
       }
       case "/retry": {
         const lastMsg = this.sessions.last(owner);
+        row = rowOf();
         if (!lastMsg || !row || lastMsg.sessionId !== row.id) return say("cannot retry: that message was not for this conversation; send a new message");
         if (row.model !== bound.model) return say(this.modelConflictLine(row.model, bound.model));
         if (row.state !== "active") return say(`session ${row.name} is paused; /resume`);
@@ -632,9 +640,11 @@ class Manager {
     const base = (report && report.record) || {};
     const v = (report && report.verdict) || { verdict: "fail", feedback: "no verdict" };
     const now = new Date().toISOString();
-    const rec = { ...base, runId: item.runId, task: this.red(item.task), mode: base.mode || (report && report.mode) || "regular",
+    const task = this.red(item.task);
+    const rec = { ...base, runId: item.runId, task, mode: base.mode || (report && report.mode) || "regular",
+      signature: journal.signatureOf({ job: base.job || null, task, domains: base.domains || [] }),   // never the raw-task signature
       startedAt: base.startedAt || item.acceptedAt || now, endedAt: base.endedAt || now, verdict: v.verdict, feedback: this.red(v.feedback || ""),
-      evidence: this.red(String((report && report.evidence) || base.evidence || "").slice(0, 4000)), source: `channel:${item.channel}` };
+      evidence: this.red(String((report && report.evidence) || base.evidence || "")).slice(0, 4000), source: `channel:${item.channel}` };   // redact, then cut
     if (!Array.isArray(rec.stages)) rec.stages = (report && report.stages) || [];
     try { this.journal.appendJournal(rec); } catch (e) { this.log(`journal write failed: ${e.message}`); }
   }
