@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-outbox-"));
-const { OUTBOX_DIR, createOutbox, collect, finish } = require("../server/channels/outbox.js");
+const { OUTBOX_DIR, createOutbox, collect, finish, snapshot, stash, RESERVED_NAME } = require("../server/channels/outbox.js");
 
 let failures = 0;
 const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}`); if (!cond) failures++; };
@@ -70,6 +70,35 @@ fs.unlinkSync(path.join(dir, "link.txt"));
   const r2 = collect(dir);
   finish(dir, r2.files.map((f) => f.name), r2.files);
   assert(!fs.existsSync(dir), "finish: dir removed when empty");
+}
+
+// per-turn collection on a persistent (session) directory
+{
+  const sdir = path.join(process.env.AI_BRIDGE_HOME, "sessions", "abc"); fs.mkdirSync(sdir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(sdir, "old.txt"), "old");
+  fs.mkdirSync(path.join(sdir, "leftover", "run1"), { recursive: true }); fs.writeFileSync(path.join(sdir, "leftover", "run1", "x"), "x");
+  const before = snapshot(sdir);
+  assert(before.size === 1 && before.get("old.txt").size === 3 && typeof before.get("old.txt").ino === "number" && typeof before.get("old.txt").mtimeMs === "number" && RESERVED_NAME === "leftover", "snapshot: names with ino/mtime/size, leftover excluded");
+  assert(snapshot(path.join(sdir, "nope")).size === 0, "snapshot: missing dir is an empty map");
+  fs.writeFileSync(path.join(sdir, "new.txt"), "new");
+  fs.writeFileSync(path.join(sdir, "leftover", "run1", "y"), "y");   // the reserved dir changed
+  {
+    const r = collect(sdir, { since: before });
+    assert(r.files.length === 1 && r.files[0].name === "new.txt" && r.skipped.length === 0, "collect since: only entries new since the snapshot; the leftover dir is neither collected nor reported");
+    finish(sdir, ["new.txt"], r.files, { keepDir: true });
+  }
+  {
+    const r = collect(sdir);
+    assert(r.files.length === 1 && r.files[0].name === "old.txt" && r.skipped.length === 0, "collect without since: leftover still excluded, old file collected");
+    finish(sdir, [], r.files, { keepDir: true });
+  }
+  fs.unlinkSync(path.join(sdir, "old.txt"));
+  finish(sdir, [], [], { keepDir: true });
+  assert(fs.existsSync(sdir), "finish keepDir: directory survives");
+  fs.writeFileSync(path.join(sdir, "left.txt"), "x");
+  const moved = stash(sdir, ["left.txt", "missing.txt", "leftover"], path.join(sdir, "leftover", "run9"));
+  assert(JSON.stringify(moved) === '["left.txt"]' && fs.readFileSync(path.join(sdir, "leftover", "run9", "left.txt"), "utf8") === "x" && !fs.existsSync(path.join(sdir, "left.txt")) && fs.existsSync(path.join(sdir, "leftover", "run1", "x")), "stash: moves undelivered files into leftover/<runId>; never moves the reserved dir itself");
+  assert((fs.statSync(path.join(sdir, "leftover", "run9")).mode & 0o777) === 0o700, "stash: destination created 0700");
 }
 
 fs.rmSync(process.env.AI_BRIDGE_HOME, { recursive: true, force: true });

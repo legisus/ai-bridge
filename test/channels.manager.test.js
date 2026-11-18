@@ -5,71 +5,14 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-manager-"));
-const { Manager } = require("../server/channels/manager.js");
 const { ChannelState } = require("../server/channels/state.js");
 const pairing = require("../server/channels/pairing.js");
-const { Approvals, encode } = require("../server/channels/approvals.js");
-const { RateLimiter } = require("../server/channels/policy.js");
+const { encode } = require("../server/channels/approvals.js");
 const journal = require("../server/journal.js");
 
 let failures = 0;
 const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}`); if (!cond) failures++; };
-const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
-
-const TOKEN = "tok-secret-1234";
-let clock = 1_700_000_000_000;
-const now = () => clock;
-
-function fakeAdapter({ buttons = true } = {}) {
-  const a = {
-    id: "fake", accountId: "default",
-    capabilities: { buttons, media: true, edit: true, textLimit: 4000, chunkMode: "text", maxFileBytes: 1e6 },
-    sent: [], started: false, offsets: null, inbound: null, action: null,
-    async start(onInbound, offsets) { a.started = true; a.inbound = onInbound; a.offsets = offsets; },
-    async stop() { a.started = false; },
-    onAction(h) { a.action = h; },
-    async sendText(chatId, text) { a.sent.push({ type: "text", chatId, text }); return { messageId: a.sent.length }; },
-    async sendButtons(chatId, text, buttons) { a.sent.push({ type: "buttons", chatId, text, buttons }); return { messageId: a.sent.length }; },
-    async editMessage(chatId, messageId, text, buttons) { a.sent.push({ type: "edit", chatId, messageId, text, buttons }); },
-    async sendFile(chatId, file, caption) { a.sent.push({ type: "file", chatId, name: file.name, bytes: fs.readFileSync(file.fd, "utf8"), caption }); return { messageId: a.sent.length }; },
-    emit(evt) { return a.inbound({ accountId: "default", chatType: "direct", ...evt }); },
-    emitAction(act) { return a.action({ ack: async () => { a.acks = (a.acks || 0) + 1; }, ...act }); },
-    texts() { return a.sent.filter((s) => s.type === "text").map((s) => s.text); },
-  };
-  return a;
-}
-
-function fakeRunAgent() {
-  const calls = [];
-  let pendingResolve = null;
-  const fn = (task, opts) => {
-    calls.push({ task, opts });
-    return new Promise((resolve) => { pendingResolve = resolve; });
-  };
-  const finish = (report) => {
-    const r = pendingResolve; pendingResolve = null;
-    const last = calls[calls.length - 1];
-    r({ verdict: { verdict: "pass", feedback: "done" }, evidence: "EVIDENCE REPORT\nTask: t\nFinal state: ok", stages: [], runId: last.opts.runId, record: {}, ...report });
-  };
-  return { fn, calls, finish, busy: () => pendingResolve !== null };
-}
-
-function build({ adapter, runAgent, config, stateFile, classify } = {}) {
-  const state = new ChannelState(stateFile || path.join(process.env.AI_BRIDGE_HOME, `state-${Math.random().toString(36).slice(2)}.json`));
-  process.env.MGR_PASS = "yes"; process.env.AI_BRIDGE_TELEGRAM_TOKEN = TOKEN;
-  const m = new Manager({
-    config: config || { fake: { token: TOKEN, dmPolicy: "pairing", allowFrom: [], codex: false, accountId: "default", envPassthrough: ["MGR_PASS"] } },
-    adapters: [adapter], state, pairing,
-    approvals: new Approvals({ now }),
-    limiter: new RateLimiter({ now }),
-    runAgent: runAgent.fn,
-    runModel: async ({ prompt }) => ({ result: classify ? await classify(prompt) : "read" }),
-    bridgePing: async () => ({ ok: true, text: '{"pong":true,"version":"test"}' }),
-    jobsTable: () => "job   mode\n toll  economy",
-    log: () => {}, now,
-  });
-  return { m, state };
-}
+const { TOKEN, advanceClock, tick, fakeAdapter, fakeRunAgent, build } = require("./helpers/manager-fakes.js");
 
 (async () => {
   // ---- 1) pairing: unknown sender gets one code message, then silence
@@ -269,14 +212,14 @@ function build({ adapter, runAgent, config, stateFile, classify } = {}) {
     assert(/queue: 0/.test(t[1]) && /uptime/.test(t[1]), "/status: uptime and queue");
     assert(t[2].includes("toll") && t[2].includes("economy"), "/jobs: table");
     assert(t[3].includes("/cancel") && t[3].includes("/approve <id> yes|no") && t[3].includes("/retry"), "/help: lists commands");
-    assert(t[4].split("\n").length === 3 && /^runs: \d+, pass rate: \d+%$/.test(t[4].split("\n")[0]) && /^cost: \$/.test(t[4].split("\n")[1]) && /^jobs: /.test(t[4].split("\n")[2]), "/journal: three-line summary");
+    assert(t[4].split("\n").length === 4 && /^runs: \d+, pass rate: \d+%$/.test(t[4].split("\n")[0]) && /^cost: \$/.test(t[4].split("\n")[1]) && /^jobs: /.test(t[4].split("\n")[2]) && /^session turns: \d+, \$\d+\.\d\d$/.test(t[4].split("\n")[3]), "/journal: four-line summary (session turns separate)");
     assert(/unknown command/.test(t[5]) && t[5].includes("/help"), "unknown command: points to /help");
 
     // rate limit: 25 quick tasks → 3 queued, rest refused by queue cap or rate limit; one notice
     for (let i = 0; i < 25; i++) await a.emit({ senderId: "43", chatId: "43", messageId: 100 + i, eventId: `r${i}`, text: `task ${i}` });
     const rl = a.sent.filter((s) => s.chatId === "43" && /rate limited/.test(s.text));
     assert(rl.length === 1, `rate limit: exactly one notice (got ${rl.length})`);
-    clock += 61000;
+    advanceClock(61000);
     await a.emit({ senderId: "43", chatId: "43", messageId: 200, eventId: "r200", text: "task later" });
     assert(a.sent.filter((s) => s.chatId === "43" && /queue full/.test(s.text)).length > 0 && !a.sent.slice(-1)[0].text.includes("rate limited"), "rate limit: window resets after 60 s");
     // oversized message
@@ -377,6 +320,84 @@ function build({ adapter, runAgent, config, stateFile, classify } = {}) {
     assert(a.texts().some((t) => t.includes('"was done"') && /lost|not delivered/.test(t)), "recovery: done item → 'result lost' notice");
     assert(journal.readJournal({}).filter((r) => r.runId === "runD00000004").length === 1, "recovery: no duplicate journal record for a run that already has one");
     assert(state.queue().length === 0 && ra.calls.length === 0, "recovery: done item removed, nothing run");
+    await m.stop();
+  }
+
+  {
+    // recovery kills the orphaned process group of a session turn that was running when the daemon died
+    const { spawn } = require("child_process");
+    const orphan = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore", detached: true });
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover3.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "o1", item: { runId: "runO00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "orphaned turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runO00000001", "running"); seed.update("runO00000001", { pid: orphan.pid, pidStartedAt: new Date().toISOString() });
+    seed.accept({ accountKey: "fake:default", eventId: "o2", item: { runId: "runO00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "queued turn" } });   // a one-shot behind the orphan
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    const { m } = build({ adapter: a, runAgent: ra, stateFile });
+    await m.start(); await tick(150);
+    let alive = true; try { process.kill(orphan.pid, 0); } catch (e) { alive = e.code !== "ESRCH"; }
+    assert(!alive, "recovery: orphaned turn process killed before draining");
+    const rec = journal.readJournal({}).find((r) => r.runId === "runO00000001");
+    assert(rec && rec.verdict === "declined" && rec.mode === "session" && rec.session === "turo" && rec.sessionId === "abc" && rec.source === "channel:fake", "recovery: declined record keeps the session fields");
+    assert(a.texts().some((t) => /not replayed/.test(t)) && ra.calls.length === 1 && ra.calls[0].task === "queued turn", "recovery: orphan reported, queued item ran (owner not held)");
+    await m.stop();
+  }
+  {
+    // recovery: an orphan that cannot be stopped → item kept, owner held, queued session turns dropped.
+    // A real (own) child stands in for the orphan; the injected group killer is a no-op, so
+    // nothing outside this test is ever signalled and the child stays alive.
+    const { spawn } = require("child_process");
+    const stuck = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover4.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "h1", item: { runId: "runH00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "stuck turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runH00000001", "running"); seed.update("runH00000001", { pid: stuck.pid, pidStartedAt: new Date().toISOString() });
+    seed.accept({ accountKey: "fake:default", eventId: "h2", item: { runId: "runH00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "later turn", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.accept({ accountKey: "fake:default", eventId: "h3", item: { runId: "runH00000003", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "one-shot" } });
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    let signalled = 0;
+    const { m, state } = build({ adapter: a, runAgent: ra, stateFile, processLooksLikeOurs: () => true, killProcessGroup: () => { signalled++; } });
+    await m.start(); await tick(700);
+    assert(signalled === 1 && state.queue().some((q) => q.runId === "runH00000001" && q.status === "running" && q.pid === stuck.pid), "recovery held: unresolved orphan item kept for the next restart");
+    assert(a.texts().some((t) => /could not be stopped/.test(t)) && !state.queue().some((q) => q.runId === "runH00000002") && journal.readJournal({}).some((r) => r.runId === "runH00000002" && r.verdict === "declined" && r.mode === "session"), "recovery held: owner's queued session turn dropped with a declined session record");
+    assert(ra.calls.length === 1 && ra.calls[0].task === "one-shot", "recovery held: the owner's one-shot task still runs");
+    await m.stop();
+    stuck.kill("SIGKILL");
+  }
+  {
+    // recovery never signals pid 0/1, the daemon itself, or a pid whose start time does not match the record
+    const { spawn } = require("child_process");
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover5.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "g1", item: { runId: "runG00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "bad pid", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runG00000001", "running"); seed.update("runG00000001", { pid: 1, pidStartedAt: new Date().toISOString() });
+    seed.accept({ accountKey: "fake:default", eventId: "g2", item: { runId: "runG00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "self", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runG00000002", "running"); seed.update("runG00000002", { pid: process.pid, pidStartedAt: new Date().toISOString() });   // the daemon's own pid, recycled
+    const reused = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    seed.accept({ accountKey: "fake:default", eventId: "g3", item: { runId: "runG00000003", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "reused pid", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runG00000003", "running"); seed.update("runG00000003", { pid: reused.pid, pidStartedAt: new Date(Date.now() - 86400e3).toISOString() });   // a node process, but started a day after the record says
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    let signalled = 0;
+    const { m, state } = build({ adapter: a, runAgent: ra, stateFile, killProcessGroup: (pid) => { signalled++; } });   // real identity check, counting killer
+    await m.start(); await tick(300);
+    let reusedAlive = true; try { process.kill(reused.pid, 0); } catch (e) { reusedAlive = e.code !== "ESRCH"; }
+    assert(signalled === 0 && reusedAlive && state.queue().length === 0 && a.texts().filter((t) => /not replayed/.test(t)).length === 3, "recovery: pid 1, the daemon's own pid and a start-time mismatch are never signalled; items dropped as not replayed");
+    reused.kill("SIGKILL");
+    await m.stop();
+  }
+  {
+    // recovery: a matching start time (real check) → the group killer is invoked
+    const { spawn } = require("child_process");
+    const own = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover6.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "k1", item: { runId: "runK00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "ours", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runK00000001", "running"); seed.update("runK00000001", { pid: own.pid, pidStartedAt: new Date().toISOString() });
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    const seen = [];
+    const { m } = build({ adapter: a, runAgent: ra, stateFile, killProcessGroup: (pid) => { seen.push(pid); own.kill("SIGKILL"); } });
+    await m.start(); await tick(300);
+    assert(seen.length === 1 && seen[0] === own.pid, "recovery: our own child with a matching start time is signalled exactly once");
     await m.stop();
   }
 

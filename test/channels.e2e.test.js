@@ -9,6 +9,7 @@ const path = require("path");
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-e2e-"));
 const { Manager } = require("../server/channels/manager.js");
 const { ChannelState } = require("../server/channels/state.js");
+const { SessionStore } = require("../server/channels/sessions.js");
 const { loadConfig } = require("../server/channels/config.js");
 const makeTelegram = require("../server/channels/telegram.js");
 const pairing = require("../server/channels/pairing.js");
@@ -49,6 +50,11 @@ const push = (text) => pending.push({ update_id: nextUpdateId++, message: { mess
 const tap = (data, messageId) => pending.push({ update_id: nextUpdateId++, callback_query: { id: `cb${nextUpdateId}`, from: user, message: { message_id: messageId, chat: { id: 42, type: "private" } }, data } });
 const msgs = () => requests.filter((r) => r.method === "sendMessage").map((r) => r.body);
 
+// ---- fake runTurn (sessions)
+const turnCalls = [];
+let releaseTurn = null;
+const runTurn = (opts) => { turnCalls.push({ opts }); return new Promise((resolve) => { releaseTurn = (extra) => resolve({ text: "ok", sessionId: opts.claudeSessionId, usage: { input: 1, output: 1, costUsd: 0.01 }, freshStart: false, calls: ["c1"], ...extra }); }); };
+
 // ---- fake runAgent
 const runCalls = [];
 let release = null;
@@ -61,7 +67,9 @@ const runAgent = (task, opts) => { runCalls.push({ task, opts }); return new Pro
   fs.writeFileSync(cfgFile, JSON.stringify({ telegram: { token: TOKEN, apiBase, allowFrom: ["42"] } }), { mode: 0o600 });
   const config = loadConfig({ env: {} });
   const stateFile = path.join(process.env.AI_BRIDGE_HOME, "channels-state.json");
+  const sessionsFile = path.join(process.env.AI_BRIDGE_HOME, "channels-sessions.json");
   const build = () => new Manager({ config, adapters: [makeTelegram(config.telegram, { log: () => {} })], state: new ChannelState(stateFile), pairing,
+    sessions: new SessionStore(sessionsFile, { dir: path.join(process.env.AI_BRIDGE_HOME, "sessions") }), runTurn,
     runAgent, runModel: async () => ({ result: "read" }), bridgePing: async () => ({ ok: true, text: "{}" }), log: () => {} });
 
   // ---- 1) read task → working → pass + evidence + document
@@ -112,6 +120,18 @@ const runAgent = (task, opts) => { runCalls.push({ task, opts }); return new Pro
   release();
   await wait(250);
   assert(new ChannelState(stateFile).queue().length === 0, "e2e: queue empty after the run");
+  await m.stop();
+
+  // ---- 4) sessions over Telegram: /new → labelled turn → /stop all
+  m = build(); await m.start();
+  push("/new turo"); await wait(250);
+  assert(msgs().pop().text.startsWith("created session turo (opus)"), "e2e: /new acknowledged");
+  push("what is on example.com"); await wait(250);
+  assert(turnCalls.length === 1 && turnCalls[0].opts.resume === false && turnCalls[0].opts.text === "what is on example.com" && msgs().pop().text.startsWith("⏳ [turo] working on it"), "e2e: plain text became a session turn");
+  releaseTurn({ text: "Example Domain" }); await wait(250);
+  assert(msgs().pop().text === "[turo] Example Domain", "e2e: labelled reply via Telegram");
+  push("/stop all"); await wait(250);
+  assert(/^stopped: 1 sessions paused, nothing running, 0 queued dropped; current target is agent/.test(msgs().pop().text), "e2e: /stop all");
   await m.stop();
 
   server.close();

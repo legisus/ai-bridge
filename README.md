@@ -248,8 +248,11 @@ recipes ask every time, and the agent stops with `NEEDS APPROVAL` before any
 irreversible action it was not told to take. Messenger-originated runs are
 **restricted**: browser commands only, no admin subcommands, no Codex rung, a
 scrubbed child environment, no recipe learning. Unknown senders get a pairing
-code and nothing else. Details, the two-machine (server + laptop) recipe, and
-troubleshooting: **[docs/CHANNELS.md](docs/CHANNELS.md)**.
+code and nothing else. `/new turo` opens a **session**: a named conversation
+that remembers your earlier messages, with `/use`, `/pause`, `/resume`,
+`/stop [name|all]` and `@turo …` to keep several jobs going and switch between
+them from one chat (turns still run one at a time). Details, the two-machine (server + laptop) recipe, and troubleshooting:
+**[docs/CHANNELS.md](docs/CHANNELS.md)**.
 
 ## Concurrency
 

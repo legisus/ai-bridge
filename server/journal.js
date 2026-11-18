@@ -110,6 +110,7 @@ function readJournal({ days } = {}) {
 function summarize(records, { minPasses = CANDIDATE_MIN_PASSES } = {}) {
   const groups = new Map();
   for (const r of records) {
+    if (r.mode === "session") continue;   // conversation turns are not judged runs
     const key = r.signature || signatureOf(r);
     if (!groups.has(key)) {
       groups.set(key, { signature: key, job: r.job || null, runs: 0, passes: 0, costUsd: 0,

@@ -60,5 +60,16 @@ assert(st.queue().length === 1 && st.queue()[0].runId === "r3", "remove: others 
   assert(!fs.readdirSync(path.dirname(file)).some((n) => n.includes(".tmp-")), "crash: no tmp leftovers");
 }
 
+// update: patch any field but status
+{
+  st.accept({ accountKey: "a", eventId: "p1", item: { runId: "runP0000001", channel: "fake", accountId: "default", chatId: "1", senderId: "1", task: "t" } });
+  st.update("runP0000001", { pid: 4242, sessionId: "abc" });
+  assert(new ChannelState(st.file).queue().find((q) => q.runId === "runP0000001").pid === 4242 && st.queue().find((q) => q.runId === "runP0000001").sessionId === "abc", "update: patch persisted");
+  let e = null; try { st.update("runP0000001", { status: "done" }); } catch (err) { e = err; }
+  assert(e && /setStatus/.test(e.message) && st.queue().find((q) => q.runId === "runP0000001").status === "queued", "update: status goes through setStatus");
+  st.update("nope", { pid: 1 });
+  assert(st.queue().length === st.queue().length, "update: unknown run id is a no-op");
+}
+
 fs.rmSync(process.env.AI_BRIDGE_HOME, { recursive: true, force: true });
 process.exit(failures ? 1 : 0);

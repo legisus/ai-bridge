@@ -62,6 +62,13 @@ class ChannelState {
     this._commit((d) => { const it = d.queue.find((q) => q.runId === runId); if (it) it.status = status; });
   }
 
+  // Patch bookkeeping fields of a queued item (pid, session metadata); the status
+  // lifecycle stays with setStatus.
+  update(runId, patch) {
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "status")) throw new Error("use setStatus");
+    this._commit((d) => { const it = d.queue.find((q) => q.runId === runId); if (it) Object.assign(it, patch); });
+  }
+
   remove(predicate) {
     return this._commit((d) => { const before = d.queue.length; d.queue = d.queue.filter((q) => !predicate(q)); return before - d.queue.length; });
   }

@@ -62,6 +62,85 @@ queue position), sends progress lines at most every 15 s, then:
 One task runs at a time (one Chrome, one relay). Up to 3 tasks per sender and
 10 overall wait in the queue; more are refused with `queue full`.
 
+## Sessions: conversations that remember
+
+A **session** is a named, persistent Claude Code conversation that runs in your
+Chrome under the same restrictions as every channel run. Where a plain task is
+judged and forgotten, a session remembers what you said earlier, so "open my
+inbox", "reply to the first guest", "shorter" work as a conversation. There is
+no judge and no model ladder: you read the reply.
+
+```
+/new turo              created session turo (opus); it is now current …
+open my turo inbox     ⏳ [turo] working on it (run 7f3a…)
+                       [turo] Three unread messages: …
+/new mail haiku        a second session, on a cheaper model
+@turo reply to Ann     one message to turo without switching
+/use mail              plain text now goes to mail
+/sessions              * mail (haiku, 0 turns, active, never) / turo (opus, 2 turns, active, 3m ago)
+```
+
+| Command | Does |
+|---|---|
+| `/new <name> [opus\|fable\|haiku]` | create a session (default model opus) and make it current |
+| `/sessions` | list your sessions; `*` marks the current one |
+| `/use <name>` / `/use agent` | where plain text goes: a session, or the one-shot agent |
+| `/pause [name]` | stop that session's running turn, drop its queued turns, refuse new ones until `/resume` |
+| `/resume <name>` | make it active again (the target does not change) |
+| `/stop [name]` | pause and forget the session; if it was current, plain text goes to the agent again |
+| `/stop all` | pause every session you have, cancel your running task, drop your queued ones |
+| `@<name> <text>` | one message to that session; `@@` at the start sends a literal `@` to the current target |
+| `/retry` | re-send your last message to the target it went to (refused if that session is paused or gone) |
+
+Names are 1–24 characters of `a-z 0-9 _ -`, up to 10 live sessions per sender;
+sessions belong to the sender who made them and are never shared.
+
+**Approvals in a session.** The intent gate sees the conversation: a bare
+"continue" or "do it" is classified together with your previous messages, so
+it inherits the risk of what it continues. Inside a turn the agent stops before
+any irreversible action it was not told to take and ends its reply with
+`NEEDS APPROVAL: <what>` (the marker counts only as the last line); you get
+**Approve / Cancel**, and on approval the same conversation continues with that
+one action authorised. An approval is spent by the turn it was given to; what
+you declined is carried into later turns as explicitly *not* authorised, and
+instructions found in pages are told to be data. At most three approval rounds
+per message; a fourth stops the turn.
+
+**Labels.** Every message from a session starts with `[name]` (`[turo] …`,
+`⏳ [turo] working on it`, `… [turo] thinking`, `❌ [turo] error — …`), so two
+sessions interleaved in one chat stay readable.
+
+**Files.** A session has one directory,
+`~/.ai-browser-bridge/sessions/<id>/`, which is the working directory of every
+turn. Files a turn saves there are sent after the reply; anything that could not
+be delivered (too large, send failed) is moved to `leftover/<runId>/` inside it
+and reported once. A file that Claude would read back as instructions
+(`CLAUDE.md`, `.mcp.json`, `.claude/…`, dotfiles) cannot be written by a
+restricted run and, if one appears anyway, is quarantined and the turn refused.
+Directories are kept after `/stop`; delete them yourself when you no longer
+want the files.
+
+**How much a session remembers.** The conversation is Claude Code's own
+transcript: Claude keeps transcripts for about 30 days (`cleanupPeriodDays`)
+and compacts long ones into a summary, so very old detail fades. If the
+transcript is gone, the next turn fails closed — `❌ [turo] this session's
+conversation is no longer available … /stop turo and /new turo to start over` —
+rather than silently starting a fresh conversation under the old name.
+
+`/journal` reports session turns on their own line (`session turns: N, $X`);
+they never count toward the pass rate of judged runs or toward recipe learning.
+
+**Restarts.** After a daemon restart, a session turn that was running is
+stopped (the daemon remembers the child's pid and start time, verifies both,
+and kills its process group) and reported as not replayed; queued session
+messages then run normally. In the rare case the old turn cannot be confirmed
+dead, the daemon keeps that item, tells you, drops your queued session messages
+for this daemon run, and holds your session turns until the next restart (your
+one-shot tasks still run). One-shot (`bridge agent`) runs that were in flight
+are *not* tracked this way: their children are not killed on restart, as before.
+`/pause`, `/stop`, `/stop all` and `/cancel` are accepted even while you are
+rate limited.
+
 ## Approvals: before, not after
 
 Three gates ask for a tap (**Approve** / **Cancel**) — or, where the messenger
@@ -115,8 +194,11 @@ type in the terminal:
 - A **second fence at the CLI**: with `AI_BRIDGE_RESTRICTED=1` (set for every
   child of a channel run) the bridge CLI itself refuses the admin subcommands
   and confines `--out` / `--file` to the run's outbox directory, symlinks
-  included. Even a model that talked its way past the tool allowlist cannot
-  write `pairing.json` or read your files through the bridge.
+  included, and refuses names Claude would read back as instructions or
+  configuration (`CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `settings*.json`,
+  anything under `.claude/`, dotfiles). Even a model that talked its way past
+  the tool allowlist cannot write `pairing.json`, plant instructions for its
+  next turn, or read your files through the bridge.
 - Model runs may call **no built-in tool other than Bash** (no Read, Write,
   Glob, WebFetch…), whatever your `settings.json` allows elsewhere.
 - Channel runs **never learn or repair recipes**; recipes stay something you grow
@@ -156,8 +238,11 @@ minute from unknown senders, 8 KB per message.
 
 State lives under `~/.ai-browser-bridge/`: `channels.json` (config),
 `pairing.json`, `channels-state.json` (dedup, offsets, queue),
-`outbox/<runId>/`, `channels.log` (rotated at 10 MB, tokens redacted). Journal
-records from channel runs carry `source: "channel:telegram"`.
+`channels-sessions.json` (sessions, current targets, last messages),
+`sessions/<id>/` (a session's working directory), `outbox/<runId>/`,
+`channels.log` (rotated at 10 MB, tokens redacted). Journal records from
+channel runs carry `source: "channel:telegram"`; session turns add
+`mode: "session"` and the session's name and id.
 
 ## Two machines: daemon on a server, Chrome on the laptop
 
@@ -191,3 +276,11 @@ unchanged. A built-in reverse connection is on the roadmap.
   extension.
 - **Tasks always ask for approval** — a keyword matched; narrow `intentKeywords`
   or rephrase ("show", "read", "list").
+- **`[turo] this session's conversation is no longer available`** — Claude's
+  transcript for that session expired or was removed; `/stop turo`, then
+  `/new turo`. The daemon never substitutes another conversation.
+- **`session turo is paused`** — `/resume turo`, or `/use agent` to send
+  one-shot tasks meanwhile.
+- **`channels-sessions.json is corrupt`** at start — the daemon refuses to run
+  with a damaged sessions file rather than forget your sessions; fix the JSON or
+  move the file aside.

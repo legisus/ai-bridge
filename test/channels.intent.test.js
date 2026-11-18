@@ -24,5 +24,11 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
 
   const p = intentPrompt("open the dashboard");
   assert(p.includes("open the dashboard") && /\bread\b/.test(p) && /\bwrite\b/.test(p), "intentPrompt: contains the task and asks for read or write");
+  const pc = intentPrompt("continue", { context: ["open the turo inbox", "draft a reply to Ann"] });
+  assert(/EARLIER MESSAGES IN THIS CONVERSATION:\n1\. open the turo inbox\n2\. draft a reply to Ann/.test(pc) && /NEW MESSAGE:\ncontinue/.test(pc) && /continuation/i.test(pc) && /answer write/i.test(pc), "intentPrompt: lists the context and classifies the new message against it");
+  assert(!/NEW MESSAGE/.test(intentPrompt("x")) && !/NEW MESSAGE/.test(intentPrompt("x", { context: [] })), "intentPrompt: no context section without context");
+  let got = null;
+  await classifyIntent("continue", { classify: async (prompt) => { got = prompt; return "write"; }, context: ["send it"] });
+  assert(got && /1\. send it/.test(got), "classifyIntent: context reaches the classifier");
   process.exit(failures ? 1 : 0);
 })();
