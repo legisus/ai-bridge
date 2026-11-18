@@ -5,71 +5,14 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-manager-"));
-const { Manager } = require("../server/channels/manager.js");
 const { ChannelState } = require("../server/channels/state.js");
 const pairing = require("../server/channels/pairing.js");
-const { Approvals, encode } = require("../server/channels/approvals.js");
-const { RateLimiter } = require("../server/channels/policy.js");
+const { encode } = require("../server/channels/approvals.js");
 const journal = require("../server/journal.js");
 
 let failures = 0;
 const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}`); if (!cond) failures++; };
-const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
-
-const TOKEN = "tok-secret-1234";
-let clock = 1_700_000_000_000;
-const now = () => clock;
-
-function fakeAdapter({ buttons = true } = {}) {
-  const a = {
-    id: "fake", accountId: "default",
-    capabilities: { buttons, media: true, edit: true, textLimit: 4000, chunkMode: "text", maxFileBytes: 1e6 },
-    sent: [], started: false, offsets: null, inbound: null, action: null,
-    async start(onInbound, offsets) { a.started = true; a.inbound = onInbound; a.offsets = offsets; },
-    async stop() { a.started = false; },
-    onAction(h) { a.action = h; },
-    async sendText(chatId, text) { a.sent.push({ type: "text", chatId, text }); return { messageId: a.sent.length }; },
-    async sendButtons(chatId, text, buttons) { a.sent.push({ type: "buttons", chatId, text, buttons }); return { messageId: a.sent.length }; },
-    async editMessage(chatId, messageId, text, buttons) { a.sent.push({ type: "edit", chatId, messageId, text, buttons }); },
-    async sendFile(chatId, file, caption) { a.sent.push({ type: "file", chatId, name: file.name, bytes: fs.readFileSync(file.fd, "utf8"), caption }); return { messageId: a.sent.length }; },
-    emit(evt) { return a.inbound({ accountId: "default", chatType: "direct", ...evt }); },
-    emitAction(act) { return a.action({ ack: async () => { a.acks = (a.acks || 0) + 1; }, ...act }); },
-    texts() { return a.sent.filter((s) => s.type === "text").map((s) => s.text); },
-  };
-  return a;
-}
-
-function fakeRunAgent() {
-  const calls = [];
-  let pendingResolve = null;
-  const fn = (task, opts) => {
-    calls.push({ task, opts });
-    return new Promise((resolve) => { pendingResolve = resolve; });
-  };
-  const finish = (report) => {
-    const r = pendingResolve; pendingResolve = null;
-    const last = calls[calls.length - 1];
-    r({ verdict: { verdict: "pass", feedback: "done" }, evidence: "EVIDENCE REPORT\nTask: t\nFinal state: ok", stages: [], runId: last.opts.runId, record: {}, ...report });
-  };
-  return { fn, calls, finish, busy: () => pendingResolve !== null };
-}
-
-function build({ adapter, runAgent, config, stateFile, classify, processLooksLikeOurs, killProcessGroup } = {}) {
-  const state = new ChannelState(stateFile || path.join(process.env.AI_BRIDGE_HOME, `state-${Math.random().toString(36).slice(2)}.json`));
-  process.env.MGR_PASS = "yes"; process.env.AI_BRIDGE_TELEGRAM_TOKEN = TOKEN;
-  const m = new Manager({
-    config: config || { fake: { token: TOKEN, dmPolicy: "pairing", allowFrom: [], codex: false, accountId: "default", envPassthrough: ["MGR_PASS"] } },
-    adapters: [adapter], state, pairing,
-    approvals: new Approvals({ now }),
-    limiter: new RateLimiter({ now }),
-    runAgent: runAgent.fn,
-    runModel: async ({ prompt }) => ({ result: classify ? await classify(prompt) : "read" }),
-    bridgePing: async () => ({ ok: true, text: '{"pong":true,"version":"test"}' }),
-    jobsTable: () => "job   mode\n toll  economy",
-    log: () => {}, now, processLooksLikeOurs, killProcessGroup,
-  });
-  return { m, state };
-}
+const { TOKEN, advanceClock, tick, fakeAdapter, fakeRunAgent, build } = require("./helpers/manager-fakes.js");
 
 (async () => {
   // ---- 1) pairing: unknown sender gets one code message, then silence
@@ -269,14 +212,14 @@ function build({ adapter, runAgent, config, stateFile, classify, processLooksLik
     assert(/queue: 0/.test(t[1]) && /uptime/.test(t[1]), "/status: uptime and queue");
     assert(t[2].includes("toll") && t[2].includes("economy"), "/jobs: table");
     assert(t[3].includes("/cancel") && t[3].includes("/approve <id> yes|no") && t[3].includes("/retry"), "/help: lists commands");
-    assert(t[4].split("\n").length === 3 && /^runs: \d+, pass rate: \d+%$/.test(t[4].split("\n")[0]) && /^cost: \$/.test(t[4].split("\n")[1]) && /^jobs: /.test(t[4].split("\n")[2]), "/journal: three-line summary");
+    assert(t[4].split("\n").length === 4 && /^runs: \d+, pass rate: \d+%$/.test(t[4].split("\n")[0]) && /^cost: \$/.test(t[4].split("\n")[1]) && /^jobs: /.test(t[4].split("\n")[2]) && /^session turns: \d+, \$\d+\.\d\d$/.test(t[4].split("\n")[3]), "/journal: four-line summary (session turns separate)");
     assert(/unknown command/.test(t[5]) && t[5].includes("/help"), "unknown command: points to /help");
 
     // rate limit: 25 quick tasks → 3 queued, rest refused by queue cap or rate limit; one notice
     for (let i = 0; i < 25; i++) await a.emit({ senderId: "43", chatId: "43", messageId: 100 + i, eventId: `r${i}`, text: `task ${i}` });
     const rl = a.sent.filter((s) => s.chatId === "43" && /rate limited/.test(s.text));
     assert(rl.length === 1, `rate limit: exactly one notice (got ${rl.length})`);
-    clock += 61000;
+    advanceClock(61000);
     await a.emit({ senderId: "43", chatId: "43", messageId: 200, eventId: "r200", text: "task later" });
     assert(a.sent.filter((s) => s.chatId === "43" && /queue full/.test(s.text)).length > 0 && !a.sent.slice(-1)[0].text.includes("rate limited"), "rate limit: window resets after 60 s");
     // oversized message
