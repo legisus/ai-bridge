@@ -98,8 +98,9 @@ function main(argv) {
   if (sub === "list" || !sub) {
     const st = load();
     if (!st.pending.length) console.log("no pending pairing requests");
-    for (const p of st.pending) console.log(`pending  ${p.channel.padEnd(10)} code ${p.code}  sender ${p.senderId}  ${metaLine(p.meta)}  (${p.createdAt})`);
-    for (const a of st.approved) console.log(`approved ${a.channel.padEnd(10)} sender ${a.senderId}  ${metaLine(a.meta)}  (${a.approvedAt})`);
+    const bot = (x) => `${x.channel}/${x.accountId || "default"}`.padEnd(18);
+    for (const p of st.pending) console.log(`pending  ${bot(p)} code ${p.code}  sender ${p.senderId}  ${metaLine(p.meta)}  (${p.createdAt})`);
+    for (const a of st.approved) console.log(`approved ${bot(a)} sender ${a.senderId}  ${metaLine(a.meta)}  (${a.approvedAt})`);
     return;
   }
   if (sub === "approve") {
@@ -107,14 +108,14 @@ function main(argv) {
     if (!channel || !code) { console.error("usage: bridge pairing approve <channel> <code>"); process.exitCode = 2; return; }
     const r = approve(channel, code);
     if (!r) { console.error(`no pending request on ${channel} with code ${code}`); process.exitCode = 1; return; }
-    console.log(`approved ${channel} sender ${r.senderId} ${metaLine(r.meta)}`.trim());
+    console.log(`approved ${channel}/${r.accountId || "default"} sender ${r.senderId} ${metaLine(r.meta)}`.trim());
     return;
   }
   if (sub === "revoke") {
     const [, channel, senderId] = argv;
     if (!channel || !senderId) { console.error("usage: bridge pairing revoke <channel> <senderId>"); process.exitCode = 2; return; }
     if (!revoke(channel, senderId)) { console.error(`${senderId} is not approved on ${channel}`); process.exitCode = 1; return; }
-    console.log(`revoked ${channel} sender ${senderId}`);
+    console.log(`revoked ${channel} sender ${senderId} (all bots)`);
     return;
   }
   console.error("usage: bridge pairing list | approve <channel> <code> | revoke <channel> <senderId>");

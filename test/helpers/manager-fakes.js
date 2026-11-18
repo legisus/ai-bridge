@@ -16,9 +16,9 @@ const now = () => clock;
 const advanceClock = (ms) => { clock += ms; };
 const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
-function fakeAdapter({ buttons = true } = {}) {
+function fakeAdapter({ buttons = true, accountId = "default" } = {}) {
   const a = {
-    id: "fake", accountId: "default",
+    id: "fake", accountId,
     capabilities: { buttons, media: true, edit: true, textLimit: 4000, chunkMode: "text", maxFileBytes: 1e6 },
     sent: [], started: false, offsets: null, inbound: null, action: null,
     async start(onInbound, offsets) { a.started = true; a.inbound = onInbound; a.offsets = offsets; },
@@ -28,7 +28,7 @@ function fakeAdapter({ buttons = true } = {}) {
     async sendButtons(chatId, text, buttons) { a.sent.push({ type: "buttons", chatId, text, buttons }); return { messageId: a.sent.length }; },
     async editMessage(chatId, messageId, text, buttons) { a.sent.push({ type: "edit", chatId, messageId, text, buttons }); },
     async sendFile(chatId, file, caption) { a.sent.push({ type: "file", chatId, name: file.name, bytes: fs.readFileSync(file.fd, "utf8"), caption }); return { messageId: a.sent.length }; },
-    emit(evt) { return a.inbound({ accountId: "default", chatType: "direct", ...evt }); },
+    emit(evt) { return a.inbound({ accountId: a.accountId, chatType: "direct", ...evt }); },
     emitAction(act) { return a.action({ ack: async () => { a.acks = (a.acks || 0) + 1; }, ...act }); },
     texts() { return a.sent.filter((s) => s.type === "text").map((s) => s.text); },
   };
@@ -68,14 +68,20 @@ function fakeRunTurn() {
   return { fn, calls, finish, busy: () => pending !== null };
 }
 
-function build({ adapter, runAgent, runTurn, config, stateFile, classify, processLooksLikeOurs, killProcessGroup, timers } = {}) {
+// Poll `fn` until truthy (bounded), for completion that is observable in state rather than timed.
+async function until(fn, ms = 2000) {
+  const end = Date.now() + ms;
+  for (;;) { if (fn()) return true; if (Date.now() > end) return false; await tick(10); }
+}
+
+function build({ adapter, adapters, runAgent, runTurn, config, stateFile, classify, processLooksLikeOurs, killProcessGroup, timers } = {}) {
   const rand = Math.random().toString(36).slice(2);
   const state = new ChannelState(stateFile || path.join(process.env.AI_BRIDGE_HOME, `state-${rand}.json`));
   const sessions = new SessionStore(path.join(process.env.AI_BRIDGE_HOME, `sessions-${rand}.json`), { dir: path.join(process.env.AI_BRIDGE_HOME, "sessions"), now });
   process.env.MGR_PASS = "yes"; process.env.AI_BRIDGE_TELEGRAM_TOKEN = TOKEN;
   const m = new Manager({
     config: config || { fake: { token: TOKEN, dmPolicy: "pairing", allowFrom: [], codex: false, accountId: "default", envPassthrough: ["MGR_PASS"] } },
-    adapters: [adapter], state, sessions, pairing,
+    adapters: adapters || [adapter], state, sessions, pairing,
     approvals: new Approvals({ now }),
     limiter: new RateLimiter({ now }),
     runAgent: runAgent ? runAgent.fn : undefined,
@@ -88,4 +94,4 @@ function build({ adapter, runAgent, runTurn, config, stateFile, classify, proces
   return { m, state, sessions };
 }
 
-module.exports = { TOKEN, now, advanceClock, tick, fakeAdapter, fakeRunAgent, fakeRunTurn, build };
+module.exports = { TOKEN, now, advanceClock, tick, until, fakeAdapter, fakeRunAgent, fakeRunTurn, build };

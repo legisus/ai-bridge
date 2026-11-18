@@ -58,12 +58,13 @@ class Approvals {
   resolve({ id, actorId, channel, accountId = "default", chatId, kind, decision }) {
     const rec = this.records.get(id);
     if (!rec) return "stale";
-    if (rec.resolved) return "stale";
-    if (this._expired(rec)) { this._settle(rec, "denied"); return "stale"; }
-    // `kind` is checked when the caller knows it (button data); the /approve text
-    // fallback passes undefined and relies on the id + conversation binding.
+    // Ownership first: a settled or expired record must not tell another conversation
+    // anything (not even that it existed). `kind` is checked when the caller knows it
+    // (button data); the /approve text fallback passes undefined.
     if (String(actorId) !== rec.senderId || channel !== rec.channel || (accountId || "default") !== rec.accountId ||
         String(chatId) !== rec.chatId || (kind !== undefined && kind !== rec.kind)) return "forbidden";
+    if (rec.resolved) return "stale";
+    if (this._expired(rec)) { this._settle(rec, "denied"); return "stale"; }
     const d = decision === "a" || decision === "approved" || decision === "yes" ? "approved" : "denied";
     this._settle(rec, d);
     return d;

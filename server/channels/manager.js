@@ -92,8 +92,15 @@ class Manager {
   sameOwner(item, owner) { return item.channel === owner.channel && (item.accountId || "default") === (owner.accountId || "default") && String(item.senderId) === String(owner.senderId); }
   label(item) { return item && item.sessionName ? `[${item.sessionName}] ` : ""; }
 
-  adapterFor(channel) { return this.adapters.find((a) => a.id === channel); }
-  cfgFor(adapter) { return this.config[adapter.id] || {}; }
+  // Adapters and configs are per bot: (channel, accountId), never channel alone.
+  adapterFor(channel, accountId = "default") {
+    return this.adapters.find((a) => a.id === channel && (a.accountId || "default") === (accountId || "default"));
+  }
+  cfgFor(adapter) {
+    const ch = this.config[adapter.id] || {};
+    const bot = Array.isArray(ch.bots) ? ch.bots.find((b) => (b.accountId || "default") === (adapter.accountId || "default")) : null;
+    return bot || ch;
+  }
   accountKey(adapter, evt) { return `${adapter.id}:${evt.accountId || adapter.accountId || "default"}`; }
   senderKey(adapter, evt) { return `${this.accountKey(adapter, evt)}:${evt.senderId}`; }
   red(text) { return redact(text, this.config); }
@@ -147,7 +154,7 @@ class Manager {
   // owner's queued session turns are dropped rather than run behind it.
   async recover() {
     for (const item of this.state.queue().filter((q) => q.status !== "queued")) {
-      const adapter = this.adapterFor(item.channel);
+      const adapter = this.adapterFor(item.channel, item.accountId);   // may be gone from the config: no notice, never another bot
       if (item.status === "done" || this.hasJournal(item.runId)) {
         // The run finished; delivery was interrupted. Its verdict is in the journal.
         if (adapter) await this.send(adapter, item.chatId, `restarted; the result of "${item.task}" was lost before delivery (not delivered); see /journal`);
@@ -487,6 +494,7 @@ class Manager {
       chatId: action.chatId, kind: parsed.kind, decision: parsed.decision });
     await ack(result === "forbidden" ? "not yours" : undefined);
     if (result === "forbidden") return;
+    if (prompt && prompt.adapter !== adapter) return;   // a prompt is edited only through the bot that sent it
     const target = prompt || { adapter, chatId: action.chatId, messageId: action.messageId, text: "" };
     if (!adapter.editMessage || target.messageId == null) return;
     const suffix = result === "approved" ? "→ approved" : result === "denied" ? "→ declined" : "(no longer pending)";
@@ -520,8 +528,14 @@ class Manager {
   quote(task) { return task.length > QUOTE_MAX ? task.slice(0, QUOTE_MAX) + "…" : task; }
 
   async runOne(item) {
-    const adapter = this.adapterFor(item.channel);
-    if (!adapter) { this.state.remove((q) => q.runId === item.runId); return; }
+    const adapter = this.adapterFor(item.channel, item.accountId);
+    if (!adapter) {
+      // The bot was removed from channels.json: the item is never run through another bot.
+      this.journalDeclined(item, "no adapter for this bot (removed from channels.json)");
+      this.state.remove((q) => q.runId === item.runId);
+      this.log(`run ${item.runId} dropped: no adapter for ${item.channel}/${item.accountId || "default"}`);
+      return;
+    }
     const cfg = this.cfgFor(adapter);
     const controller = new AbortController();
     this.current = { item, controller };

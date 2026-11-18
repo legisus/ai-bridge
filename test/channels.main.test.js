@@ -31,6 +31,19 @@ const run = (args) => new Promise((resolve) => execFile(process.execPath, [cli, 
   // status: shows the lock pid and channels, never the token
   r = await run(["channels", "status"]);
   assert(r.code === 0 && r.stdout.includes(`pid ${process.pid}`) && r.stdout.includes("telegram") && !r.stdout.includes('"x"'), "channels status: lock pid + channel list, no token");
+  // several bots: one status line per bot, tokens never printed
+  fs.writeFileSync(path.join(home, "channels.json"), JSON.stringify({ telegram: { bots: [{ accountId: "default", token: "sentinel-tok-DEFAULT" }, { accountId: "turo", token: "sentinel-tok-TURO", session: "turo" }] } }), { mode: 0o600 });
+  r = await run(["channels", "status"]);
+  assert(r.code === 0 && /channel telegram\/default: dmPolicy pairing, allowFrom \(none\), codex off, session none/.test(r.stdout) && /channel telegram\/turo: dmPolicy pairing, allowFrom \(none\), codex off, session turo \(fable\)/.test(r.stdout) && !r.stdout.includes("sentinel-tok"), "channels status: one line per bot with its binding, no tokens");
+  // pairing output names the bot (channel/account)
+  fs.writeFileSync(path.join(home, "pairing.json"), JSON.stringify({ pending: [{ channel: "telegram", accountId: "turo", senderId: "7", code: "ABCDEF", meta: {}, createdAt: new Date().toISOString() }], approved: [] }), { mode: 0o600 });
+  r = await run(["pairing", "list"]);
+  assert(r.code === 0 && /pending\s+telegram\/turo\s+code ABCDEF\s+sender 7/.test(r.stdout), "pairing list: shows channel/account");
+  r = await run(["pairing", "approve", "telegram", "ABCDEF"]);
+  assert(r.code === 0 && /approved telegram\/turo sender 7/.test(r.stdout), "pairing approve: names the bot");
+  r = await run(["pairing", "revoke", "telegram", "7"]);
+  assert(r.code === 0 && /revoked telegram sender 7 \(all bots\)/.test(r.stdout), "pairing revoke: says it is channel-wide");
+  fs.writeFileSync(path.join(home, "channels.json"), JSON.stringify({ telegram: { token: "x" } }), { mode: 0o600 });
   fs.unlinkSync(path.join(home, "channels.lock"));
 
   // stale lock (dead pid) is ignored; the daemon then starts and fails on the fake token… so give it a bogus apiBase and stop it
@@ -51,7 +64,11 @@ const run = (args) => new Promise((resolve) => execFile(process.execPath, [cli, 
   // acquireLock in-process: exclusive create, own pid tolerated, dead pid reclaimed
   {
     process.env.AI_BRIDGE_HOME = home;
-    const { acquireLock, LOCK_FILE } = require("../server/channels/main.js");
+    const { acquireLock, LOCK_FILE, buildAdapters } = require("../server/channels/main.js");
+    const { loadConfig } = require("../server/channels/config.js");
+    fs.writeFileSync(path.join(home, "channels.json"), JSON.stringify({ telegram: { bots: [{ accountId: "default", token: "a:1" }, { accountId: "turo", token: "b:2", session: "turo" }] } }), { mode: 0o600 });
+    const built = buildAdapters(loadConfig({ env: {}, file: path.join(home, "channels.json") }), { log: () => {}, fetch: async () => { throw new Error("no network"); } });
+    assert(built.length === 2 && built[0].id === "telegram" && built[0].accountId === "default" && built[1].accountId === "turo", "buildAdapters: one adapter per bot with its accountId");
     const rel = acquireLock();
     assert(fs.readFileSync(LOCK_FILE, "utf8") === String(process.pid), "acquireLock: writes our pid");
     const rel2 = acquireLock();
