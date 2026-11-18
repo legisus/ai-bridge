@@ -20,6 +20,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- fake Bot API
 const TOKEN = "777:E2E";
+const TOKEN_T = "778:E2ET";   // the bound "turo" bot
 const requests = [];
 let pending = [];
 let nextUpdateId = 1000;
@@ -28,14 +29,16 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
     const raw = Buffer.concat(chunks);
-    const method = req.url.split("/").pop();
+    const parts = req.url.split("/");
+    const method = parts.pop();
+    const tok = (parts.pop() || "").replace(/^bot/, "");   // which bot is calling
     let body = null;
     if ((req.headers["content-type"] || "").startsWith("application/json")) { try { body = JSON.parse(raw.toString()); } catch {} }
-    requests.push({ method, body, raw });
+    requests.push({ method, body, raw, tok });
     const reply = (status, json) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(json)); };
     if (method === "getUpdates") {
-      const upd = pending.filter((u) => u.update_id >= (body.offset || 0));
-      pending = pending.filter((u) => u.update_id < (body.offset || 0));
+      const upd = pending.filter((u) => u.tok === tok && u.update_id >= (body.offset || 0));
+      pending = pending.filter((u) => !(u.tok === tok && u.update_id < (body.offset || 0)));
       if (upd.length) return reply(200, { ok: true, result: upd });
       return setTimeout(() => reply(200, { ok: true, result: [] }), 25);
     }
@@ -46,9 +49,9 @@ const server = http.createServer((req, res) => {
   });
 });
 const user = { id: 42, is_bot: false, first_name: "Ann" };
-const push = (text) => pending.push({ update_id: nextUpdateId++, message: { message_id: nextUpdateId, from: user, chat: { id: 42, type: "private" }, date: 1, text } });
-const tap = (data, messageId) => pending.push({ update_id: nextUpdateId++, callback_query: { id: `cb${nextUpdateId}`, from: user, message: { message_id: messageId, chat: { id: 42, type: "private" } }, data } });
-const msgs = () => requests.filter((r) => r.method === "sendMessage").map((r) => r.body);
+const push = (text, tok = TOKEN) => pending.push({ tok, update_id: nextUpdateId++, message: { message_id: nextUpdateId, from: user, chat: { id: 42, type: "private" }, date: 1, text } });
+const tap = (data, messageId, tok = TOKEN) => pending.push({ tok, update_id: nextUpdateId++, callback_query: { id: `cb${nextUpdateId}`, from: user, message: { message_id: messageId, chat: { id: 42, type: "private" } }, data } });
+const msgs = (tok = TOKEN) => requests.filter((r) => r.method === "sendMessage" && r.tok === tok).map((r) => r.body);
 
 // ---- fake runTurn (sessions)
 const turnCalls = [];
@@ -64,11 +67,11 @@ const runAgent = (task, opts) => { runCalls.push({ task, opts }); return new Pro
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const apiBase = `http://127.0.0.1:${server.address().port}`;
   const cfgFile = path.join(process.env.AI_BRIDGE_HOME, "channels.json");
-  fs.writeFileSync(cfgFile, JSON.stringify({ telegram: { token: TOKEN, apiBase, allowFrom: ["42"] } }), { mode: 0o600 });
+  fs.writeFileSync(cfgFile, JSON.stringify({ telegram: { apiBase, allowFrom: ["42"], bots: [{ accountId: "default", token: TOKEN }, { accountId: "turo", token: TOKEN_T, session: "turo" }] } }), { mode: 0o600 });
   const config = loadConfig({ env: {} });
   const stateFile = path.join(process.env.AI_BRIDGE_HOME, "channels-state.json");
   const sessionsFile = path.join(process.env.AI_BRIDGE_HOME, "channels-sessions.json");
-  const build = () => new Manager({ config, adapters: [makeTelegram(config.telegram, { log: () => {} })], state: new ChannelState(stateFile), pairing,
+  const build = () => new Manager({ config, adapters: config.telegram.bots.map((b) => makeTelegram(b, { log: () => {} })), state: new ChannelState(stateFile), pairing,
     sessions: new SessionStore(sessionsFile, { dir: path.join(process.env.AI_BRIDGE_HOME, "sessions") }), runTurn,
     runAgent, runModel: async () => ({ result: "read" }), bridgePing: async () => ({ ok: true, text: "{}" }), log: () => {} });
 
@@ -132,6 +135,19 @@ const runAgent = (task, opts) => { runCalls.push({ task, opts }); return new Pro
   assert(msgs().pop().text === "[turo] Example Domain", "e2e: labelled reply via Telegram");
   push("/stop all"); await wait(250);
   assert(/^stopped: 1 sessions paused, nothing running, 0 queued dropped; current target is agent/.test(msgs().pop().text), "e2e: /stop all");
+
+  // ---- 5) a bound bot: its chat is the conversation; the general bot still runs one-shots
+  const turnsBefore = turnCalls.length;
+  push("hello turo", TOKEN_T); await wait(300);
+  assert(turnCalls.length === turnsBefore + 1 && turnCalls[turnsBefore].opts.resume === false && turnCalls[turnsBefore].opts.text === "hello turo" && turnCalls[turnsBefore].opts.model === "claude-fable-5-1" && msgs(TOKEN_T).pop().text.startsWith("⏳ [turo] working on it"), "e2e: a bound bot runs plain text as its session turn on fable");
+  releaseTurn({ text: "from turo" }); await wait(250);
+  assert(msgs(TOKEN_T).pop().text === "[turo] from turo", "e2e: the bound bot's reply goes through its own token");
+  push("/stop", TOKEN_T); await wait(250);
+  assert(msgs(TOKEN_T).pop().text === "stopped turo; your next message starts a fresh conversation", "e2e: /stop on the bound bot starts over");
+  const runsBefore = runCalls.length;
+  push("get the page title again"); await wait(300);
+  assert(runCalls.length === runsBefore + 1 && msgs().pop().text.startsWith("⏳ working on it"), "e2e: the general bot still runs one-shot tasks");
+  release(); await wait(250);
   await m.stop();
 
   server.close();

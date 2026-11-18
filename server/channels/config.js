@@ -63,7 +63,7 @@ function loadConfig({ env = process.env, file = CONFIG_FILE } = {}) {
     if (listForm && c.token !== undefined) throw new Error(`channel ${channel}: use either token or bots, not both`);
     if (listForm && !Array.isArray(c.bots)) throw new Error(`channel ${channel}: bots must be a list`);
     const { bots: rawBots, token: flatToken, accountId: flatAccount, apiBase: flatApi, session: flatSession, model: flatModel, ...channelKeys } = c;
-    const defaults = normalizeShared({ ...DEFAULTS, ...channelKeys });
+    const defaults = normalizeShared({ ...DEFAULTS, ...channelKeys, ...(flatApi !== undefined ? { apiBase: flatApi } : {}) });   // apiBase is a per-channel default too
     if (!POLICIES.includes(defaults.dmPolicy)) throw new Error(`channel ${channel}: dmPolicy must be one of ${POLICIES.join(", ")} (got "${defaults.dmPolicy}")`);
 
     const entries = listForm ? rawBots : [{ accountId: flatAccount, token: flatToken, apiBase: flatApi, session: flatSession, model: flatModel }];

@@ -34,6 +34,9 @@ Microsoft Teams, Google Chat and Signal follow, one adapter each.
    ```
 6. Text a task: *"open example.com and tell me the page title"*.
 
+Want a separate bot for each job? Create more bots with BotFather and list them
+under `"bots"` (see *One bot per job* below); one daemon polls them all.
+
 Keep it running with `deploy/launchd/com.ai-bridge.channels.plist` (macOS) or
 `deploy/systemd/ai-bridge-channels.service` (Linux); both templates explain the
 two paths to replace.
@@ -94,6 +97,34 @@ open my turo inbox     ⏳ [turo] working on it (run 7f3a…)
 
 Names are 1–24 characters of `a-z 0-9 _ -`, up to 10 live sessions per sender;
 sessions belong to the sender who made them and are never shared.
+
+### One bot per job
+
+If you would rather have `@my_turo_bot` *be* the turo conversation, bind a bot
+to a session in `channels.json`:
+
+```json
+{
+  "telegram": {
+    "bots": [
+      { "accountId": "default", "token": "123:AA…" },
+      { "accountId": "turo",   "token": "456:BB…", "session": "turo" },
+      { "accountId": "mail",   "token": "789:CC…", "session": "mail", "model": "haiku" }
+    ]
+  }
+}
+```
+
+On a bound bot every plain message (even one starting with `@`) goes to that one
+conversation, which is created on your first message; replies are labelled as
+usual. `/pause`, `/resume`, `/stop` (start the conversation over), `/sessions`,
+`/retry`, `/cancel`, `/status`, `/journal`, `/help` work; `/new`, `/use`,
+`/stop all` and `@name` are refused with a one-line explanation. Each bot pairs
+separately (the code message says which conversation the bot is), and a sender
+paired on one bot has nothing on another until paired there. The session model
+is `fable` unless the bot sets `"model"`; a row created earlier under the same
+name on another model is refused until you `/stop` it. The general bot (no
+`session`) keeps the full session commands.
 
 **Approvals in a session.** The intent gate sees the conversation: a bare
 "continue" or "do it" is classified together with your previous messages, so
@@ -228,10 +259,25 @@ type in the terminal:
 | `open` (needs `"*"` in `allowFrom`) | run | run | run |
 | `disabled` | drop | drop | drop |
 
-Identity is the messenger's stable id (Telegram numeric user id), never a
-display name. Paired senders are owner-equivalent: `/jobs` and `/journal` show
-everything. Pending pairing codes expire after an hour; `bridge pairing list`
-shows them, `bridge pairing revoke telegram <id>` removes an approved sender.
+Several bots under one channel: put them in `"bots": [...]`, each with a unique
+`accountId` (`[a-z0-9_-]{1,24}`; one may be `default`), its own `token`, and
+optional per-bot overrides of the channel-level keys (`dmPolicy`, `allowFrom`,
+`codex`, `intentKeywords`, `envPassthrough`, `apiBase`). Tokens may come from
+the environment instead: `AI_BRIDGE_TELEGRAM_TOKEN` for the `default` bot (or
+the lone bot of the one-bot form) and `AI_BRIDGE_TELEGRAM_<ACCOUNTID>_TOKEN`
+(upper-cased, other characters → `_`) for the rest; the account-specific key
+wins when both are set. Two bots with the same token, or two account ids that
+map to the same environment key, are refused at start. Bot tokens are never
+passed to child processes, even if listed in `envPassthrough`.
+
+Identity is the messenger's stable id (Telegram numeric user id) **per bot**:
+pairing, sessions and queue limits are keyed by `channel:accountId:senderId`.
+Paired senders are owner-equivalent: `/jobs` and `/journal` show everything
+(the journal is one aggregate across all bots and channels). `/status` shows the
+current run's text only to the sender who queued it. Pending pairing codes expire
+after an hour; `bridge pairing list` shows them with the bot they belong to
+(`telegram/turo`), `bridge pairing revoke telegram <id>` removes an approved
+sender from **every** bot of that channel.
 
 Rate limits: 20 messages per paired sender per minute, 200 overall, 5 per
 minute from unknown senders, 8 KB per message.
@@ -281,6 +327,11 @@ unchanged. A built-in reverse connection is on the roadmap.
   `/new turo`. The daemon never substitutes another conversation.
 - **`session turo is paused`** — `/resume turo`, or `/use agent` to send
   one-shot tasks meanwhile.
+- **`this bot is bound to session turo: …`** — that bot is one conversation;
+  use the general bot for `/new`, `/use` and `@name`.
+- **`accounts "a" and "b" have the same token` / `env keys collide`** — two
+  entries in `bots` resolve to one credential or one environment key; fix the
+  `accountId`s or tokens.
 - **`channels-sessions.json is corrupt`** at start — the daemon refuses to run
   with a damaged sessions file rather than forget your sessions; fix the JSON or
   move the file aside.
