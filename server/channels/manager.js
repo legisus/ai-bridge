@@ -152,7 +152,7 @@ class Manager {
         // The run finished; delivery was interrupted. Its verdict is in the journal.
         if (adapter) await this.send(adapter, item.chatId, `restarted; the result of "${item.task}" was lost before delivery (not delivered); see /journal`);
       } else {
-        if (Number.isInteger(item.pid) && item.pid > 0 && !(await this.stopOrphan(item.pid))) {
+        if (Number.isInteger(item.pid) && item.pid > 0 && !(await this.stopOrphan(item.pid, item.pidStartedAt))) {
           const key = this.ownerKeyOf(item);
           this.heldOwners.add(key);
           this.log(`recovery: run ${item.runId} pid ${item.pid} still alive; holding ${key}'s queued session turns`);
@@ -174,14 +174,16 @@ class Manager {
 
   // Stop a leftover turn's process group the way an abort does (killGroup semantics);
   // true when it is confirmed gone — or was never ours: a reused pid is left alone.
-  // pid 0/1/negative are never signalled (kill(-1) would reach every process of the user).
-  async stopOrphan(pid) {
-    if (!(Number.isInteger(pid) && pid > 1)) return true;
+  // pid 0/1/negative and the daemon itself are never signalled (kill(-1) would reach every
+  // process of the user); a pid whose identity cannot be inspected is held, not guessed.
+  async stopOrphan(pid, pidStartedAt) {
+    if (!(Number.isInteger(pid) && pid > 1) || pid === process.pid) return true;
     const alive = () => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
     if (!alive()) return true;
-    let ours = false;
-    try { ours = !!this.processLooksLikeOurs(pid); } catch { ours = false; }
-    if (!ours) return true;
+    let ours = null;
+    try { ours = this.processLooksLikeOurs(pid, pidStartedAt); } catch { ours = null; }
+    if (ours === null) return false;      // could not inspect: hold rather than signal or drain
+    if (!ours) return true;               // a recycled pid belongs to someone else
     try { this.killProcessGroup(pid); } catch {}
     for (let i = 0; i < 10; i++) {
       if (!alive()) return true;
@@ -239,7 +241,10 @@ class Manager {
       return;
     }
 
-    // paired or allowlisted sender
+    // paired or allowlisted sender. Emergency controls are dispatched before the rate
+    // limiter: a sender who is being throttled must still be able to stop things.
+    const text0 = String(evt.text || "").trim();
+    if (/^\/(cancel|stop|pause)(\s|$)/i.test(text0) && Buffer.byteLength(text0, "utf8") <= MAX_TEXT) { seen(); return this.handleCommand(adapter, evt, who, text0); }
     if (!this.limiter.allow(senderKey)) {
       seen();
       const noticeKey = `${senderKey}:ratenotice`;
@@ -630,110 +635,138 @@ class Manager {
       if (signal.aborted) return "aborted";
       return null;
     };
-    const dropFor = async (why) => {
-      if (why === "aborted") { writeJournal("cancelled", "cancelled before the turn started"); await status("⏹", "cancelled"); return; }
-      const feedback = why === "unpaired" ? "sender no longer paired when the turn came up" : "session paused or stopped before the turn ran";
-      writeJournal("declined", feedback);
-      await status("🚫", why === "unpaired" ? "you are no longer paired" : "dropped — session paused or stopped");
-    };
+    const whyFeedback = (why, when) => why === "unpaired" ? `sender no longer paired ${when}` : why === "aborted" ? "stopped by user" : `session paused or stopped ${when}`;
 
-    if (this.heldOwners.has(this.ownerKeyOf(item))) {
-      writeJournal("declined", "held: an earlier turn of yours could not be stopped after a restart");
-      await status("🚫", "dropped — an earlier turn of yours could not be stopped after a restart");
-      return;
-    }
-    if (!this.sessions.get(owner, { id: item.sessionId })) return dropFor("paused");
-
-    // A file the model saved earlier must never become Claude's instructions now.
-    const bad = this.instructionFilesIn(dir);
-    if (bad.length) {
+    let verdict = null, feedback = "", text = "", errorText = null, lastWhat = null, why = null;
+    let since = null, timer = null, spawning = false;
+    const INSTRUCTION = "INSTRUCTION_FILE";
+    // A file the model saved earlier must never become Claude's instructions. Checked
+    // before the gate and again immediately before every physical spawn.
+    const quarantine = () => {
+      const bad = this.instructionFilesIn(dir);
+      if (!bad.length) return null;
       outbox.stash(dir, bad, path.join(dir, outbox.RESERVED_NAME, `quarantine-${item.runId}`));
       this.log(`run ${item.runId}: instruction file(s) in session ${item.sessionId}: ${bad.join(", ")} — quarantined, turn refused`);
-      writeJournal("fail", `instruction file in the session directory: ${bad.join(", ")}`);
-      await status("❌", `refused: the session directory contained an instruction file (${bad.join(", ")}); moved to leftover/quarantine-${item.runId}`);
-      return;
-    }
-    const since = outbox.snapshot(dir);   // once; continuations add to the same turn
-
-    // Gate: intent, with the conversation's earlier messages as context.
-    const intent = await classifyIntent(item.task, {
-      keywords: cfg.intentKeywords || DEFAULT_KEYWORDS, context: item.context || [],
-      classify: async (prompt) => String((await this.runModel({ model: agent.MATCH_MODEL, prompt, allowedTools: [], timeoutMs: 60000, baseEnv: cleanEnv(process.env, cfg.envPassthrough) })).result || ""),
-    });
-    if (intent === "write") {
-      setStatus("awaiting-approval");
-      const decision = await this.ask(adapter, item, { kind: "intent", signal, label,
-        text: `This message looks like it will send, submit or change something:\n"${this.quote(item.task)}"\nApprove?` });
-      if (decision === "cancelled") { writeJournal("cancelled", "cancelled while awaiting approval"); await status("⏹", `cancelled — "${this.quote(item.task)}" was not run`); return; }
-      if (decision !== "approved") { writeJournal("declined", "message not approved"); await status("🚫", `declined — "${this.quote(item.task)}" was not run`); return; }
-      setStatus("running");
-    }
-
-    let why = recheck();
-    if (why) return dropFor(why);
-    const row = this.sessions.get(owner, { id: item.sessionId });
-    const resume = row.started;                // decided before the durable flag flips
-    if (!resume) this.sessions.markStarted(row.id);
-    const stage = stageLabel(row.model);
-    let verdict = null, feedback = "", text = "", errorText = null, lastWhat = null;
-    const timer = this.timers.setInterval(() => { status("…", "thinking").catch(() => {}); }, PROGRESS_EVERY_MS);
-    const spawn = async ({ turnText, authorized, resumeNow, retryFresh, stageName }) => {
-      const res = await this.runTurn({
-        model: row.model, text: turnText, claudeSessionId: row.claudeSessionId, resume: resumeNow, retryFresh, cwd: dir,
-        systemPrompt: agent.turnNote({ turn: row.turns + 1, authorized, declined: row.declined || [] }),
-        envPassthrough: cfg.envPassthrough, signal,
-        onSpawn: (pid) => this.state.update(item.runId, { pid, pidStartedAt: new Date().toISOString() }),
-      });
-      stages.push({ stage: stageName, ...res.usage });
-      calls.push(...(res.calls || []));
-      return res.text;
+      return Object.assign(new Error(`the session directory contained an instruction file (${bad.join(", ")}); moved to leftover/quarantine-${item.runId}`), { code: INSTRUCTION });
     };
+    // One physical Claude call. The progress line goes out only while one is in flight.
+    const spawn = async (row, { turnText, authorized, resumeNow, retryFresh, stageName }) => {
+      const planted = quarantine();
+      if (planted) throw planted;
+      spawning = true;
+      try {
+        const res = await this.runTurn({
+          model: row.model, text: turnText, claudeSessionId: row.claudeSessionId, resume: resumeNow, retryFresh, cwd: dir,
+          systemPrompt: agent.turnNote({ turn: row.turns + 1, authorized, declined: row.declined || [] }),
+          envPassthrough: cfg.envPassthrough, signal,
+          onSpawn: (pid) => this.state.update(item.runId, { pid, pidStartedAt: new Date().toISOString() }),
+        });
+        stages.push({ stage: stageName, ...res.usage });
+        calls.push(...(res.calls || []));
+        return res.text;
+      } finally {
+        spawning = false;
+        try { this.state.update(item.runId, { pid: null }); } catch {}
+      }
+    };
+
+    // Everything that can fail runs inside one lifecycle block, so every accepted turn
+    // ends with exactly one journal record and one labelled message.
     try {
-      text = await spawn({ turnText: item.task, authorized: null, resumeNow: resume, retryFresh: row.turns === 0, stageName: `turn:${stage}` });
-      let rounds = 0;
-      for (;;) {
-        const what = agent.lastNeedsApprovalLine(text);
-        if (!what) { verdict = "reply"; break; }
-        lastWhat = what;
-        if (rounds >= 3) { declinedNow.push(what); verdict = "declined"; feedback = `not approved within the limit: ${what}`; break; }
-        rounds++;
-        setStatus("awaiting-approval");
-        const decision = await this.ask(adapter, item, { kind: "step", signal, label, text: `Approval needed: ${what}`, digest: crypto.createHash("sha256").update(what).digest("hex") });
-        if (decision === "cancelled") { verdict = "cancelled"; feedback = "stopped by user; actions already performed were not undone"; break; }
-        if (decision !== "approved") { declinedNow.push(what); verdict = "declined"; feedback = `not approved: ${what}`; break; }
-        setStatus("running");
-        why = recheck();
-        if (why) { verdict = why === "aborted" ? "cancelled" : "declined"; feedback = why === "unpaired" ? "sender no longer paired before the continuation" : why === "aborted" ? "stopped by user" : "session paused or stopped before the continuation"; break; }
-        text = await spawn({ turnText: `approved: ${what}; proceed and report`, authorized: what, resumeNow: true, retryFresh: false, stageName: `turn:${stage}(approved)` });
+      if (this.heldOwners.has(this.ownerKeyOf(item))) {
+        why = "held"; verdict = "declined"; feedback = "held: an earlier turn of yours could not be stopped after a restart";
+      } else if ((why = recheck())) {
+        verdict = why === "aborted" ? "cancelled" : "declined"; feedback = whyFeedback(why, "when the turn came up");
+      } else {
+        const planted = quarantine();
+        if (planted) throw planted;
+        since = outbox.snapshot(dir);   // once; continuations add to the same turn
+
+        // Gate: intent, with the conversation's earlier messages as context.
+        const intent = await classifyIntent(item.task, {
+          keywords: cfg.intentKeywords || DEFAULT_KEYWORDS, context: item.context || [],
+          classify: async (prompt) => String((await this.runModel({ model: agent.MATCH_MODEL, prompt, allowedTools: [], timeoutMs: 60000, baseEnv: cleanEnv(process.env, cfg.envPassthrough) })).result || ""),
+        });
+        let gate = "approved";
+        if (intent === "write") {
+          setStatus("awaiting-approval");
+          gate = await this.ask(adapter, item, { kind: "intent", signal, label,
+            text: `This message looks like it will send, submit or change something:\n"${this.quote(item.task)}"\nApprove?` });
+          setStatus("running");
+        }
+        if (gate === "cancelled") { why = "intent"; verdict = "cancelled"; feedback = "cancelled while awaiting approval"; }
+        else if (gate !== "approved") { why = "intent"; verdict = "declined"; feedback = "message not approved"; }
+        else if ((why = recheck())) {
+          verdict = why === "aborted" ? "cancelled" : "declined"; feedback = whyFeedback(why, "before the turn ran");
+        } else {
+          const row = this.sessions.get(owner, { id: item.sessionId });
+          const resume = row.started;                // decided before the durable flag flips
+          if (!resume) this.sessions.markStarted(row.id);
+          const stage = stageLabel(row.model);
+          timer = this.timers.setInterval(() => { if (spawning) status("…", "thinking").catch(() => {}); }, PROGRESS_EVERY_MS);
+          text = await spawn(row, { turnText: item.task, authorized: null, resumeNow: resume, retryFresh: row.turns === 0, stageName: `turn:${stage}` });
+          let rounds = 0;
+          for (;;) {
+            const what = agent.lastNeedsApprovalLine(text);
+            if (!what) { verdict = "reply"; break; }
+            lastWhat = what;
+            if (rounds >= 3) { declinedNow.push(what); verdict = "declined"; feedback = `not approved within the limit: ${what}`; break; }
+            rounds++;
+            setStatus("awaiting-approval");
+            const decision = await this.ask(adapter, item, { kind: "step", signal, label, text: `Approval needed: ${what}`, digest: crypto.createHash("sha256").update(what).digest("hex") });
+            if (decision === "cancelled") { verdict = "cancelled"; feedback = "stopped by user; actions already performed were not undone"; break; }
+            if (decision !== "approved") { declinedNow.push(what); verdict = "declined"; feedback = `not approved: ${what}`; break; }
+            setStatus("running");
+            if ((why = recheck())) { verdict = why === "aborted" ? "cancelled" : "declined"; feedback = whyFeedback(why, "before the continuation"); break; }
+            text = await spawn(row, { turnText: `approved: ${what}; proceed and report`, authorized: what, resumeNow: true, retryFresh: false, stageName: `turn:${stage}(approved)` });
+          }
+        }
       }
     } catch (e) {
       if (signal.aborted || (e && e.name === "AbortError")) { verdict = "cancelled"; feedback = "stopped by user; actions already performed were not undone"; }
+      else if (e && e.code === INSTRUCTION) { verdict = "fail"; feedback = e.message; errorText = `refused: ${e.message}`; }
       else if (/No conversation found with session ID/.test(String(e && e.message))) {
         verdict = "fail"; feedback = "transcript missing";
         errorText = `this session's conversation is no longer available (Claude keeps transcripts ~30 days); /stop ${name} and /new ${name} to start over`;
       } else { verdict = "fail"; feedback = String(e && e.message); errorText = `error — ${feedback}`; this.log(`run ${item.runId} error: ${feedback}`); }
     } finally {
-      this.timers.clearInterval(timer);
+      if (timer != null) this.timers.clearInterval(timer);
       try { this.state.update(item.runId, { pid: null }); } catch {}
     }
 
-    // Terminal: journal first, then the row, then `done`, then the user.
+    // Terminal: journal first, then the row (only if Claude ran), then `done`, then the user.
     writeJournal(verdict, feedback, text);
-    if (verdict === "reply" || verdict === "declined") {
+    if (stages.length && (verdict === "reply" || verdict === "declined")) {
       this.sessions.complete(item.sessionId, item.sessionGen, { declined: declinedNow, countTurn: true });
     }
     setStatus("done");
     this.log(`run ${item.runId} [${name}] ${verdict}${feedback ? `: ${feedback}` : ""}`);
     if (verdict === "reply") return this.deliverTurn(adapter, item, text, dir, since);
-    if (verdict === "cancelled") return status("⏹", "cancelled");
-    if (verdict === "declined") {
-      if (why === "unpaired") return status("🚫", "you are no longer paired");
-      if (why === "paused") return status("🚫", "dropped — session paused or stopped");
-      if (/within the limit/.test(feedback)) return status("⏹", `stopped: "${lastWhat}" was not approved within the limit`);
-      return status("🚫", `not approved: ${lastWhat}`);
+    if (verdict === "cancelled") await status("⏹", why === "intent" ? `cancelled — "${this.quote(item.task)}" was not run` : "cancelled");
+    else if (verdict === "declined") {
+      if (why === "held") await status("🚫", "dropped — an earlier turn of yours could not be stopped after a restart");
+      else if (why === "unpaired") await status("🚫", "you are no longer paired");
+      else if (why === "paused") await status("🚫", "dropped — session paused or stopped");
+      else if (why === "intent") await status("🚫", `declined — "${this.quote(item.task)}" was not run`);
+      else if (/within the limit/.test(feedback)) await status("⏹", `stopped: "${lastWhat}" was not approved within the limit`);
+      else await status("🚫", `not approved: ${lastWhat}`);
+    } else {
+      await status("❌", errorText || `error — ${feedback}`);
+      if (!/^refused: |no longer available/.test(errorText || "")) await say("reply /retry to send it again");
     }
-    await status("❌", errorText || `error — ${feedback}`);
-    if (!/no longer available/.test(errorText || "")) await say("reply /retry to send it again");
+    // Whatever the outcome, files this turn produced are never stranded in the cwd.
+    if (since) await this.stashTurnFiles(adapter, item, dir, since, verdict);
+  }
+
+  // A turn that ended without a reply: close and move its files to leftover/<runId>/
+  // and say so once, so the next turn's snapshot does not bury them.
+  async stashTurnFiles(adapter, item, dir, since, verdict) {
+    const { files, skipped } = outbox.collect(dir, { since });
+    outbox.finish(dir, [], files, { keepDir: true });
+    const names = files.map((f) => f.name).concat(skipped.map((s) => s.name));
+    if (!names.length) return;
+    const moved = outbox.stash(dir, names, path.join(dir, outbox.RESERVED_NAME, item.runId));
+    if (moved.length) await this.send(adapter, item.chatId, `kept ${moved.length} file(s) in leftover/${item.runId}: ${moved.map((n) => `${n} (turn ${verdict})`).join(", ")}`, { label: this.label(item) });
   }
 
   // The reply, then the files this turn produced (by the pre-turn snapshot). Undelivered
@@ -777,8 +810,6 @@ class Manager {
   }
 }
 
-// Is this pid one of our model children (claude/node)? A pid can be reused after a
-// crash; a stranger is never signalled.
 // Same signal an abort sends (agent.js killGroup): the whole process group, then the
 // pid itself as a fallback. Guarded against pid ≤ 1 by the caller.
 function defaultKillProcessGroup(pid) {
@@ -786,10 +817,25 @@ function defaultKillProcessGroup(pid) {
   try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
 }
 
-function defaultProcessLooksLikeOurs(pid) {
+// Is this pid the model child we recorded? A pid can be recycled after a crash or a
+// reboot, so the command must look like ours (claude/node) AND the process must have
+// started when we recorded it (ps lstart within START_TOLERANCE_MS of pidStartedAt).
+// Returns true/false, or null when ps could not tell us (the caller then holds).
+const START_TOLERANCE_MS = 15000;
+function defaultProcessLooksLikeOurs(pid, pidStartedAt) {
+  if (pid === process.pid) return false;
   const { execFileSync } = require("child_process");
-  try { return /claude|node/i.test(execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { stdio: ["ignore", "pipe", "ignore"] }).toString()); }
-  catch { return false; }
+  // Two queries: combined columns truncate the command name on macOS.
+  const ps = (col) => execFileSync("ps", ["-o", `${col}=`, "-p", String(pid)], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  let command, lstart;
+  try { command = ps("command"); lstart = ps("lstart"); }
+  catch { return null; }
+  if (!command || !lstart) return false;                    // no such process any more
+  if (!/(^|\/)(claude|node)(\s|$)/i.test(command)) return false;
+  const started = Date.parse(lstart);
+  const recorded = Date.parse(pidStartedAt || "");
+  if (!Number.isFinite(started) || !Number.isFinite(recorded)) return null;
+  return Math.abs(started - recorded) <= START_TOLERANCE_MS;
 }
 
 async function defaultPing() {

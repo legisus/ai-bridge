@@ -365,18 +365,39 @@ const { TOKEN, advanceClock, tick, fakeAdapter, fakeRunAgent, build } = require(
     stuck.kill("SIGKILL");
   }
   {
-    // recovery never signals pid 0/1 or a pid that is not ours, whatever the stored item says
+    // recovery never signals pid 0/1, the daemon itself, or a pid whose start time does not match the record
+    const { spawn } = require("child_process");
     const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover5.json");
     const seed = new ChannelState(stateFile);
     seed.accept({ accountKey: "fake:default", eventId: "g1", item: { runId: "runG00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "bad pid", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
-    seed.setStatus("runG00000001", "running"); seed.update("runG00000001", { pid: 1 });
-    seed.accept({ accountKey: "fake:default", eventId: "g2", item: { runId: "runG00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "stranger", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
-    seed.setStatus("runG00000002", "running"); seed.update("runG00000002", { pid: process.pid });   // alive, but "not ours"
+    seed.setStatus("runG00000001", "running"); seed.update("runG00000001", { pid: 1, pidStartedAt: new Date().toISOString() });
+    seed.accept({ accountKey: "fake:default", eventId: "g2", item: { runId: "runG00000002", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "self", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runG00000002", "running"); seed.update("runG00000002", { pid: process.pid, pidStartedAt: new Date().toISOString() });   // the daemon's own pid, recycled
+    const reused = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    seed.accept({ accountKey: "fake:default", eventId: "g3", item: { runId: "runG00000003", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "reused pid", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runG00000003", "running"); seed.update("runG00000003", { pid: reused.pid, pidStartedAt: new Date(Date.now() - 86400e3).toISOString() });   // a node process, but started a day after the record says
     const a = fakeAdapter(); const ra = fakeRunAgent();
     let signalled = 0;
-    const { m, state } = build({ adapter: a, runAgent: ra, stateFile, processLooksLikeOurs: () => false, killProcessGroup: () => { signalled++; } });
-    await m.start(); await tick(100);
-    assert(signalled === 0 && state.queue().length === 0 && a.texts().filter((t) => /not replayed/.test(t)).length === 2, "recovery: pid 1 and a foreign pid are never signalled; items dropped as not replayed");
+    const { m, state } = build({ adapter: a, runAgent: ra, stateFile, killProcessGroup: (pid) => { signalled++; } });   // real identity check, counting killer
+    await m.start(); await tick(300);
+    let reusedAlive = true; try { process.kill(reused.pid, 0); } catch (e) { reusedAlive = e.code !== "ESRCH"; }
+    assert(signalled === 0 && reusedAlive && state.queue().length === 0 && a.texts().filter((t) => /not replayed/.test(t)).length === 3, "recovery: pid 1, the daemon's own pid and a start-time mismatch are never signalled; items dropped as not replayed");
+    reused.kill("SIGKILL");
+    await m.stop();
+  }
+  {
+    // recovery: a matching start time (real check) → the group killer is invoked
+    const { spawn } = require("child_process");
+    const own = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recover6.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:default", eventId: "k1", item: { runId: "runK00000001", channel: "fake", accountId: "default", chatId: "42", senderId: "42", task: "ours", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runK00000001", "running"); seed.update("runK00000001", { pid: own.pid, pidStartedAt: new Date().toISOString() });
+    const a = fakeAdapter(); const ra = fakeRunAgent();
+    const seen = [];
+    const { m } = build({ adapter: a, runAgent: ra, stateFile, killProcessGroup: (pid) => { seen.push(pid); own.kill("SIGKILL"); } });
+    await m.start(); await tick(300);
+    assert(seen.length === 1 && seen[0] === own.pid, "recovery: our own child with a matching start time is signalled exactly once");
     await m.stop();
   }
 

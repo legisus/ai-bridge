@@ -47,6 +47,10 @@ for (const [name, model, msg] of [["turo", "opus", "already used"], ["TURO", "op
   assert(e && e.message.includes(msg), `create: refuses ${name}/${model}`);
 }
 assert(store.create(other, "turo").name === "turo" && store.create(acct2, "turo").name === "turo", "create: names are per owner key");
+for (const bad of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+  let e = null; try { store.create(other, `m-${bad.replace(/_/g, "")}`.toLowerCase(), bad); } catch (err) { e = err; }
+  assert(e && /unknown model/.test(e.message), `create: inherited property "${bad}" is not a model`);
+}
 assert(store.get(owner, { name: "turo" }).id === r.id && store.get(owner, { name: "TURO" }).id === r.id && store.get(other, { id: r.id }) === null && store.get(acct2, { id: r.id }) === null, "get: by name (case-folded), scoped to the full owner key");
 assert(store.list(owner).map((x) => x.name).join(",") === "turo,tz" && store.list(acct2).length === 1, "list: creation order, per owner");
 for (let i = store.list(owner).length; i < 10; i++) store.create(owner, `s${i}`);
@@ -85,6 +89,18 @@ assert(store.stop(owner, r.id) === null && store.stop(other, store.list(owner)[0
 store.setCurrent(owner, null); assert(store.current(owner) === null, "setCurrent: null clears");
 assert(store.markStarted(store.list(owner)[0].id).started === true && store.markStarted("000000000000") === null, "markStarted: durable flag; unknown id null");
 assert(new S.SessionStore(file, { dir }).list(owner).length === 9 && new S.SessionStore(file, { dir }).list(owner)[0].started === true, "persistence: a fresh instance reads the same file");
+{
+  // a missing file is an empty store; a corrupt or unreadable one fails loudly instead of silently routing to the agent
+  const fresh = new S.SessionStore(path.join(process.env.AI_BRIDGE_HOME, "nope.json"), { dir });
+  assert(fresh.list(owner).length === 0 && fresh.current(owner) === null, "read: ENOENT is an empty store");
+  const corrupt = path.join(process.env.AI_BRIDGE_HOME, "corrupt.json"); fs.writeFileSync(corrupt, "{ not json");
+  let e = null; try { new S.SessionStore(corrupt, { dir }).list(owner); } catch (err) { e = err; }
+  assert(e && /channels-sessions|corrupt|JSON/i.test(e.message) && fs.readFileSync(corrupt, "utf8") === "{ not json", "read: corrupt JSON throws and the file is left alone");
+  fs.chmodSync(file, 0o000);
+  e = null; try { new S.SessionStore(file, { dir }).list(owner); } catch (err) { e = err; }
+  fs.chmodSync(file, 0o600);
+  assert(e && /EACCES|unreadable|permission/i.test(e.message), "read: an unreadable file throws");
+}
 
 fs.rmSync(process.env.AI_BRIDGE_HOME, { recursive: true, force: true });
 console.log(failures === 0 ? "\nAll sessions tests passed." : `\n${failures} test(s) FAILED.`);

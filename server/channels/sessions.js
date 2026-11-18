@@ -54,9 +54,18 @@ class SessionStore {
     this.now = now;
   }
 
+  // A missing file is an empty store. Anything else (unreadable, corrupt) throws: silently
+  // routing to the agent, or overwriting the file on the next write, would lose sessions.
   _read() {
+    let raw;
+    try { raw = fs.readFileSync(this.file, "utf8"); }
+    catch (e) {
+      if (e.code === "ENOENT") return { sessions: [], current: {}, last: {} };
+      throw new Error(`${path.basename(this.file)} unreadable: ${e.message}`);
+    }
     let d;
-    try { d = JSON.parse(fs.readFileSync(this.file, "utf8")); } catch { d = {}; }
+    try { d = JSON.parse(raw); } catch (e) { throw new Error(`${path.basename(this.file)} is corrupt (invalid JSON: ${e.message}); fix or move it before restarting`); }
+    if (!d || typeof d !== "object" || Array.isArray(d)) throw new Error(`${path.basename(this.file)} is corrupt (expected an object)`);
     return { sessions: Array.isArray(d.sessions) ? d.sessions : [], current: d.current || {}, last: d.last || {} };
   }
   _write(d) { atomicWrite(this.file, JSON.stringify(d) + "\n"); }
@@ -77,7 +86,8 @@ class SessionStore {
   create(owner, rawName, modelKey = "opus") {
     const name = normalizeName(rawName);
     if (!name) throw new Error("invalid session name");
-    const model = MODELS[String(modelKey || "opus").toLowerCase()];
+    const key = String(modelKey || "opus").toLowerCase();
+    const model = Object.prototype.hasOwnProperty.call(MODELS, key) ? MODELS[key] : null;
     if (!model) throw new Error("unknown model");
     return this._mutate((d) => {
       const rows = this._rows(d, owner);

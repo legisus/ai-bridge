@@ -101,8 +101,10 @@ pairing.save({ pending: [], approved: [
   assert(last() === "current target: turo", "use: reply");
   await say("/retry");
   assert(state.queue().filter((q) => q.task === "@literal task").length === 2 && state.queue().filter((q) => q.task === "@literal task").every((q) => !q.sessionId), "retry: agent target replayed as the agent without re-parsing routing");
-  await say("/pause turo"); await say("/retry");
-  assert(/^⏳ queued/.test(a.texts().slice(-1)[0]) || true, "retry: (agent target) unaffected by a paused current session");
+  await say("/pause turo");
+  const beforeRetry = state.queue().length;
+  await say("/retry");
+  assert(/^queue full/.test(last()) && state.queue().length === beforeRetry, "retry: refused by the cap, not by routing, while the current session is paused");
   await say("/resume turo");
 
   // ---- 6) /stop all
@@ -132,7 +134,10 @@ pairing.save({ pending: [], approved: [
   {
     pairing.save({ pending: [], approved: [{ channel: "fake", accountId: "default", senderId: "42", approvedAt: "x" }] });
     const classifyPrompts = [];
-    const timers = { fns: [], cleared: [], setInterval(fn) { this.fns.push(fn); return this.fns.length; }, clearInterval(id) { this.cleared.push(id); }, fire() { for (const f of this.fns) f(); } };
+    const timers = { active: new Map(), cleared: [], n: 0,
+      setInterval(fn) { this.n++; this.active.set(this.n, fn); return this.n; },
+      clearInterval(id) { this.cleared.push(id); this.active.delete(id); },
+      fire() { for (const f of [...this.active.values()]) f(); } };
     const a = fakeAdapter(); const ra = fakeRunAgent(); const rt = fakeRunTurn();
     const { m, state, sessions } = build({ adapter: a, runAgent: ra, runTurn: rt, timers, classify: async (prompt) => { classifyPrompts.push(prompt); return "read"; } });
     await m.start();
@@ -262,14 +267,59 @@ pairing.save({ pending: [], approved: [
     await say("k"); await tick(); rt.finish({ text: "next" }); await tick(80);
     assert(!a.texts().slice(idx).some((t) => /big\.bin/.test(t)) && last() === "[turo] next", "leftover: not reported again");
 
-    // ---- K) progress via the injected timers
+    // ---- K) progress via the injected timers: only while Claude is actually running
     await say("p"); await tick();
     const clearedBefore = timers.cleared.length;
-    timers.fire();
-    await tick();
-    assert(last() === "… [turo] thinking", "progress: labelled thinking line");
+    timers.fire(); await tick();
+    assert(last() === "… [turo] thinking", "progress: labelled thinking line while the turn runs");
+    rt.finish({ text: "NEEDS APPROVAL: p1" }); await tick();
+    const nTexts = a.texts().length;
+    timers.fire(); await tick();
+    assert(a.texts().length === nTexts && lastButtons().text === "[turo] Approval needed: p1", "progress: silent while waiting for an approval tap");
+    await tap("approve");
+    timers.fire(); await tick();
+    assert(last() === "… [turo] thinking", "progress: resumes during the continuation");
     rt.finish({ text: "done" }); await tick(80);
-    assert(timers.cleared.length > clearedBefore, "progress: interval cleared when the turn ends");
+    const nTexts2 = a.texts().length;
+    timers.fire(); await tick();
+    assert(timers.cleared.length > clearedBefore && timers.active.size === 0 && a.texts().length === nTexts2, "progress: interval cleared when the turn ends; firing afterwards sends nothing");
+
+    // ---- N) a failing prompt send is a journaled, labelled failure (whole lifecycle covered)
+    advanceClock(61000);
+    const origButtons = a.sendButtons.bind(a);
+    a.sendButtons = async () => { throw new Error("telegram blip"); };
+    const beforeN = rt.calls.length;
+    await say("send a note to Ann"); await tick(80);
+    a.sendButtons = origButtons;
+    assert(rt.calls.length === beforeN && a.texts().slice(-2)[0] === "❌ [turo] error — telegram blip" && last() === "[turo] reply /retry to send it again" && lastRec().verdict === "fail" && lastRec().mode === "session" && lastRec().task === "send a note to Ann" && state.queue().length === 0, "lifecycle: a failing intent prompt ends as a journaled, labelled fail");
+
+    // ---- O) full re-check before the intent gate: a paused session's queued write never asks for approval
+    await say("o1"); await tick();
+    await say("send o2");
+    sessions.pause(owner42, id);
+    const buttonsBefore = a.sent.filter((x) => x.type === "buttons").length;
+    rt.finish({ text: "o1 done" }); await tick(80);
+    assert(a.sent.filter((x) => x.type === "buttons").length === buttonsBefore && lastRec().task === "send o2" && lastRec().verdict === "declined" && a.texts().some((t) => t === "🚫 [turo] dropped — session paused or stopped"), "recheck: paused session's queued write is dropped before the intent gate");
+    sessions.resume(owner42, id);
+
+    // ---- P) files of a declined turn are stashed and reported, not stranded
+    advanceClock(61000);
+    await say("p2"); await tick();
+    const runIdP = state.queue()[0].runId;
+    fs.writeFileSync(path.join(dir, "early.png"), "PNG");
+    rt.finish({ text: "NEEDS APPROVAL: send p2" }); await tick();
+    await tap("deny"); await tick(80);
+    assert(a.texts().some((t) => t === `[turo] kept 1 file(s) in leftover/${runIdP}: early.png (turn declined)`) && fs.existsSync(path.join(dir, "leftover", runIdP, "early.png")) && !fs.existsSync(path.join(dir, "early.png")), "files: a declined turn's files go to leftover and are reported");
+    await say("p3"); await tick(); rt.finish({ text: "p3 done" }); await tick(80);
+    assert(!a.texts().slice(-2).some((t) => /early\.png/.test(t)) && last() === "[turo] p3 done", "files: not reported again by the next turn");
+
+    // ---- Q) an instruction file planted between a call and its continuation stops the continuation
+    await say("q1"); await tick();
+    rt.finish({ text: "NEEDS APPROVAL: go q" }); await tick();
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "planted");
+    const beforeQ = rt.calls.length;
+    await tap("approve"); await tick(80);
+    assert(rt.calls.length === beforeQ && /^❌ \[turo\] refused: the session directory contained an instruction file \(CLAUDE\.md\); moved to leftover\/quarantine-[0-9a-f]+$/.test(last()) && !fs.existsSync(path.join(dir, "CLAUDE.md")) && lastRec().verdict === "fail", "instruction file: scanned again before the continuation, quarantined, no spawn");
 
     // ---- M) /journal separates session turns
     advanceClock(61000);
@@ -278,6 +328,34 @@ pairing.save({ pending: [], approved: [
     const judged = recs7.filter((r) => r.mode !== "session"); const turns = recs7.filter((r) => r.mode === "session");
     const turnCost = turns.reduce((n, r) => n + (Number(r.costUsd) || 0), 0).toFixed(2);
     assert(turns.length > 5 && last().startsWith(`runs: ${judged.length}, pass rate: 0%`) && last().endsWith(`\nsession turns: ${turns.length}, $${turnCost}`), "journal: session turns counted and costed separately from judged runs");
+    await m.stop();
+  }
+
+  // ---- R) emergency commands work even when the sender is rate limited
+  {
+    pairing.save({ pending: [], approved: [{ channel: "fake", accountId: "default", senderId: "42", approvedAt: "x" }] });
+    const a = fakeAdapter(); const ra = fakeRunAgent(); const rt = fakeRunTurn();
+    const { m, state, sessions } = build({ adapter: a, runAgent: ra, runTurn: rt });
+    await m.start();
+    const say = (text) => a.emit({ senderId: "42", chatId: "42", eventId: `${text}#${a.sent.length}`, text });
+    const last = () => a.texts().pop();
+    advanceClock(61000);
+    await say("/new turo"); await say("r1"); await tick();
+    for (let i = 0; i < 20; i++) await say(`/status`);           // burn the 20/min bucket
+    await say("/status");
+    assert(last() === "rate limited; slow down and try again in a minute", "limiter: ordinary commands are limited");
+    const n = a.texts().length;
+    await say("/sessions");
+    assert(a.texts().length === n, "limiter: no second notice inside the minute");
+    const cur = m.current;
+    await say("/pause turo");
+    assert(last() === "paused turo; stopped its running turn" && cur.controller.signal.aborted === true && sessions.get(owner42, { name: "turo" }).state === "paused", "limiter: /pause still works while rate limited");
+    await say("/stop all");
+    assert(/^stopped: 1 sessions paused/.test(last()), "limiter: /stop all still works while rate limited");
+    await say("/cancel");
+    assert(/^(stopped;|nothing to cancel)/.test(last()), "limiter: /cancel still works while rate limited");
+    await say("/resume turo");
+    assert(a.texts().length === a.texts().length && last() !== "resumed turo", "limiter: /resume is an ordinary command and stays limited");
     await m.stop();
   }
 

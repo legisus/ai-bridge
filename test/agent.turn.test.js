@@ -69,6 +69,8 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
   // session id mismatch (runner returns another id)
   err = null; try { await runTurn({ model: "m", text: "x", claudeSessionId: U, resume: true, cwd, systemPrompt: "n" }, () => Promise.resolve({ result: "ok", session_id: "22222222-2222-4333-8444-555555555555", usage: {} })); } catch (e) { err = e; }
   assert(err && /session_id/.test(err.message), "runTurn: session_id mismatch is an error");
+  err = null; try { await runTurn({ model: "m", text: "x", claudeSessionId: U, resume: true, cwd, systemPrompt: "n" }, () => Promise.resolve({ result: "ok", usage: {} })); } catch (e) { err = e; }
+  assert(err && /session_id/.test(err.message), "runTurn: a result without session_id is an error");
 
   // missing transcript
   err = null; try { await runTurn({ model: "m", text: "x", claudeSessionId: U, resume: true, retryFresh: false, cwd, systemPrompt: "n", baseEnv: base({ FAKE_CLAUDE_MODE: "noconv" }), timeoutMs: 10000 }); } catch (e) { err = e; }

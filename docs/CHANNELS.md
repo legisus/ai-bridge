@@ -129,8 +129,17 @@ rather than silently starting a fresh conversation under the old name.
 
 `/journal` reports session turns on their own line (`session turns: N, $X`);
 they never count toward the pass rate of judged runs or toward recipe learning.
-After a daemon restart, a turn that was running is stopped (its process group is
-killed) and reported as not replayed; queued session messages run normally.
+
+**Restarts.** After a daemon restart, a session turn that was running is
+stopped (the daemon remembers the child's pid and start time, verifies both,
+and kills its process group) and reported as not replayed; queued session
+messages then run normally. In the rare case the old turn cannot be confirmed
+dead, the daemon keeps that item, tells you, drops your queued session messages
+for this daemon run, and holds your session turns until the next restart (your
+one-shot tasks still run). One-shot (`bridge agent`) runs that were in flight
+are *not* tracked this way: their children are not killed on restart, as before.
+`/pause`, `/stop`, `/stop all` and `/cancel` are accepted even while you are
+rate limited.
 
 ## Approvals: before, not after
 
@@ -272,3 +281,6 @@ unchanged. A built-in reverse connection is on the roadmap.
   `/new turo`. The daemon never substitutes another conversation.
 - **`session turo is paused`** — `/resume turo`, or `/use agent` to send
   one-shot tasks meanwhile.
+- **`channels-sessions.json is corrupt`** at start — the daemon refuses to run
+  with a damaged sessions file rather than forget your sessions; fix the JSON or
+  move the file aside.

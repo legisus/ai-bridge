@@ -324,10 +324,10 @@ async function runTurn({ model, text, claudeSessionId, resume, retryFresh = fals
     res = await attempt(false);
     freshStart = true;
   }
-  if (res.session_id && res.session_id !== claudeSessionId) {
-    throw new Error(`claude returned session_id ${res.session_id}, expected ${claudeSessionId}`);
+  if (!res || res.session_id !== claudeSessionId) {
+    throw new Error(`claude returned session_id ${res && res.session_id ? res.session_id : "(none)"}, expected ${claudeSessionId}`);
   }
-  return { text: String(res.result || ""), sessionId: res.session_id || claudeSessionId, usage: usageOf(res), freshStart, calls };
+  return { text: String(res.result || ""), sessionId: res.session_id, usage: usageOf(res), freshStart, calls };
 }
 
 function extractEvidence(resultText) {
