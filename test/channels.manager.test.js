@@ -12,7 +12,7 @@ const journal = require("../server/journal.js");
 
 let failures = 0;
 const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}`); if (!cond) failures++; };
-const { TOKEN, advanceClock, tick, fakeAdapter, fakeRunAgent, build } = require("./helpers/manager-fakes.js");
+const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = require("./helpers/manager-fakes.js");
 
 (async () => {
   // ---- 1) pairing: unknown sender gets one code message, then silence
@@ -398,6 +398,68 @@ const { TOKEN, advanceClock, tick, fakeAdapter, fakeRunAgent, build } = require(
     const { m } = build({ adapter: a, runAgent: ra, stateFile, killProcessGroup: (pid) => { seen.push(pid); own.kill("SIGKILL"); } });
     await m.start(); await tick(300);
     assert(seen.length === 1 && seen[0] === own.pid, "recovery: our own child with a matching start time is signalled exactly once");
+    await m.stop();
+  }
+
+  const TOKEN_B = "tok-secret-bbbb-5678";
+  const twoBots = { fake: { token: TOKEN, accountId: "default", dmPolicy: "pairing", allowFrom: [], codex: false, envPassthrough: ["MGR_PASS"], boundSession: null, bots: [
+    { accountId: "default", token: TOKEN, dmPolicy: "pairing", allowFrom: [], codex: false, envPassthrough: ["MGR_PASS"], boundSession: null },
+    { accountId: "b", token: TOKEN_B, dmPolicy: "pairing", allowFrom: [], codex: true, envPassthrough: ["MGR_PASS_B"], boundSession: null } ] } };
+  pairing.save({ pending: [], approved: [{ channel: "fake", accountId: "default", senderId: "42", approvedAt: "x" }, { channel: "fake", accountId: "b", senderId: "42", approvedAt: "x" }] });
+  process.env.MGR_PASS_B = "yes-b";
+  {
+    // two bots of one channel: each item runs with its own bot's config and is answered through its own adapter
+    advanceClock(61000);
+    const a1 = fakeAdapter(); const a2 = fakeAdapter({ accountId: "b" }); const ra = fakeRunAgent();
+    const { m, state } = build({ adapters: [a1, a2], runAgent: ra, config: twoBots });
+    await m.start();
+    await a2.emit({ senderId: "42", chatId: "42", eventId: "b1", text: "task for b" });
+    assert(await until(() => ra.calls.length === 1) && a2.texts().some((t) => /working on it/.test(t)) && a1.texts().length === 0, "two bots: ack through adapter b");
+    assert(ra.calls[0].opts.codex === true && ra.calls[0].opts.baseEnv.MGR_PASS_B === "yes-b" && !("MGR_PASS" in ra.calls[0].opts.baseEnv), "two bots: the item runs with bot b's own config (codex, passthrough)");
+    ra.finish({});
+    assert(await until(() => state.queue().length === 0) && a2.texts().some((t) => t.startsWith("✅ pass")) && a1.texts().length === 0, "two bots: item of account b runs and replies through adapter b");
+    // another bot's tap on a pending prompt is forbidden; a retained prompt is never edited through another adapter
+    await a1.emit({ senderId: "42", chatId: "42", eventId: "w1", text: "send the invoice" });
+    assert(await until(() => a1.sent.some((x) => x.type === "buttons")), "two bots: write intent asked on adapter a");
+    const prompt = a1.sent.find((x) => x.type === "buttons");
+    await a2.emitAction({ actorId: "42", chatId: "42", messageId: 1, data: prompt.buttons[0].data });
+    assert(ra.calls.length === 1 && !a2.sent.some((x) => x.type === "edit") && !a1.sent.some((x) => x.type === "edit"), "handleAction: another bot's tap is forbidden (no run, no edit)");
+    await a1.emitAction({ actorId: "42", chatId: "42", messageId: 1, data: prompt.buttons[1].data });
+    assert(await until(() => state.queue().length === 0), "two bots: decline settles the item");
+    m.prompts.set("deadbeefdeadbeef", { adapter: a1, chatId: "42", messageId: 7, text: "secret prompt" });
+    const origResolve = m.approvals.resolve.bind(m.approvals); m.approvals.resolve = () => "stale";
+    const edits = () => a1.sent.filter((x) => x.type === "edit").length + a2.sent.filter((x) => x.type === "edit").length;
+    const e0 = edits();
+    await a2.emitAction({ actorId: "42", chatId: "42", messageId: 7, data: encode("intent", "a", "deadbeefdeadbeef") });
+    assert(edits() === e0 && m.prompts.has("deadbeefdeadbeef"), "handleAction: stale id from another bot edits nothing");
+    m.approvals.resolve = origResolve;
+    await m.stop();
+  }
+  {
+    // recovery with two bots: notices go through the item's own adapter; a bot that vanished from the config → orphan handling first, then drop
+    const { spawn } = require("child_process");
+    const stateFile = path.join(process.env.AI_BRIDGE_HOME, "recoverTwo.json");
+    const seed = new ChannelState(stateFile);
+    seed.accept({ accountKey: "fake:b", eventId: "r1", item: { runId: "runR00000001", channel: "fake", accountId: "b", chatId: "42", senderId: "42", task: "was running on b" } });
+    seed.setStatus("runR00000001", "running");
+    const gone1 = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    seed.accept({ accountKey: "fake:gone", eventId: "r2", item: { runId: "runR00000002", channel: "fake", accountId: "gone", chatId: "42", senderId: "42", task: "bot removed, stoppable", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runR00000002", "running"); seed.update("runR00000002", { pid: gone1.pid, pidStartedAt: new Date().toISOString() });
+    const gone2 = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+    seed.accept({ accountKey: "fake:gone", eventId: "r3", item: { runId: "runR00000003", channel: "fake", accountId: "gone", chatId: "42", senderId: "42", task: "bot removed, unkillable", sessionId: "abc", sessionName: "turo", sessionGen: 1 } });
+    seed.setStatus("runR00000003", "running"); seed.update("runR00000003", { pid: gone2.pid, pidStartedAt: new Date().toISOString() });
+    seed.accept({ accountKey: "fake:gone", eventId: "r4", item: { runId: "runR00000004", channel: "fake", accountId: "gone", chatId: "42", senderId: "42", task: "queued for a removed bot" } });
+    const a1 = fakeAdapter(); const a2 = fakeAdapter({ accountId: "b" }); const ra = fakeRunAgent();
+    const signalled = [];
+    const { m, state } = build({ adapters: [a1, a2], runAgent: ra, config: twoBots, stateFile, processLooksLikeOurs: () => true,
+      killProcessGroup: (pid) => { signalled.push(pid); if (pid === gone1.pid) gone1.kill("SIGKILL"); } });
+    await m.start();
+    assert(await until(() => state.queue().filter((q) => q.runId === "runR00000001").length === 0), "two bots: recovery handled the b item");
+    assert(a2.texts().some((t) => /was running on b.*not replayed/.test(t)) && !a1.texts().some((t) => /was running on b/.test(t)), "two bots: recovery notice through the item's own adapter");
+    assert(signalled.includes(gone1.pid) && !state.queue().some((q) => q.runId === "runR00000002") && journal.readJournal({}).some((r) => r.runId === "runR00000002" && r.verdict === "declined"), "two bots: a vanished bot's stoppable orphan is stopped, then its item journaled declined and dropped");
+    assert(signalled.includes(gone2.pid) && state.queue().some((q) => q.runId === "runR00000003" && q.status === "running"), "two bots: a vanished bot's unkillable orphan keeps its item for the next restart");
+    assert(await until(() => !state.queue().some((q) => q.runId === "runR00000004")) && journal.readJournal({}).some((r) => r.runId === "runR00000004" && r.verdict === "declined") && ra.calls.length === 0, "two bots: a queued item for a vanished bot is dropped, never run through another bot");
+    gone2.kill("SIGKILL");
     await m.stop();
   }
 

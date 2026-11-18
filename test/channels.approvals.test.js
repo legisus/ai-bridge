@@ -27,6 +27,23 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
     assert((await promise) === "approved", "promise resolves approved");
     assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale", "resolve: second click → stale");
   }
+  // ownership is checked before "stale": a foreign account never learns a record settled
+  {
+    const A = new Approvals({ ttlMs: 1000, now: () => 0 });
+    const { id } = A.create(base);
+    A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "d" });
+    assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "turo", chatId: "100", kind: "intent", decision: "a" }) === "forbidden", "resolve: a settled record answers forbidden, not stale, to another account");
+    assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale", "resolve: the owner still gets stale after settlement");
+    assert(A.resolve({ id: "ffffffffffffffff", actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale", "resolve: an unknown id is stale");
+  }
+  {
+    let t = 0;
+    const A = new Approvals({ ttlMs: 1000, now: () => t });
+    const { id, promise } = A.create(base);
+    t = 2000;
+    assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "turo", chatId: "100", kind: "intent", decision: "a" }) === "forbidden", "resolve: an expired record is forbidden to a foreign account");
+    assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale" && (await promise) === "denied", "resolve: the owner gets stale for an expired record, which settles denied");
+  }
   // other actor forbidden, promise pending
   {
     const A = new Approvals();

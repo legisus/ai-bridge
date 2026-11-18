@@ -251,7 +251,9 @@ scrubbed child environment, no recipe learning. Unknown senders get a pairing
 code and nothing else. `/new turo` opens a **session**: a named conversation
 that remembers your earlier messages, with `/use`, `/pause`, `/resume`,
 `/stop [name|all]` and `@turo …` to keep several jobs going and switch between
-them from one chat (turns still run one at a time). Details, the two-machine (server + laptop) recipe, and troubleshooting:
+them from one chat (turns still run one at a time), or bind one bot per job
+(`"bots": [{ "accountId": "turo", "token": "…", "session": "turo" }]`) so that
+each bot's chat simply *is* that conversation. Details, the two-machine (server + laptop) recipe, and troubleshooting:
 **[docs/CHANNELS.md](docs/CHANNELS.md)**.
 
 ## Concurrency

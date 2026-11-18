@@ -46,12 +46,14 @@ function acquireLock() {
   throw new Error(`could not acquire ${LOCK_FILE}`);
 }
 
+// One adapter per bot (a channel's `bots` list, or the channel itself in the one-bot form).
 function buildAdapters(config, deps) {
   const out = [];
   for (const [name, cfg] of Object.entries(config)) {
     const make = ADAPTERS[name];
     if (!make) throw new Error(`unknown channel "${name}" in channels.json; known channels: ${Object.keys(ADAPTERS).join(", ")}`);
-    out.push(make()(cfg, deps));
+    const bots = Array.isArray(cfg.bots) && cfg.bots.length ? cfg.bots : [cfg];
+    for (const bot of bots) out.push(make()(bot, deps));
   }
   return out;
 }
@@ -86,8 +88,14 @@ function status() {
   console.log(pid ? `daemon: ${pidAlive(pid) ? "running" : "not running (stale lock)"} (pid ${pid})` : "daemon: not running");
   let config;
   try { config = loadConfig(); } catch (e) { console.log(`config: ${e.message}`); return; }
+  const { MODELS } = require("./sessions");
+  const modelKey = (id) => Object.keys(MODELS).find((k) => MODELS[k] === id) || id;
   for (const [name, c] of Object.entries(config)) {
-    console.log(`channel ${name}: dmPolicy ${c.dmPolicy}, allowFrom ${c.allowFrom.length ? c.allowFrom.join(",") : "(none)"}, codex ${c.codex ? "on" : "off"}`);
+    const bots = Array.isArray(c.bots) && c.bots.length ? c.bots : [c];
+    for (const b of bots) {
+      const bound = b.boundSession ? `${b.boundSession.name} (${modelKey(b.boundSession.model)})` : "none";
+      console.log(`channel ${name}/${b.accountId || "default"}: dmPolicy ${b.dmPolicy}, allowFrom ${b.allowFrom.length ? b.allowFrom.join(",") : "(none)"}, codex ${b.codex ? "on" : "off"}, session ${bound}`);
+    }
   }
 }
 

@@ -37,11 +37,11 @@ assert(eq(S.parseRoute("plain text"), { kind: "plain", text: "plain text" }), "p
 // store
 const store = new S.SessionStore(file, { dir, now: () => clock });
 const r = store.create(owner, "Turo");
-assert(/^[0-9a-f]{12}$/.test(r.id) && /^[0-9a-f-]{36}$/.test(r.claudeSessionId) && r.name === "turo" && r.model === "claude-opus-5-5" && r.state === "active" && r.gen === 1 && r.started === false && r.turns === 0 && eq(r.recent, []) && eq(r.declined, []), "create: row defaults");
+assert(/^[0-9a-f]{12}$/.test(r.id) && /^[0-9a-f-]{36}$/.test(r.claudeSessionId) && r.name === "turo" && r.model === "claude-fable-5-1" && r.state === "active" && r.gen === 1 && r.started === false && r.turns === 0 && eq(r.recent, []) && eq(r.declined, []), "create: row defaults");
 assert(r.channel === "fake" && r.accountId === "default" && r.senderId === "42" && r.chatId === "42" && r.createdAt && r.lastUsedAt === r.createdAt, "create: owner fields and timestamps");
 assert((fs.statSync(store.dirOf(r.id)).mode & 0o777) === 0o700 && (fs.statSync(file).mode & 0o777) === 0o600, "create: dir 0700, file 0600");
 assert(store.current(owner).id === r.id && store.current(other) === null && store.current(acct2) === null, "create: current for its owner only (sender id alone is not identity)");
-assert(store.create(owner, "tz", "fable").model === "claude-fable-5-1", "create: model key mapped");
+assert(store.create(owner, "tz", "opus").model === "claude-opus-5-5", "create: model key mapped (default is fable, opus by name)");
 for (const [name, model, msg] of [["turo", "opus", "already used"], ["TURO", "opus", "already used"], ["agent", "opus", "invalid"], ["x", "gpt", "unknown model"]]) {
   let e = null; try { store.create(owner, name, model); } catch (err) { e = err; }
   assert(e && e.message.includes(msg), `create: refuses ${name}/${model}`);

@@ -15,7 +15,7 @@ const { chunk } = require("./chunk");
 const outbox = require("./outbox");
 const { cleanEnv, isInstructionPath } = require("./restricted");
 const { classifyIntent, DEFAULT_KEYWORDS } = require("./intent");
-const { SessionStore, parseRoute, MODELS } = require("./sessions");
+const { SessionStore, parseRoute, MODELS, DEFAULT_MODEL_KEY } = require("./sessions");
 const { redact } = require("./config");
 const agent = require("../agent");
 const journal = require("../journal");
@@ -46,6 +46,22 @@ const HELP = `Commands:
 @<name> <text> — one message to a session
 /help — this list
 Anything else is a task for the browser agent, or for your current session.`;
+
+// A bound bot (channels.json `session`) is one conversation: the session commands that
+// pick or create sessions are refused, the rest control that one row.
+const HELP_BOUND = `Commands:
+/ping — relay + extension health
+/status — daemon uptime, queue, current run, this bot's conversation
+/journal [days] — runs, pass rate, cost (all channels)
+/approve <id> yes|no — answer an approval by text
+/retry — send your last message again
+/cancel — stop the running turn and drop your queued messages
+/pause — pause this conversation (stops its turn)
+/resume — unpause
+/stop — start the conversation over (forgets the old one)
+/sessions — show this conversation
+/help — this list
+Plain text continues the conversation.`;
 
 const rid = () => crypto.randomBytes(6).toString("hex");
 const modelKey = (model) => Object.keys(MODELS).find((k) => MODELS[k] === model) || model;
@@ -92,8 +108,15 @@ class Manager {
   sameOwner(item, owner) { return item.channel === owner.channel && (item.accountId || "default") === (owner.accountId || "default") && String(item.senderId) === String(owner.senderId); }
   label(item) { return item && item.sessionName ? `[${item.sessionName}] ` : ""; }
 
-  adapterFor(channel) { return this.adapters.find((a) => a.id === channel); }
-  cfgFor(adapter) { return this.config[adapter.id] || {}; }
+  // Adapters and configs are per bot: (channel, accountId), never channel alone.
+  adapterFor(channel, accountId = "default") {
+    return this.adapters.find((a) => a.id === channel && (a.accountId || "default") === (accountId || "default"));
+  }
+  cfgFor(adapter) {
+    const ch = this.config[adapter.id] || {};
+    const bot = Array.isArray(ch.bots) ? ch.bots.find((b) => (b.accountId || "default") === (adapter.accountId || "default")) : null;
+    return bot || ch;
+  }
   accountKey(adapter, evt) { return `${adapter.id}:${evt.accountId || adapter.accountId || "default"}`; }
   senderKey(adapter, evt) { return `${this.accountKey(adapter, evt)}:${evt.senderId}`; }
   red(text) { return redact(text, this.config); }
@@ -147,7 +170,7 @@ class Manager {
   // owner's queued session turns are dropped rather than run behind it.
   async recover() {
     for (const item of this.state.queue().filter((q) => q.status !== "queued")) {
-      const adapter = this.adapterFor(item.channel);
+      const adapter = this.adapterFor(item.channel, item.accountId);   // may be gone from the config: no notice, never another bot
       if (item.status === "done" || this.hasJournal(item.runId)) {
         // The run finished; delivery was interrupted. Its verdict is in the journal.
         if (adapter) await this.send(adapter, item.chatId, `restarted; the result of "${item.task}" was lost before delivery (not delivered); see /journal`);
@@ -202,10 +225,10 @@ class Manager {
   journalRun(item, verdict, feedback) {
     if (this.hasJournal(item.runId)) return;
     try {
-      const rec = agent.journalRecord({ runId: item.runId, task: item.task, startedAt: item.acceptedAt || new Date().toISOString(), stages: [],
-        verdict: { verdict, feedback }, mode: item.sessionId ? "session" : "regular", evidence: "" });
+      const rec = agent.journalRecord({ runId: item.runId, task: this.red(item.task), startedAt: item.acceptedAt || new Date().toISOString(), stages: [],
+        verdict: { verdict, feedback: this.red(feedback) }, mode: item.sessionId ? "session" : "regular", evidence: "" });
       rec.source = `channel:${item.channel}`;
-      rec.feedback = feedback;
+      rec.feedback = this.red(feedback);
       if (item.sessionId) { rec.session = item.sessionName; rec.sessionId = item.sessionId; }
       this.journal.appendJournal(rec);
     } catch (e) { this.log(`journal write failed: ${e.message}`); }
@@ -235,7 +258,8 @@ class Manager {
       const last = this.state.getNotice(noticeKey) || 0;
       if (this.now() - last >= NOTICE_EVERY_MS) {
         this.state.setNotice(noticeKey, this.now());
-        await this.send(adapter, evt.chatId, `Not paired. Code: ${code}. The operator runs: bridge pairing approve ${adapter.id} ${code}`);
+        const bound = cfg.boundSession ? ` (this bot is the "${cfg.boundSession.name}" conversation; your message was not kept — send it again once paired)` : "";
+        await this.send(adapter, evt.chatId, `Not paired. Code: ${code}. The operator runs: bridge pairing approve ${adapter.id} ${code}${bound}`);
         this.log(`pairing request from ${senderKey}`);
       }
       return;
@@ -260,8 +284,24 @@ class Manager {
     if (!text) { seen(); return this.send(adapter, evt.chatId, "attachments are not supported yet; send the task as text"); }
     if (text.startsWith("/")) { seen(); return this.handleCommand(adapter, evt, who, text); }
 
-    // a task: resolve its target (a named session, the current session, or the agent)
     const owner = this.ownerOf(adapter, evt);
+    // A bound bot: every plain message (an @-prefixed one too) goes to its one row.
+    const bound = cfg.boundSession || null;
+    if (bound) {
+      let row = this.sessions.get(owner, { name: bound.name });
+      if (row && row.model !== bound.model) { seen(); return this.send(adapter, evt.chatId, this.modelConflictLine(row.model, bound.model)); }
+      if (!row) {
+        try { row = this.sessions.create(owner, bound.name, modelKey(bound.model)); this.log(`session ${row.id} (${row.name}) created for bound bot ${this.ownerKeyOf(row)}`); }
+        catch (e) {
+          seen();
+          return this.send(adapter, evt.chatId, /max 10/.test(e.message) ? "cannot start the conversation: too many sessions on this bot (max 10); the operator can clear them" : `cannot start the conversation: ${e.message}`);
+        }
+      }
+      if (row.state !== "active") { seen(); return this.send(adapter, evt.chatId, `session ${row.name} is paused; /resume`); }
+      return this.enqueue(adapter, owner, { text, target: { kind: "session", row }, accountKey, eventId });
+    }
+
+    // a task: resolve its target (a named session, the current session, or the agent)
     const route = parseRoute(text);
     if (route.kind === "usage") { seen(); return this.send(adapter, evt.chatId, `usage: @${route.name} <message>`); }
     let target = { kind: "agent" };
@@ -323,10 +363,83 @@ class Manager {
 
   // ---- commands ------------------------------------------------------------------
 
+  boundRefusal(bound) { return `this bot is bound to session ${bound.name}: plain text goes to it, /pause and /resume control it, /stop starts it over`; }
+  modelConflictLine(rowModel, botModel) { return `this conversation runs on ${modelKey(rowModel)}, the bot is configured for ${modelKey(botModel)}; /stop to start over on ${modelKey(botModel)}`; }
+  // The current run's text is shown only to its own owner.
+  currentLine(owner) {
+    if (!this.current) return "idle";
+    const it = this.current.item;
+    return this.sameOwner(it, owner) ? `run ${it.runId} (${it.status || "running"}): ${this.red(it.task).slice(0, 80)}` : "busy (another chat)";
+  }
+
+  // Commands on a bound bot. Returns undefined for the commands the shared handler owns.
+  async handleBoundCommand(adapter, evt, owner, bound, cmd, args) {
+    const chatId = evt.chatId;
+    const say = async (t) => { await this.send(adapter, chatId, t); return true; };   // true = handled
+    // The store is read only by the commands that need the row, so /cancel (and the
+    // shared commands) keep working when channels-sessions.json cannot be read.
+    const rowOf = () => this.sessions.get(owner, { name: bound.name });
+    const onlyOne = `this bot only has the conversation "${bound.name}"`;
+    const noRow = "no conversation yet; just send a message";
+    const nameOk = args.length === 0 || (args.length === 1 && String(args[0]).toLowerCase() === bound.name);
+    let row;
+    switch (cmd) {
+      case "/new": case "/use": return say(this.boundRefusal(bound));
+      case "/start": return say(this.boundRefusal(bound) + "\n" + HELP_BOUND);
+      case "/help": return say(HELP_BOUND);
+      case "/status": {
+        row = rowOf();
+        const up = Math.round((this.now() - this.startedAt) / 1000);
+        return say(`uptime: ${up}s\nqueue: ${this.state.queue().length}\ncurrent: ${this.currentLine(owner)}\nbound: ${bound.name} (${modelKey(bound.model)})\nconversation: ${row ? `${row.state}, ${row.turns} turns` : "none yet"}`);
+      }
+      case "/sessions": { row = rowOf(); return say(row ? `* ${row.name} (${modelKey(row.model)}, ${row.turns} turns, ${row.state}, ${this.ageLabel(row)})\ncurrent: ${row.name}` : noRow); }
+      case "/pause": {
+        if (!nameOk) return say(onlyOne);
+        row = rowOf();
+        if (!row) return say(noRow);
+        this.sessions.pause(owner, row.id);
+        const r = this.abortAndDrop(owner, row.id, `session ${row.name} paused`);
+        return say(`paused ${row.name}${r.aborted ? "; stopped its running turn" : ""}${r.dropped ? `; dropped ${r.dropped} queued` : ""}`);
+      }
+      case "/resume": {
+        if (!nameOk) return say(onlyOne);
+        row = rowOf();
+        if (!row) return say(noRow);
+        this.sessions.resume(owner, row.id);
+        return say(`resumed ${row.name}`);
+      }
+      case "/stop": {
+        if (args[0] && String(args[0]).toLowerCase() === "all") return say(this.boundRefusal(bound));
+        if (!nameOk) return say(onlyOne);
+        row = rowOf();
+        if (!row) return say(noRow);
+        this.sessions.stop(owner, row.id);
+        this.abortAndDrop(owner, row.id, `session ${row.name} stopped`);
+        this.log(`session ${row.id} (${row.name}) stopped (bound bot)`);
+        return say(`stopped ${row.name}; your next message starts a fresh conversation`);
+      }
+      case "/retry": {
+        const lastMsg = this.sessions.last(owner);
+        row = rowOf();
+        if (!lastMsg || !row || lastMsg.sessionId !== row.id) return say("cannot retry: that message was not for this conversation; send a new message");
+        if (row.model !== bound.model) return say(this.modelConflictLine(row.model, bound.model));
+        if (row.state !== "active") return say(`session ${row.name} is paused; /resume`);
+        await this.enqueue(adapter, owner, { text: lastMsg.text, target: { kind: "session", row }, accountKey: this.accountKey(adapter, evt), eventId: evt.eventId != null ? `${evt.eventId}:retry` : null, record: false });
+        return true;
+      }
+      default: return undefined;
+    }
+  }
+
   async handleCommand(adapter, evt, who, text) {
     const [cmd, ...args] = text.split(/\s+/);
     const chatId = evt.chatId;
     const owner = this.ownerOf(adapter, evt);
+    const cfg = this.cfgFor(adapter);
+    if (cfg.boundSession) {
+      const r = await this.handleBoundCommand(adapter, evt, owner, cfg.boundSession, cmd.toLowerCase(), args);
+      if (r !== undefined) return r;
+    }
     const byName = (raw) => this.sessions.get(owner, { name: raw });
     const noSuch = (raw) => this.send(adapter, chatId, `no session named ${String(raw).toLowerCase()}; /sessions`);
     switch (cmd.toLowerCase()) {
@@ -337,14 +450,13 @@ class Manager {
       }
       case "/status": {
         const up = Math.round((this.now() - this.startedAt) / 1000);
-        const cur = this.current ? `run ${this.current.item.runId} (${this.current.item.status || "running"}): ${this.current.item.task.slice(0, 80)}` : "idle";
         const curSession = this.sessions.current(owner);
-        return this.send(adapter, chatId, `uptime: ${up}s\nqueue: ${this.state.queue().length}\ncurrent: ${cur}\nsessions: ${this.sessions.list(owner).length} (current: ${curSession ? curSession.name : "agent"})`);
+        return this.send(adapter, chatId, `uptime: ${up}s\nqueue: ${this.state.queue().length}\ncurrent: ${this.currentLine(owner)}\nsessions: ${this.sessions.list(owner).length} (current: ${curSession ? curSession.name : "agent"})`);
       }
       case "/new": {
         if (args.length < 1 || args.length > 2) return this.send(adapter, chatId, "usage: /new <name> [opus|fable|haiku]");
         try {
-          const row = this.sessions.create(owner, args[0], args[1] || "opus");
+          const row = this.sessions.create(owner, args[0], args[1] || DEFAULT_MODEL_KEY);
           this.log(`session ${row.id} (${row.name}) created by ${this.ownerKeyOf(row)}`);
           return this.send(adapter, chatId, `created session ${row.name} (${modelKey(row.model)}); it is now current. Plain text goes to it; /use agent to go back.`);
         } catch (e) {
@@ -457,7 +569,7 @@ class Manager {
   async ask(adapter, item, { kind, text, signal, digest, label = "" }) {
     const { id, promise } = this.approvals.create({ runId: item.runId, kind, digest: digest || digestOf(text), channel: item.channel,
       accountId: item.accountId, chatId: item.chatId, senderId: item.senderId, signal });
-    text = label + text;
+    text = this.red(label + text);   // redacted before truncation; the stored body is what was sent
     const limit = adapter.capabilities.textLimit || 4000;
     let messageId = null;
     if (adapter.capabilities.buttons && adapter.sendButtons) {
@@ -487,6 +599,7 @@ class Manager {
       chatId: action.chatId, kind: parsed.kind, decision: parsed.decision });
     await ack(result === "forbidden" ? "not yours" : undefined);
     if (result === "forbidden") return;
+    if (prompt && prompt.adapter !== adapter) return;   // a prompt is edited only through the bot that sent it
     const target = prompt || { adapter, chatId: action.chatId, messageId: action.messageId, text: "" };
     if (!adapter.editMessage || target.messageId == null) return;
     const suffix = result === "approved" ? "→ approved" : result === "denied" ? "→ declined" : "(no longer pending)";
@@ -517,11 +630,34 @@ class Manager {
     } finally { this.draining = false; }
   }
 
-  quote(task) { return task.length > QUOTE_MAX ? task.slice(0, QUOTE_MAX) + "…" : task; }
+  // Redacted first, then truncated: a token straddling the cut never survives in part.
+  quote(task) { const t = this.red(task); return t.length > QUOTE_MAX ? t.slice(0, QUOTE_MAX) + "…" : t; }
+
+  // One-shot runs are journaled here (runAgent is told not to), so the record is
+  // redacted and written before anything is delivered.
+  journalOneShot(item, report) {
+    if (this.hasJournal(item.runId)) return;
+    const base = (report && report.record) || {};
+    const v = (report && report.verdict) || { verdict: "fail", feedback: "no verdict" };
+    const now = new Date().toISOString();
+    const task = this.red(item.task);
+    const rec = { ...base, runId: item.runId, task, mode: base.mode || (report && report.mode) || "regular",
+      signature: journal.signatureOf({ job: base.job || null, task, domains: base.domains || [] }),   // never the raw-task signature
+      startedAt: base.startedAt || item.acceptedAt || now, endedAt: base.endedAt || now, verdict: v.verdict, feedback: this.red(v.feedback || ""),
+      evidence: this.red(String((report && report.evidence) || base.evidence || "")).slice(0, 4000), source: `channel:${item.channel}` };   // redact, then cut
+    if (!Array.isArray(rec.stages)) rec.stages = (report && report.stages) || [];
+    try { this.journal.appendJournal(rec); } catch (e) { this.log(`journal write failed: ${e.message}`); }
+  }
 
   async runOne(item) {
-    const adapter = this.adapterFor(item.channel);
-    if (!adapter) { this.state.remove((q) => q.runId === item.runId); return; }
+    const adapter = this.adapterFor(item.channel, item.accountId);
+    if (!adapter) {
+      // The bot was removed from channels.json: the item is never run through another bot.
+      this.journalDeclined(item, "no adapter for this bot (removed from channels.json)");
+      this.state.remove((q) => q.runId === item.runId);
+      this.log(`run ${item.runId} dropped: no adapter for ${item.channel}/${item.accountId || "default"}`);
+      return;
+    }
     const cfg = this.cfgFor(adapter);
     const controller = new AbortController();
     this.current = { item, controller };
@@ -534,6 +670,22 @@ class Manager {
         return;
       }
       setStatus("running");
+      // A bound bot runs nothing but its own conversation: items from before the binding,
+      // other rows, or a row of another model are dropped here, whatever queued them.
+      const bound = cfg.boundSession || null;
+      if (bound) {
+        if (!item.sessionId || item.sessionName !== bound.name) {
+          this.journalDeclined(item, `bot is bound to session ${bound.name}`);
+          await this.send(adapter, item.chatId, `🚫 dropped — this bot is bound to session ${bound.name}`);
+          return;
+        }
+        const row = this.sessions.get({ channel: item.channel, accountId: item.accountId, senderId: item.senderId }, { id: item.sessionId });
+        if (row && row.model !== bound.model) {
+          this.journalDeclined(item, "model conflict with the bot's configured session model");
+          await this.send(adapter, item.chatId, `🚫 [${bound.name}] ${this.modelConflictLine(row.model, bound.model)}`);
+          return;
+        }
+      }
       if (item.sessionId) { await this.runSessionTurn(adapter, cfg, item, controller, setStatus); return; }
       // Gate 1: intent.
       const intent = await classifyIntent(item.task, {
@@ -565,7 +717,7 @@ class Manager {
       dir = outbox.createOutbox(item.runId);
       const report = await this.runAgent(item.task, {
         runId: item.runId, restricted: true, codex: cfg.codex === true, cwd: dir, signal: controller.signal, source: `channel:${item.channel}`,
-        baseEnv: cleanEnv(process.env, cfg.envPassthrough),
+        baseEnv: cleanEnv(process.env, cfg.envPassthrough), noJournal: true,
         approve: async (req) => {
           setStatus("awaiting-approval");
           const d = await this.ask(adapter, item, { kind: req.kind || "step", signal: controller.signal, digest: req.digest,
@@ -578,6 +730,7 @@ class Manager {
           if (t - this.lastProgressAt >= PROGRESS_EVERY_MS) { this.lastProgressAt = t; this.send(adapter, item.chatId, `… ${st.stage}`); }
         },
       });
+      this.journalOneShot(item, report);
       setStatus("done");
       await this.deliver(adapter, item, report, dir);
     } catch (e) {
@@ -620,10 +773,10 @@ class Manager {
     const writeJournal = (verdict, feedback, text) => {
       if (this.hasJournal(item.runId)) return;
       try {
-        const rec = agent.journalRecord({ runId: item.runId, task: item.task, startedAt, stages, verdict: { verdict, feedback }, mode: "session", evidence: text || "" });
+        const rec = agent.journalRecord({ runId: item.runId, task: this.red(item.task), startedAt, stages, verdict: { verdict, feedback: this.red(feedback) }, mode: "session", evidence: this.red(text || "") });
         rec.source = `channel:${item.channel}`;
         rec.session = name; rec.sessionId = item.sessionId; rec.calls = calls.slice();
-        if (feedback) rec.feedback = feedback;
+        if (feedback) rec.feedback = this.red(feedback);
         this.journal.appendJournal(rec);
       } catch (e) { this.log(`journal write failed: ${e.message}`); }
     };
@@ -727,7 +880,7 @@ class Manager {
       else if (e && e.code === INSTRUCTION) { verdict = "fail"; feedback = e.message; errorText = `refused: ${e.message}`; }
       else if (/No conversation found with session ID/.test(String(e && e.message))) {
         verdict = "fail"; feedback = "transcript missing";
-        errorText = `this session's conversation is no longer available (Claude keeps transcripts ~30 days); /stop ${name} and /new ${name} to start over`;
+        errorText = `this session's conversation is no longer available (Claude keeps transcripts ~30 days); ${cfg.boundSession ? "/stop, then send a new message" : `/stop ${name} and /new ${name} to start over`}`;
       } else { verdict = "fail"; feedback = String(e && e.message); errorText = `error — ${feedback}`; this.log(`run ${item.runId} error: ${feedback}`); }
     } finally {
       if (timer != null) this.timers.clearInterval(timer);

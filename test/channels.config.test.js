@@ -57,6 +57,69 @@ assert(redact("sent sec-ret_TOKEN:1 to x", cfg) === "sent <redacted> to x", "red
 assert(redact("nothing here", cfg) === "nothing here", "redact: untouched when no token present");
 assert(redact(null, cfg) === "", "redact: null → empty string");
 
+// ---- several bots per channel
+const TA = "sentinel-token-AAAA:1", TB = "sentinel-token-BBBB:2", TC = "sentinel-token-CCCC:3";
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { dmPolicy: "allowlist", allowFrom: [1], envPassthrough: ["X"], bots: [
+  { accountId: "turo", token: TB, session: "Turo" },
+  { accountId: "mail", token: TC, session: "mail", model: "haiku", dmPolicy: "pairing", apiBase: "http://x", envPassthrough: ["Y"] },
+  { accountId: "default", token: TA } ] } }), { mode: 0o600 });
+cfg = loadConfig({ env: {} });
+assert(cfg.telegram.bots.length === 3 && cfg.telegram.bots[0].accountId === "turo" && cfg.telegram.bots[0].dmPolicy === "allowlist" && JSON.stringify(cfg.telegram.bots[0].allowFrom) === '["1"]' && JSON.stringify(cfg.telegram.bots[0].envPassthrough) === '["X"]' && cfg.telegram.bots[0].codex === false && JSON.stringify(cfg.telegram.bots[0].boundSession) === '{"name":"turo","model":"claude-fable-5-1"}', "bots: channel defaults merged into each bot, session name normalised, model default fable");
+assert(cfg.telegram.bots[2].boundSession === null && cfg.telegram.bots[1].dmPolicy === "pairing" && cfg.telegram.bots[1].apiBase === "http://x" && JSON.stringify(cfg.telegram.bots[1].envPassthrough) === '["Y"]' && cfg.telegram.bots[1].boundSession.model === "claude-haiku-5-5", "bots: unbound bot, per-bot overrides kept");
+assert(cfg.telegram.token === TA && cfg.telegram.accountId === "default" && cfg.telegram.dmPolicy === "allowlist", "bots: flat token/accountId alias the default bot even when listed last; channel defaults stay flat");
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { apiBase: "http://shared", bots: [{ accountId: "default", token: TA }, { accountId: "turo", token: TB, apiBase: "http://own" }] } }), { mode: 0o600 });
+cfg = loadConfig({ env: {} });
+assert(cfg.telegram.bots[0].apiBase === "http://shared" && cfg.telegram.bots[1].apiBase === "http://own" && cfg.telegram.apiBase === "http://shared", "bots: channel-level apiBase is a default every bot inherits");
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t", accountId: "solo", apiBase: "http://y", allowFrom: [5] } }), { mode: 0o600 });
+cfg = loadConfig({ env: {} });
+assert(cfg.telegram.bots.length === 1 && cfg.telegram.bots[0].accountId === "solo" && cfg.telegram.bots[0].token === "t" && cfg.telegram.bots[0].apiBase === "http://y" && JSON.stringify(cfg.telegram.bots[0].allowFrom) === '["5"]' && cfg.telegram.bots[0].boundSession === null && cfg.telegram.accountId === "solo", "one-bot form: bots[0] mirrors the flat fields incl. a custom accountId");
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "E:9" } });
+assert(cfg.telegram.bots[0].token === "E:9" && cfg.telegram.token === "E:9", "one-bot form: the generic env token applies to the lone bot whatever its accountId");
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "E:9", AI_BRIDGE_TELEGRAM_SOLO_TOKEN: "S:1" } });
+assert(cfg.telegram.bots[0].token === "S:1", "one-bot form: the account-specific env token wins over the generic one");
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { bots: [{ accountId: "default" }, { accountId: "turo", session: "turo" }] } }), { mode: 0o600 });
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "D:0", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "T:1" } });
+assert(cfg.telegram.bots[0].token === "D:0" && cfg.telegram.bots[1].token === "T:1", "bots: env overrides apply before the token check (env-only credentials); generic → default only");
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_DEFAULT_TOKEN: "DT:1", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "T:1" } });
+assert(cfg.telegram.bots[0].token === "DT:1", "bots: AI_BRIDGE_TELEGRAM_DEFAULT_TOKEN reaches the default bot");
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "G:0", AI_BRIDGE_TELEGRAM_DEFAULT_TOKEN: "DT:2", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "T:1" } });
+assert(cfg.telegram.bots[0].token === "DT:2", "bots: the account-specific key wins over the generic one for the default bot too");
+err = null; try { loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "SAME", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "SAME" } }); } catch (e) { err = e; }
+assert(err && /same token/.test(err.message) && !/SAME/.test(err.message), "bots: duplicate tokens produced by overrides are rejected without echoing the token");
+for (const [name, body, re] of [
+  ["token+bots", { telegram: { token: "t", bots: [{ accountId: "a", token: "x" }] } }, /either token or bots/],
+  ["bad accountId", { telegram: { bots: [{ accountId: "Bad Id", token: "x" }] } }, /accountId "Bad Id" is invalid/],
+  ["duplicate accountId", { telegram: { bots: [{ accountId: "a", token: "x" }, { accountId: "a", token: "y" }] } }, /duplicate accountId "a"/],
+  ["two defaults", { telegram: { bots: [{ token: "x" }, { token: "y" }] } }, /duplicate accountId "default"/],
+  ["missing token", { telegram: { bots: [{ accountId: "a" }] } }, /telegram\/a[^]*no token|no token[^]*telegram\/a/],
+  ["env collision", { telegram: { bots: [{ accountId: "foo-bar", token: "x" }, { accountId: "foo_bar", token: "y" }] } }, /env keys collide[^]*foo-bar[^]*foo_bar/],
+  ["same token", { telegram: { bots: [{ accountId: "a", token: "x" }, { accountId: "b", token: "x" }] } }, /same token[^]*"a"[^]*"b"/],
+  ["bad session", { telegram: { bots: [{ accountId: "a", token: "x", session: "agent" }] } }, /session "agent" is not a valid session name/],
+  ["bad model", { telegram: { bots: [{ accountId: "a", token: "x", session: "s", model: "gpt" }] } }, /model "gpt"/],
+  ["bad bot policy", { telegram: { bots: [{ accountId: "a", token: "x", dmPolicy: "yolo" }] } }, /dmPolicy/],
+  ["bots not a list", { telegram: { bots: { accountId: "a", token: "x" } } }, /bots must be a list/],
+  ["empty bots", { telegram: { bots: [] } }, /bots must not be empty/],
+  ["channel-level session with bots", { telegram: { session: "x", bots: [{ accountId: "a", token: "x" }] } }, /belong on each bot entry/],
+  ["channel-level accountId with bots", { telegram: { accountId: "a", bots: [{ accountId: "a", token: "x" }] } }, /belong on each bot entry/],
+  ["empty session", { telegram: { bots: [{ accountId: "a", token: "x", session: "" }] } }, /session "" is not a valid session name/],
+]) { fs.writeFileSync(CONFIG_FILE, JSON.stringify(body), { mode: 0o600 }); err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; } assert(err && re.test(err.message), `loadConfig: ${name} rejected`); }
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t", dmPolicy: TA } }), { mode: 0o600 });
+err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; }
+assert(err && /dmPolicy must be one of/.test(err.message) && !err.message.includes(TA), "loadConfig: a bad dmPolicy value is not echoed (it might be a misplaced token)");
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { bots: [{ accountId: "a", token: "x", dmPolicy: TB }] } }), { mode: 0o600 });
+err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; }
+assert(err && /telegram\/a/.test(err.message) && !err.message.includes(TB), "loadConfig: a bad per-bot dmPolicy value is not echoed either");
+fs.writeFileSync(CONFIG_FILE, `{"telegram":{"token":"${TA}"} x`, { mode: 0o600 });
+err = null; try { loadConfig({ env: {} }); } catch (e) { err = e; }
+assert(err && /invalid JSON/.test(err.message) && /position \d+/.test(err.message) && !err.message.includes(TA), "loadConfig: malformed JSON reports a position, never the content");
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { bots: [{ accountId: "default", token: TA }, { accountId: "turo", token: TB, session: "turo" }] } }), { mode: 0o600 });
+cfg = loadConfig({ env: {} });
+assert(redact(`a ${TA} b ${TB} c`, cfg) === "a <redacted> b <redacted> c", "redact: every bot's token replaced");
+
+// back to the one-bot config the logger block expects
+fs.writeFileSync(CONFIG_FILE, JSON.stringify({ telegram: { token: "t" } }), { mode: 0o600 });
+cfg = loadConfig({ env: { AI_BRIDGE_TELEGRAM_TOKEN: "sec-ret_TOKEN:1" } });
+
 // logger: redaction + rotation
 {
   const file = path.join(process.env.AI_BRIDGE_HOME, "channels.log");

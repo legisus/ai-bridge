@@ -23,10 +23,16 @@ const KEEP_AUTH = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTH
 const KEEP_AI = new Set(["AI_BRIDGE_RUN_ID", "AI_BRIDGE_JOB", "AI_BRIDGE_OUTBOX", "AI_BRIDGE_AGENT", "AI_BRIDGE_RESTRICTED"]);
 
 // `extraKeys`: operator-configured passthrough (channels.json "envPassthrough").
+// Messenger credentials (AI_BRIDGE_<CHANNEL>[_<ACCOUNT>]_TOKEN) are denied even when an
+// operator lists them in envPassthrough: no child of a channel run ever sees a bot token.
+const DENY_RE = /^AI_BRIDGE_.*_TOKEN$/i;
 function cleanEnv(src = process.env, extraKeys = []) {
   const extra = new Set(extraKeys || []);
   const out = {};
-  for (const [k, v] of Object.entries(src)) if ((KEEP.has(k) || KEEP_AUTH.has(k) || KEEP_AI.has(k) || extra.has(k)) && v !== undefined) out[k] = v;
+  for (const [k, v] of Object.entries(src)) {
+    if (DENY_RE.test(k)) continue;
+    if ((KEEP.has(k) || KEEP_AUTH.has(k) || KEEP_AI.has(k) || extra.has(k)) && v !== undefined) out[k] = v;
+  }
   return out;
 }
 

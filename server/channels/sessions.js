@@ -15,6 +15,7 @@ const { atomicWrite, withLock } = require("../atomic");
 const SESSIONS_FILE = path.join(DIR, "channels-sessions.json");
 const SESSIONS_DIR = path.join(DIR, "sessions");
 const MODELS = { opus: "claude-opus-5-5", fable: "claude-fable-5-1", haiku: "claude-haiku-5-5" };
+const DEFAULT_MODEL_KEY = "fable";   // every session runs on Fable unless /new names another model
 const RESERVED = ["agent", "all", "none"];
 const MAX_PER_SENDER = 10;
 const NAME_RE = /^[a-z0-9_-]{1,24}$/;
@@ -83,10 +84,10 @@ class SessionStore {
   }
   _copy(row) { return row ? JSON.parse(JSON.stringify(row)) : null; }
 
-  create(owner, rawName, modelKey = "opus") {
+  create(owner, rawName, modelKey = DEFAULT_MODEL_KEY) {
     const name = normalizeName(rawName);
     if (!name) throw new Error("invalid session name");
-    const key = String(modelKey || "opus").toLowerCase();
+    const key = String(modelKey || DEFAULT_MODEL_KEY).toLowerCase();
     const model = Object.prototype.hasOwnProperty.call(MODELS, key) ? MODELS[key] : null;
     if (!model) throw new Error("unknown model");
     return this._mutate((d) => {
@@ -181,4 +182,4 @@ class SessionStore {
   }
 }
 
-module.exports = { SESSIONS_FILE, SESSIONS_DIR, MODELS, RESERVED, MAX_PER_SENDER, NAME_RE, RECENT_KEEP, DECLINED_KEEP, normalizeName, ownerKey, parseRoute, SessionStore };
+module.exports = { SESSIONS_FILE, SESSIONS_DIR, MODELS, DEFAULT_MODEL_KEY, RESERVED, MAX_PER_SENDER, NAME_RE, RECENT_KEEP, DECLINED_KEEP, normalizeName, ownerKey, parseRoute, SessionStore };
