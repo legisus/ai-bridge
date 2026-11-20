@@ -43,8 +43,10 @@ two paths to replace.
 
 ## What you can send
 
-Plain text is a task. The daemon replies `⏳ working on it (run abc123)` (or a
-queue position), sends progress lines at most every 15 s, then:
+Plain text is a task. The daemon replies `⏳ working on it` (or `⏳ queued
+(position 2)`), then edits that one line in place while it runs (`⏳ working on
+it · ops:opus-5.5 · 45s`, at most every 15 s, never a new message or a
+notification), ends it as `✅ done in 52s`, and sends:
 
 - `✅ pass — …` / `❌ fail — …` / `🚫 declined — …` / `⏹ cancelled`
 - the evidence report, split to the messenger's message limit
@@ -75,7 +77,7 @@ no judge and no model ladder: you read the reply.
 
 ```
 /new turo              created session turo (fable); it is now current …
-open my turo inbox     ⏳ [turo] working on it (run 7f3a…)
+open my turo inbox     ⏳ [turo] working on it   → edited to ⏳ [turo] thinking · 30s → ✅ [turo] done in 52s
                        [turo] Three unread messages: …
 /new mail haiku        a second session, on a cheaper model
 @turo reply to Ann     one message to turo without switching

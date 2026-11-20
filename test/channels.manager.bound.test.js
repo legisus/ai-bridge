@@ -109,7 +109,7 @@ process.env.MGR_PASS2 = "yes2";
   // ---- status privacy: the same sender id under another account sees no task text
   await say(a1, "z"); await until(() => rt.calls.length === callsBefore + 2);
   await say(a0, "/status"); assert(/current: busy \(another chat\)/.test(last(a0)) && !/\bz\b/.test(last(a0)), "status: another owner's task text hidden (same sender id, other account)");
-  await say(a1, "/status"); assert(/current: run [0-9a-f]+ \(running\): z/.test(last()), "status: the owner sees its own task");
+  await say(a1, "/status"); assert(/current: running: z$/m.test(last()) && !/[0-9a-f]{12}/.test(last()), "status: the owner sees its own task");
   rt.finish({ text: "zz" }); await idle();
 
   // ---- redaction: prompt bodies (across the quote boundary), journal task/feedback, one-shot evidence

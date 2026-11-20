@@ -92,7 +92,8 @@ class Manager {
     this.now = now;
     this.journal = journalApi;
     this.startedAt = now();
-    this.current = null;            // { item, controller }
+    this.current = null;            // { item, controller, startedAt }
+    this.acks = new Map();          // runId -> { chatId, messageId, text }: the "working on it" line, edited in place as progress
     this.prompts = new Map();       // approvalId -> { adapter, chatId, messageId, text }
     this.lastProgressAt = 0;
     this.draining = false;
@@ -122,11 +123,35 @@ class Manager {
   red(text) { return redact(text, this.config); }
 
   // `label` ("[turo] ") goes on every chunk; the chunker gets the remaining room.
-  async send(adapter, chatId, text, { label = "" } = {}) {
+  async send(adapter, chatId, text, { label = "", silent = false } = {}) {
     const limit = Math.max(1, (adapter.capabilities.textLimit || 4000) - label.length);
+    let last = null;
     for (const part of chunk(this.red(text), limit, adapter.capabilities.chunkMode || "text")) {
-      try { await adapter.sendText(chatId, label + part); } catch (e) { this.log(`send failed to ${adapter.id}:${chatId}: ${e.message}`); }
+      try { last = await adapter.sendText(chatId, label + part, { silent }); } catch (e) { this.log(`send failed to ${adapter.id}:${chatId}: ${e.message}`); }
     }
+    return last || null;
+  }
+
+  // Progress never beeps: the "working on it" line is edited in place; without an editable
+  // ack (restart, adapter without edits) the line goes out as a silent message instead.
+  async progress(adapter, item, text) {
+    const ack = this.acks.get(item.runId);
+    text = this.red(text);
+    if (ack && ack.text === text) return;
+    if (ack && adapter.capabilities.edit && adapter.editMessage) {
+      try { await adapter.editMessage(ack.chatId, ack.messageId, text); ack.text = text; return; }
+      catch (e) { this.log(`progress edit failed to ${adapter.id}:${ack.chatId}: ${e.message}`); this.acks.delete(item.runId); }
+    }
+    await this.send(adapter, item.chatId, text, { silent: true });
+  }
+  elapsed(item) { return fmtDuration(this.now() - (this.current && this.current.item === item ? this.current.startedAt : this.now())); }
+  // The ack's final form: "✅ [turo] done in 52s" (the reply itself is a separate message).
+  async finishAck(adapter, item, verdict) {
+    if (!this.acks.has(item.runId)) return;
+    const word = verdict === "reply" || verdict === "pass" ? "✅ done in" : verdict === "cancelled" ? "⏹ stopped after" : verdict === "declined" ? "🚫 declined after" : "❌ failed after";
+    const [emoji, ...rest] = word.split(" ");
+    await this.progress(adapter, item, `${emoji} ${this.label(item)}${rest.join(" ")} ${this.elapsed(item)}`);
+    this.acks.delete(item.runId);
   }
 
   pausedLine(row) { return `session ${row.name} is paused; /resume ${row.name} or /use <other>`; }
@@ -179,7 +204,7 @@ class Manager {
           const key = this.ownerKeyOf(item);
           this.heldOwners.add(key);
           this.log(`recovery: run ${item.runId} pid ${item.pid} still alive; holding ${key}'s queued session turns`);
-          if (adapter) await this.send(adapter, item.chatId, `restarted; a previous turn (run ${item.runId}) is still running and could not be stopped; your queued session messages were dropped — send them again later`);
+          if (adapter) await this.send(adapter, item.chatId, `restarted; a previous turn is still running and could not be stopped; your queued session messages were dropped — send them again later`);
           continue;   // kept, with its pid, for the next restart
         }
         this.journalDeclined(item, "daemon restarted while the task was running or awaiting approval; not replayed");
@@ -340,7 +365,9 @@ class Manager {
     const position = this.state.queue().length;
     const label = this.label(item);
     this.log(`accepted run ${runId} from ${this.ownerKeyOf(item)}${item.sessionName ? ` [${item.sessionName}]` : ""} (position ${position})`);
-    await this.send(adapter, owner.chatId, position === 1 && !this.current ? `⏳ ${label}working on it (run ${runId})` : `⏳ ${label}queued (run ${runId}, position ${position})`);
+    const ackText = position === 1 && !this.current ? `⏳ ${label}working on it` : `⏳ ${label}queued (position ${position})`;
+    const sent = await this.send(adapter, owner.chatId, ackText);
+    if (sent && sent.messageId) this.acks.set(runId, { chatId: owner.chatId, messageId: sent.messageId, text: ackText });
     this.kick();
   }
 
@@ -369,7 +396,7 @@ class Manager {
   currentLine(owner) {
     if (!this.current) return "idle";
     const it = this.current.item;
-    return this.sameOwner(it, owner) ? `run ${it.runId} (${it.status || "running"}): ${this.red(it.task).slice(0, 80)}` : "busy (another chat)";
+    return this.sameOwner(it, owner) ? `${it.status || "running"}: ${this.red(it.task).slice(0, 80)}` : "busy (another chat)";
   }
 
   // Commands on a bound bot. Returns undefined for the commands the shared handler owns.
@@ -389,8 +416,8 @@ class Manager {
       case "/help": return say(HELP_BOUND);
       case "/status": {
         row = rowOf();
-        const up = Math.round((this.now() - this.startedAt) / 1000);
-        return say(`uptime: ${up}s\nqueue: ${this.state.queue().length}\ncurrent: ${this.currentLine(owner)}\nbound: ${bound.name} (${modelKey(bound.model)})\nconversation: ${row ? `${row.state}, ${row.turns} turns` : "none yet"}`);
+        const up = fmtDuration(this.now() - this.startedAt);
+        return say(`uptime: ${up}\nqueue: ${this.state.queue().length}\ncurrent: ${this.currentLine(owner)}\nbound: ${bound.name} (${modelKey(bound.model)})\nconversation: ${row ? `${row.state}, ${row.turns} turns` : "none yet"}`);
       }
       case "/sessions": { row = rowOf(); return say(row ? `* ${row.name} (${modelKey(row.model)}, ${row.turns} turns, ${row.state}, ${this.ageLabel(row)})\ncurrent: ${row.name}` : noRow); }
       case "/pause": {
@@ -449,9 +476,9 @@ class Manager {
         return this.send(adapter, chatId, r.ok ? `bridge ok: ${r.text}` : `bridge down: ${r.text}`);
       }
       case "/status": {
-        const up = Math.round((this.now() - this.startedAt) / 1000);
+        const up = fmtDuration(this.now() - this.startedAt);
         const curSession = this.sessions.current(owner);
-        return this.send(adapter, chatId, `uptime: ${up}s\nqueue: ${this.state.queue().length}\ncurrent: ${this.currentLine(owner)}\nsessions: ${this.sessions.list(owner).length} (current: ${curSession ? curSession.name : "agent"})`);
+        return this.send(adapter, chatId, `uptime: ${up}\nqueue: ${this.state.queue().length}\ncurrent: ${this.currentLine(owner)}\nsessions: ${this.sessions.list(owner).length} (current: ${curSession ? curSession.name : "agent"})`);
       }
       case "/new": {
         if (args.length < 1 || args.length > 2) return this.send(adapter, chatId, "usage: /new <name> [opus|fable|haiku]");
@@ -660,7 +687,7 @@ class Manager {
     }
     const cfg = this.cfgFor(adapter);
     const controller = new AbortController();
-    this.current = { item, controller };
+    this.current = { item, controller, startedAt: this.now() };
     const setStatus = (s) => { item.status = s; this.state.setStatus(item.runId, s); };
     let dir = null;
     try {
@@ -670,6 +697,7 @@ class Manager {
         return;
       }
       setStatus("running");
+      await this.progress(adapter, item, `⏳ ${this.label(item)}working on it`);   // a queued line becomes the working one
       // A bound bot runs nothing but its own conversation: items from before the binding,
       // other rows, or a row of another model are dropped here, whatever queued them.
       const bound = cfg.boundSession || null;
@@ -727,18 +755,20 @@ class Manager {
         },
         onProgress: (st) => {
           const t = this.now();
-          if (t - this.lastProgressAt >= PROGRESS_EVERY_MS) { this.lastProgressAt = t; this.send(adapter, item.chatId, `… ${st.stage}`); }
+          if (t - this.lastProgressAt >= PROGRESS_EVERY_MS) { this.lastProgressAt = t; this.progress(adapter, item, `⏳ ${this.label(item)}working on it · ${st.stage} · ${this.elapsed(item)}`).catch(() => {}); }
         },
       });
       this.journalOneShot(item, report);
       setStatus("done");
+      await this.finishAck(adapter, item, report && report.verdict);
       await this.deliver(adapter, item, report, dir);
     } catch (e) {
       this.log(`run ${item.runId} error: ${e.message}`);
-      try { await this.send(adapter, item.chatId, `❌ error — ${e.message}`); } catch {}
+      try { await this.finishAck(adapter, item, "fail"); await this.send(adapter, item.chatId, `❌ error — ${e.message}`); } catch {}
     } finally {
       try { this.state.remove((q) => q.runId === item.runId); }
       catch (e) { this.log(`run ${item.runId}: could not remove from the queue: ${e.message}`); }
+      this.acks.delete(item.runId);
       this.current = null;
     }
   }
@@ -856,7 +886,7 @@ class Manager {
           const resume = row.started;                // decided before the durable flag flips
           if (!resume) this.sessions.markStarted(row.id);
           const stage = stageLabel(row.model);
-          timer = this.timers.setInterval(() => { if (spawning) status("…", "thinking").catch(() => {}); }, PROGRESS_EVERY_MS);
+          timer = this.timers.setInterval(() => { if (spawning) this.progress(adapter, item, `⏳ ${label}thinking · ${this.elapsed(item)}`).catch(() => {}); }, PROGRESS_EVERY_MS);
           text = await spawn(row, { turnText: item.task, authorized: null, resumeNow: resume, retryFresh: row.turns === 0, stageName: `turn:${stage}` });
           let rounds = 0;
           for (;;) {
@@ -894,6 +924,7 @@ class Manager {
     }
     setStatus("done");
     this.log(`run ${item.runId} [${name}] ${verdict}${feedback ? `: ${feedback}` : ""}`);
+    await this.finishAck(adapter, item, verdict);
     if (verdict === "reply") return this.deliverTurn(adapter, item, text, dir, since);
     if (verdict === "cancelled") await status("⏹", why === "intent" ? `cancelled — "${this.quote(item.task)}" was not run` : "cancelled");
     else if (verdict === "declined") {
@@ -965,6 +996,17 @@ class Manager {
 
 // Same signal an abort sends (agent.js killGroup): the whole process group, then the
 // pid itself as a fallback. Guarded against pid ≤ 1 by the caller.
+// "45s", "3m 20s", "1h 5m", "2d 3h"
+function fmtDuration(ms) {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ${sec % 60}s`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h ${min % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
 function defaultKillProcessGroup(pid) {
   if (!(Number.isInteger(pid) && pid > 1)) return;
   try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
@@ -1004,4 +1046,4 @@ async function defaultPing() {
   });
 }
 
-module.exports = { Manager, HELP, QUEUE_PER_SENDER, QUEUE_GLOBAL, PROGRESS_EVERY_MS };
+module.exports = { Manager, HELP, QUEUE_PER_SENDER, QUEUE_GLOBAL, PROGRESS_EVERY_MS, fmtDuration };

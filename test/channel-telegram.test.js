@@ -92,6 +92,9 @@ const server = http.createServer((req, res) => {
   const sent = await adapter.sendText("42", "plain *text*");
   const sm = requests.filter((r) => r.method === "sendMessage").pop();
   assert(sm.body.chat_id === "42" && sm.body.text === "plain *text*" && !("parse_mode" in sm.body) && sent.messageId === 555, "sendText: chat_id + text, no parse_mode, returns messageId");
+  assert(!("disable_notification" in sm.body), "sendText: a normal message notifies");
+  await adapter.sendText("42", "quiet", { silent: true });
+  assert(requests.filter((r) => r.method === "sendMessage").pop().body.disable_notification === true, "sendText: { silent } sets disable_notification");
 
   const btn = await adapter.sendButtons("42", "Approve?", [{ label: "Approve", data: "ab1:intent:a:0123456789abcdef" }, { label: "Cancel", data: "ab1:intent:d:0123456789abcdef" }]);
   const sb = requests.filter((r) => r.method === "sendMessage").pop();

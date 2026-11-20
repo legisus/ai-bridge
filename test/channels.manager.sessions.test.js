@@ -42,9 +42,9 @@ pairing.save({ pending: [], approved: [
   }
   await say("open the inbox");
   const turo = sessions.get(owner42, { name: "turo" });
-  assert(/^⏳ \[turo\] working on it \(run [0-9a-f]+\)$/.test(last()) && state.queue()[0].sessionName === "turo" && state.queue()[0].sessionGen === 1 && state.queue()[0].sessionId === turo.id && JSON.stringify(state.queue()[0].context) === "[]", "plain text: routed to the current session with gen and empty context");
+  assert(last() === "⏳ [turo] working on it" && state.queue()[0].sessionName === "turo" && state.queue()[0].sessionGen === 1 && state.queue()[0].sessionId === turo.id && JSON.stringify(state.queue()[0].context) === "[]", "plain text: routed to the current session with gen and empty context");
   await say("@tz list my cars");
-  assert(/^⏳ \[tz\] queued \(run [0-9a-f]+, position 2\)$/.test(last()) && state.queue()[1].sessionName === "tz" && state.queue()[1].task === "list my cars" && sessions.current(owner42).name === "turo", "@name: one-off routing keeps the target");
+  assert(last() === "⏳ [tz] queued (position 2)" && state.queue()[1].sessionName === "tz" && state.queue()[1].task === "list my cars" && sessions.current(owner42).name === "turo", "@name: one-off routing keeps the target");
   await say("@@tz literal");
   assert(state.queue()[2].sessionName === "turo" && state.queue()[2].task === "@tz literal" && JSON.stringify(state.queue()[2].context) === '["open the inbox"]', "@@: escaped literal goes to the current target; context = the texts before it");
   assert(JSON.stringify(sessions.get(owner42, { name: "turo" }).recent) === '["open the inbox","@tz literal"]' && sessions.last(owner42).text === "@tz literal", "recordInbound: recent and last kept by the manager");
@@ -55,7 +55,7 @@ pairing.save({ pending: [], approved: [
   await say("fourth");
   assert(/^queue full/.test(last()), "cap: 4th item of the owner refused");
   await say("from account b", { accountId: "b" });
-  assert(/^⏳ queued \(run [0-9a-f]+, position 4\)$/.test(last()) && state.queue()[3].accountId === "b" && !state.queue()[3].sessionId, "cap: same sender id under another account is another owner (unlabelled agent ack)");
+  assert(last() === "⏳ queued (position 4)" && state.queue()[3].accountId === "b" && !state.queue()[3].sessionId, "cap: same sender id under another account is another owner (unlabelled agent ack)");
 
   // ---- 3) another owner's /pause never aborts this owner's run
   advanceClock(61000); await tick();
@@ -269,20 +269,25 @@ pairing.save({ pending: [], approved: [
 
     // ---- K) progress via the injected timers: only while Claude is actually running
     await say("p"); await tick();
+    const ackIdK = a.sent.length;
+    assert(a.sent[ackIdK - 1].text === "⏳ [turo] working on it", "progress: the ack is the last message before the turn runs");
+    const edits = () => a.sent.filter((s) => s.type === "edit" && s.messageId === ackIdK);
     const clearedBefore = timers.cleared.length;
+    const nTexts0 = a.texts().length;
     timers.fire(); await tick();
-    assert(last() === "… [turo] thinking", "progress: labelled thinking line while the turn runs");
+    assert(edits().length === 1 && /^⏳ \[turo\] thinking · \d+[smhd]/.test(edits()[0].text) && a.texts().length === nTexts0, "progress: the ack is edited to a thinking line (no new message, no beep)");
     rt.finish({ text: "NEEDS APPROVAL: p1" }); await tick();
-    const nTexts = a.texts().length;
+    const nTexts = a.texts().length, nEdits = edits().length;
     timers.fire(); await tick();
-    assert(a.texts().length === nTexts && lastButtons().text === "[turo] Approval needed: p1", "progress: silent while waiting for an approval tap");
+    assert(a.texts().length === nTexts && edits().length === nEdits && lastButtons().text === "[turo] Approval needed: p1", "progress: silent while waiting for an approval tap");
     await tap("approve");
     timers.fire(); await tick();
-    assert(last() === "… [turo] thinking", "progress: resumes during the continuation");
+    assert(edits().length === nEdits + 1 && /^⏳ \[turo\] thinking · /.test(edits().pop().text), "progress: resumes during the continuation");
     rt.finish({ text: "done" }); await tick(80);
-    const nTexts2 = a.texts().length;
+    assert(/^✅ \[turo\] done in \d+[smhd]/.test(edits().pop().text) && last() === "[turo] done", "progress: the ack ends as 'done in …' and the reply is its own message");
+    const nTexts2 = a.texts().length, nEdits2 = edits().length;
     timers.fire(); await tick();
-    assert(timers.cleared.length > clearedBefore && timers.active.size === 0 && a.texts().length === nTexts2, "progress: interval cleared when the turn ends; firing afterwards sends nothing");
+    assert(timers.cleared.length > clearedBefore && timers.active.size === 0 && a.texts().length === nTexts2 && edits().length === nEdits2, "progress: interval cleared when the turn ends; firing afterwards sends nothing");
 
     // ---- N) a failing prompt send is a journaled, labelled failure (whole lifecycle covered)
     advanceClock(61000);
