@@ -138,8 +138,8 @@ function makeAdapter(config, deps = {}) {
     },
     onAction(handler) { actionHandler = handler; },
 
-    async sendText(chatId, text) {
-      const r = await call("sendMessage", { chat_id: String(chatId), text: String(text) });
+    async sendText(chatId, text, { silent = false } = {}) {
+      const r = await call("sendMessage", { chat_id: String(chatId), text: String(text), ...(silent ? { disable_notification: true } : {}) });
       return { messageId: r && r.message_id };
     },
     async sendButtons(chatId, text, buttons) {

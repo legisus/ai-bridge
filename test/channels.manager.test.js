@@ -50,7 +50,7 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     await p;
     assert(queuedDuring === 1, "accept: task persisted before handleInbound resolves");
     await tick();
-    assert(/^⏳ working on it \(run [0-9a-f]+\)$/.test(a.texts()[0]), "accept: first task replies 'working on it'");
+    assert(a.texts()[0] === "⏳ working on it", "accept: first task replies 'working on it'");
     assert(ra.calls.length === 1 && ra.calls[0].opts.restricted === true && ra.calls[0].opts.source === "channel:fake" && ra.calls[0].opts.codex === false, "run: runAgent called restricted with source");
     assert(ra.calls[0].opts.baseEnv && ra.calls[0].opts.baseEnv.PATH === process.env.PATH && !("AI_BRIDGE_TELEGRAM_TOKEN" in ra.calls[0].opts.baseEnv) && ra.calls[0].opts.baseEnv.MGR_PASS === "yes", "run: baseEnv is scrubbed and honours envPassthrough");
     assert(fs.existsSync(ra.calls[0].opts.cwd) && ra.calls[0].opts.cwd.includes("outbox"), "run: cwd is a fresh outbox dir");
@@ -59,7 +59,7 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     await a.emit({ senderId: "42", chatId: "42", messageId: 2, eventId: "e2", text: "second thing" });
     await a.emit({ senderId: "42", chatId: "42", messageId: 3, eventId: "e3", text: "third thing" });
     await a.emit({ senderId: "42", chatId: "42", messageId: 4, eventId: "e4", text: "fourth thing" });
-    assert(a.texts().some((t) => /⏳ queued \(run [0-9a-f]+, position 2\)/.test(t)) && a.texts().some((t) => /position 3\)/.test(t)), "queue: later tasks get positions 2 and 3");
+    assert(a.texts().some((t) => t === "⏳ queued (position 2)") && a.texts().some((t) => /position 3\)/.test(t)), "queue: later tasks get positions 2 and 3");
     assert(a.texts().some((t) => /^queue full \(\d+ waiting\); try again later$/.test(t)), "queue: 4th task from one sender refused");
     assert(state.queue().length === 3 && ra.calls.length === 1, "queue: one running, two waiting");
 
@@ -71,9 +71,11 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     ra.calls[0].opts.onProgress({ stage: "ops:opus-5.5" });
     ra.calls[0].opts.onProgress({ stage: "judge:fable-5.1" });
     await tick();
-    assert(a.texts().filter((t) => t.startsWith("… ")).length === 1 && a.texts().some((t) => t === "… ops:opus-5.5"), "progress: coalesced to one message per 15 s");
+    const ackId = a.sent.findIndex((s) => s.text === "⏳ working on it") + 1;
+    const pEdits = a.sent.filter((s) => s.type === "edit");
+    assert(pEdits.length === 1 && pEdits[0].messageId === ackId && /^⏳ working on it · ops:opus-5\.5 · \d+[smhd]/.test(pEdits[0].text) && !a.texts().some((t) => t.startsWith("… ")), "progress: edits the ack in place (one edit per 15 s), never a new message");
 
-    // completion: verdict, evidence, file; symlink skipped; token redacted
+    // completion: verdict, evidence, file; symlink skipped; token redacted; the ack ends as "done in …"
     const cwd = ra.calls[0].opts.cwd;
     fs.writeFileSync(path.join(cwd, "result.txt"), "RESULT");
     fs.symlinkSync(path.join(process.env.AI_BRIDGE_HOME, "nothing"), path.join(cwd, "evil"));
@@ -88,6 +90,7 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     const file = a.sent.find((s) => s.type === "file");
     assert(file && file.name === "result.txt" && file.bytes === "RESULT" && file.chatId === "42", "deliver: outbox file sent to the sender");
     assert(texts.some((t) => t === "skipped: evil (symlink)"), "deliver: symlink reported as skipped");
+    assert(/^✅ done in \d+[smhd]/.test(a.sent.filter((s) => s.type === "edit" && s.messageId === ackId).pop().text), "ack: finalised as 'done in …' on a pass");
     assert(!fs.existsSync(path.join(cwd, "result.txt")), "deliver: delivered file removed from the outbox");
     await tick();
     assert(state.queue().length === 2 && ra.calls.length === 2 && ra.calls[1].task === "second thing", "queue: next task started after delivery");
@@ -136,6 +139,7 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     assert(ra.calls.length === 1 && a.texts().some((t) => t.startsWith("🚫 declined")), "intent: deny → declined, agent never called");
     assert(journal.readJournal({}).some((r) => r.verdict === "declined" && r.task === "pay the parking ticket" && r.source === "channel:fake"), "intent: declined run journaled with source");
     assert(state.queue().length === 0, "intent: declined item removed from the queue");
+    assert(a.sent.some((s) => s.type === "edit" && s.text === "🚫 declined"), "intent: the declined task's ack is finalised");
 
     // oversized task → prompt bounded
     await a.emit({ senderId: "42", chatId: "42", messageId: 3, eventId: "e3", text: "send " + "y".repeat(6000) });
@@ -209,7 +213,7 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     const t = a.texts();
     assert(ra.calls.length === 0, "commands: no agent runs");
     assert(t[0].startsWith("bridge ok") && t[0].includes("pong"), "/ping: reports bridge health");
-    assert(/queue: 0/.test(t[1]) && /uptime/.test(t[1]), "/status: uptime and queue");
+    assert(/queue: 0/.test(t[1]) && /^uptime: \d+[smhd]/m.test(t[1]), "/status: uptime and queue");
     assert(t[2].includes("toll") && t[2].includes("economy"), "/jobs: table");
     assert(t[3].includes("/cancel") && t[3].includes("/approve <id> yes|no") && t[3].includes("/retry"), "/help: lists commands");
     assert(t[4].split("\n").length === 4 && /^runs: \d+, pass rate: \d+%$/.test(t[4].split("\n")[0]) && /^cost: \$/.test(t[4].split("\n")[1]) && /^jobs: /.test(t[4].split("\n")[2]) && /^session turns: \d+, \$\d+\.\d\d$/.test(t[4].split("\n")[3]), "/journal: four-line summary (session turns separate)");
@@ -423,7 +427,8 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     assert(await until(() => a1.sent.some((x) => x.type === "buttons")), "two bots: write intent asked on adapter a");
     const prompt = a1.sent.find((x) => x.type === "buttons");
     await a2.emitAction({ actorId: "42", chatId: "42", messageId: 1, data: prompt.buttons[0].data });
-    assert(ra.calls.length === 1 && !a2.sent.some((x) => x.type === "edit") && !a1.sent.some((x) => x.type === "edit"), "handleAction: another bot's tap is forbidden (no run, no edit)");
+    const promptEdit = (x) => x.type === "edit" && /approved|declined|no longer pending|invoice/.test(x.text);
+    assert(ra.calls.length === 1 && !a2.sent.some(promptEdit) && !a1.sent.some(promptEdit), "handleAction: another bot's tap is forbidden (no run, no prompt edit)");
     await a1.emitAction({ actorId: "42", chatId: "42", messageId: 1, data: prompt.buttons[1].data });
     assert(await until(() => state.queue().length === 0), "two bots: decline settles the item");
     m.prompts.set("deadbeefdeadbeef", { adapter: a1, chatId: "42", messageId: 7, text: "secret prompt" });
