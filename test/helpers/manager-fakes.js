@@ -24,9 +24,9 @@ function fakeAdapter({ buttons = true, accountId = "default" } = {}) {
     async start(onInbound, offsets) { a.started = true; a.inbound = onInbound; a.offsets = offsets; },
     async stop() { a.started = false; },
     onAction(h) { a.action = h; },
-    async sendText(chatId, text) { a.sent.push({ type: "text", chatId, text }); return { messageId: a.sent.length }; },
+    async sendText(chatId, text, opts) { a.sent.push({ type: "text", chatId, text, silent: !!(opts && opts.silent) }); return { messageId: a.sent.length }; },
     async sendButtons(chatId, text, buttons) { a.sent.push({ type: "buttons", chatId, text, buttons }); return { messageId: a.sent.length }; },
-    async editMessage(chatId, messageId, text, buttons) { a.sent.push({ type: "edit", chatId, messageId, text, buttons }); },
+    async editMessage(chatId, messageId, text, buttons) { const rec = { type: "edit", chatId, messageId, text, buttons }; if (a.editHook) await a.editHook(rec); a.sent.push(rec); },   // editHook: delay or throw
     async sendFile(chatId, file, caption) { a.sent.push({ type: "file", chatId, name: file.name, bytes: fs.readFileSync(file.fd, "utf8"), caption }); return { messageId: a.sent.length }; },
     emit(evt) { return a.inbound({ accountId: a.accountId, chatType: "direct", ...evt }); },
     emitAction(act) { return a.action({ ack: async () => { a.acks = (a.acks || 0) + 1; }, ...act }); },

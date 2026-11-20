@@ -45,8 +45,10 @@ two paths to replace.
 
 Plain text is a task. The daemon replies `⏳ working on it` (or `⏳ queued
 (position 2)`), then edits that one line in place while it runs (`⏳ working on
-it · ops:opus-5.5 · 45s`, at most every 15 s, never a new message or a
-notification), ends it as `✅ done in 52s`, and sends:
+it · ops:opus-5.5 · 45s`, at most every 15 s; only when the line cannot be
+edited, e.g. after a daemon restart, does progress go out as a message, and
+then without sound), ends it as `✅ done in 52s` (`⏹ stopped after …`,
+`🚫 declined`, `❌ failed after …`), and sends:
 
 - `✅ pass — …` / `❌ fail — …` / `🚫 declined — …` / `⏹ cancelled`
 - the evidence report, split to the messenger's message limit

@@ -90,6 +90,7 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     const file = a.sent.find((s) => s.type === "file");
     assert(file && file.name === "result.txt" && file.bytes === "RESULT" && file.chatId === "42", "deliver: outbox file sent to the sender");
     assert(texts.some((t) => t === "skipped: evil (symlink)"), "deliver: symlink reported as skipped");
+    assert(/^✅ done in \d+[smhd]/.test(a.sent.filter((s) => s.type === "edit" && s.messageId === ackId).pop().text), "ack: finalised as 'done in …' on a pass");
     assert(!fs.existsSync(path.join(cwd, "result.txt")), "deliver: delivered file removed from the outbox");
     await tick();
     assert(state.queue().length === 2 && ra.calls.length === 2 && ra.calls[1].task === "second thing", "queue: next task started after delivery");
@@ -138,6 +139,7 @@ const { TOKEN, advanceClock, tick, until, fakeAdapter, fakeRunAgent, build } = r
     assert(ra.calls.length === 1 && a.texts().some((t) => t.startsWith("🚫 declined")), "intent: deny → declined, agent never called");
     assert(journal.readJournal({}).some((r) => r.verdict === "declined" && r.task === "pay the parking ticket" && r.source === "channel:fake"), "intent: declined run journaled with source");
     assert(state.queue().length === 0, "intent: declined item removed from the queue");
+    assert(a.sent.some((s) => s.type === "edit" && s.text === "🚫 declined"), "intent: the declined task's ack is finalised");
 
     // oversized task → prompt bounded
     await a.emit({ senderId: "42", chatId: "42", messageId: 3, eventId: "e3", text: "send " + "y".repeat(6000) });

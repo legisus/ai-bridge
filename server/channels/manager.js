@@ -132,26 +132,49 @@ class Manager {
     return last || null;
   }
 
-  // Progress never beeps: the "working on it" line is edited in place; without an editable
-  // ack (restart, adapter without edits) the line goes out as a silent message instead.
-  async progress(adapter, item, text) {
-    const ack = this.acks.get(item.runId);
+  // Progress never beeps: the "working on it" line is edited in place. Updates of one run
+  // are serialized (a slow edit never overtakes the final line) and stop after the final
+  // one. Without an editable line (restart, adapter without edits, a message Telegram will
+  // not edit any more) the text goes out as a silent message, which then becomes the line.
+  progress(adapter, item, text, { final = false } = {}) {
     text = this.red(text);
-    if (ack && ack.text === text) return;
-    if (ack && adapter.capabilities.edit && adapter.editMessage) {
-      try { await adapter.editMessage(ack.chatId, ack.messageId, text); ack.text = text; return; }
-      catch (e) { this.log(`progress edit failed to ${adapter.id}:${ack.chatId}: ${e.message}`); this.acks.delete(item.runId); }
-    }
-    await this.send(adapter, item.chatId, text, { silent: true });
+    let ack = this.acks.get(item.runId);
+    if (ack && ack.final) return Promise.resolve();
+    if (!ack) { ack = { chatId: item.chatId, messageId: null, text: null, ready: Promise.resolve(), chain: Promise.resolve() }; this.acks.set(item.runId, ack); }
+    if (final) ack.final = true;
+    const step = async () => {
+      await ack.ready;
+      if (ack.text === text) return;
+      if (ack.messageId != null && adapter.capabilities.edit && adapter.editMessage) {
+        try { await adapter.editMessage(ack.chatId, ack.messageId, text); ack.text = text; return; }
+        catch (e) {
+          if (/not modified/i.test(e.message)) { ack.text = text; return; }
+          this.log(`progress edit failed to ${adapter.id}:${ack.chatId}: ${e.message}`);
+          if (!e.permanent) return;          // transient: this tick is skipped, the line stays editable
+          ack.messageId = null;              // Telegram will not edit it any more: continue below
+        }
+      }
+      const sent = await this.send(adapter, item.chatId, text, { silent: true });
+      ack.text = text;
+      if (sent && sent.messageId != null && adapter.capabilities.edit && adapter.editMessage) ack.messageId = sent.messageId;
+    };
+    ack.chain = ack.chain.then(step, step);
+    return ack.chain;
   }
   elapsed(item) { return fmtDuration(this.now() - (this.current && this.current.item === item ? this.current.startedAt : this.now())); }
   // The ack's final form: "✅ [turo] done in 52s" (the reply itself is a separate message).
+  // Idempotent; the entry is removed by whoever owns the item's lifecycle (runOne, dropQueued).
   async finishAck(adapter, item, verdict) {
-    if (!this.acks.has(item.runId)) return;
-    const word = verdict === "reply" || verdict === "pass" ? "✅ done in" : verdict === "cancelled" ? "⏹ stopped after" : verdict === "declined" ? "🚫 declined after" : "❌ failed after";
-    const [emoji, ...rest] = word.split(" ");
-    await this.progress(adapter, item, `${emoji} ${this.label(item)}${rest.join(" ")} ${this.elapsed(item)}`);
-    this.acks.delete(item.runId);
+    const ack = this.acks.get(item.runId);
+    if (!ack || ack.final) return;
+    const v = verdict && typeof verdict === "object" ? verdict.verdict : verdict;
+    const label = this.label(item);
+    const text = v === "reply" || v === "pass" ? `✅ ${label}done in ${this.elapsed(item)}`
+      : v === "cancelled" ? `⏹ ${label}stopped after ${this.elapsed(item)}`
+      : v === "dropped" ? `⏹ ${label}dropped (never ran)`
+      : v === "declined" ? `🚫 ${label}declined`
+      : `❌ ${label}failed after ${this.elapsed(item)}`;
+    await this.progress(adapter, item, text, { final: true });
   }
 
   pausedLine(row) { return `session ${row.name} is paused; /resume ${row.name} or /use <other>`; }
@@ -365,9 +388,12 @@ class Manager {
     const position = this.state.queue().length;
     const label = this.label(item);
     this.log(`accepted run ${runId} from ${this.ownerKeyOf(item)}${item.sessionName ? ` [${item.sessionName}]` : ""} (position ${position})`);
-    const ackText = position === 1 && !this.current ? `⏳ ${label}working on it` : `⏳ ${label}queued (position ${position})`;
-    const sent = await this.send(adapter, owner.chatId, ackText);
-    if (sent && sent.messageId) this.acks.set(runId, { chatId: owner.chatId, messageId: sent.messageId, text: ackText });
+    const ackText = this.red(position === 1 && !this.current ? `⏳ ${label}working on it` : `⏳ ${label}queued (position ${position})`);
+    // Registered before the send resolves: a progress update that comes first waits for it.
+    const ack = { chatId: owner.chatId, messageId: null, text: ackText, ready: null, chain: Promise.resolve() };
+    ack.ready = this.send(adapter, owner.chatId, ackText).then((sent) => { if (sent && sent.messageId != null) ack.messageId = sent.messageId; }, () => {});
+    this.acks.set(runId, ack);
+    await ack.ready;
     this.kick();
   }
 
@@ -376,6 +402,11 @@ class Manager {
     const victims = this.state.queue().filter((q) => q.status === "queued" && pred(q));
     for (const item of victims) this.journalDeclined(item, reason);
     if (victims.length) this.state.remove((q) => q.status === "queued" && pred(q));
+    for (const item of victims) {
+      const adapter = this.adapterFor(item.channel, item.accountId);
+      const done = adapter ? this.finishAck(adapter, item, "dropped") : Promise.resolve();
+      done.catch(() => {}).then(() => this.acks.delete(item.runId));
+    }
     return victims.length;
   }
 
@@ -760,7 +791,7 @@ class Manager {
       });
       this.journalOneShot(item, report);
       setStatus("done");
-      await this.finishAck(adapter, item, report && report.verdict);
+      await this.finishAck(adapter, item, (report && report.verdict) || "fail");
       await this.deliver(adapter, item, report, dir);
     } catch (e) {
       this.log(`run ${item.runId} error: ${e.message}`);
@@ -768,6 +799,8 @@ class Manager {
     } finally {
       try { this.state.remove((q) => q.runId === item.runId); }
       catch (e) { this.log(`run ${item.runId}: could not remove from the queue: ${e.message}`); }
+      // Early exits (unpaired, bound drop, intent declined, cancelled before it ran) end here.
+      try { await this.finishAck(adapter, item, controller.signal.aborted ? "cancelled" : "declined"); } catch {}
       this.acks.delete(item.runId);
       this.current = null;
     }

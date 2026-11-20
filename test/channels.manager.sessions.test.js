@@ -281,7 +281,7 @@ pairing.save({ pending: [], approved: [
     timers.fire(); await tick();
     assert(a.texts().length === nTexts && edits().length === nEdits && lastButtons().text === "[turo] Approval needed: p1", "progress: silent while waiting for an approval tap");
     await tap("approve");
-    timers.fire(); await tick();
+    advanceClock(15000); timers.fire(); await tick();
     assert(edits().length === nEdits + 1 && /^⏳ \[turo\] thinking · /.test(edits().pop().text), "progress: resumes during the continuation");
     rt.finish({ text: "done" }); await tick(80);
     assert(/^✅ \[turo\] done in \d+[smhd]/.test(edits().pop().text) && last() === "[turo] done", "progress: the ack ends as 'done in …' and the reply is its own message");
