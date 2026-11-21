@@ -3,7 +3,8 @@
 // A record binds consent to the operation (run, kind, digest) and to the
 // conversation (channel, account, chat, sender). Button data carries only a
 // locator — `ab1:<kind>:<a|d>:<id>` — never state or secrets. Records are
-// single-use and expire after ttlMs; denied, expired, aborted all resolve "denied".
+// single-use and expire after ttlMs: a tap resolves "approved" or "denied", the timer
+// resolves "expired" (nobody answered — not a refusal), an abort resolves "denied".
 const crypto = require("crypto");
 
 const PREFIX = "ab1";
@@ -35,7 +36,7 @@ class Approvals {
     const promise = new Promise((resolve) => { resolveFn = resolve; });
     const rec = { id, runId, kind, digest, channel, accountId, chatId: String(chatId), senderId: String(senderId),
       createdAt: this.now(), resolved: null, _resolve: resolveFn };
-    rec._timer = setTimeout(() => this._settle(rec, "denied"), this.ttlMs);
+    rec._timer = setTimeout(() => this._settle(rec, "expired"), this.ttlMs);
     if (rec._timer.unref) rec._timer.unref();
     if (signal) {
       if (signal.aborted) this._settle(rec, "denied");
@@ -64,7 +65,7 @@ class Approvals {
     if (String(actorId) !== rec.senderId || channel !== rec.channel || (accountId || "default") !== rec.accountId ||
         String(chatId) !== rec.chatId || (kind !== undefined && kind !== rec.kind)) return "forbidden";
     if (rec.resolved) return "stale";
-    if (this._expired(rec)) { this._settle(rec, "denied"); return "stale"; }
+    if (this._expired(rec)) { this._settle(rec, "expired"); return "stale"; }
     const d = decision === "a" || decision === "approved" || decision === "yes" ? "approved" : "denied";
     this._settle(rec, d);
     return d;

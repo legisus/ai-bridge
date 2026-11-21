@@ -42,7 +42,7 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
     const { id, promise } = A.create(base);
     t = 2000;
     assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "turo", chatId: "100", kind: "intent", decision: "a" }) === "forbidden", "resolve: an expired record is forbidden to a foreign account");
-    assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale" && (await promise) === "denied", "resolve: the owner gets stale for an expired record, which settles denied");
+    assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale" && (await promise) === "expired", "resolve: the owner gets stale for an expired record, which settles expired");
   }
   // other actor forbidden, promise pending
   {
@@ -69,7 +69,17 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
     const { id, promise } = A.create(base);
     t = 11 * 60 * 1000;
     assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale", "resolve after 11 min → stale");
-    assert((await promise) === "denied", "expired record resolves denied");
+    assert((await promise) === "expired", "expired record resolves expired (a timeout is not a refusal)");
+    A.close();
+  }
+  // the TTL timer itself settles "expired"
+  {
+    const A = new Approvals({ ttlMs: 30 });
+    const keep = setTimeout(() => {}, 5000);   // the TTL timer is unref'd; keep the loop alive for it
+    const { id, promise } = A.create(base);
+    assert((await promise) === "expired", "timer: an unanswered record resolves expired");
+    clearTimeout(keep);
+    assert(A.resolve({ id, actorId: "42", channel: "telegram", accountId: "default", chatId: "100", kind: "intent", decision: "a" }) === "stale", "timer: a tap after expiry is stale, never approved");
     A.close();
   }
   // abort signal

@@ -25,7 +25,7 @@ function fakeAdapter({ buttons = true, accountId = "default" } = {}) {
     async stop() { a.started = false; },
     onAction(h) { a.action = h; },
     async sendText(chatId, text, opts) { a.sent.push({ type: "text", chatId, text, silent: !!(opts && opts.silent) }); return { messageId: a.sent.length }; },
-    async sendButtons(chatId, text, buttons) { a.sent.push({ type: "buttons", chatId, text, buttons }); return { messageId: a.sent.length }; },
+    async sendButtons(chatId, text, buttons) { a.sent.push({ type: "buttons", chatId, text, buttons }); const id = a.sent.length; if (a.buttonsHook) await a.buttonsHook(); return { messageId: id }; },   // buttonsHook: delay the send's response
     async editMessage(chatId, messageId, text, buttons) { const rec = { type: "edit", chatId, messageId, text, buttons }; if (a.editHook) await a.editHook(rec); a.sent.push(rec); },   // editHook: delay or throw
     async sendFile(chatId, file, caption) { a.sent.push({ type: "file", chatId, name: file.name, bytes: fs.readFileSync(file.fd, "utf8"), caption }); return { messageId: a.sent.length }; },
     emit(evt) { return a.inbound({ accountId: a.accountId, chatType: "direct", ...evt }); },
@@ -74,7 +74,7 @@ async function until(fn, ms = 2000) {
   for (;;) { if (fn()) return true; if (Date.now() > end) return false; await tick(10); }
 }
 
-function build({ adapter, adapters, runAgent, runTurn, config, stateFile, classify, processLooksLikeOurs, killProcessGroup, timers } = {}) {
+function build({ adapter, adapters, runAgent, runTurn, config, stateFile, classify, processLooksLikeOurs, killProcessGroup, timers, approvalTtlMs, log } = {}) {
   const rand = Math.random().toString(36).slice(2);
   const state = new ChannelState(stateFile || path.join(process.env.AI_BRIDGE_HOME, `state-${rand}.json`));
   const sessions = new SessionStore(path.join(process.env.AI_BRIDGE_HOME, `sessions-${rand}.json`), { dir: path.join(process.env.AI_BRIDGE_HOME, "sessions"), now });
@@ -82,14 +82,14 @@ function build({ adapter, adapters, runAgent, runTurn, config, stateFile, classi
   const m = new Manager({
     config: config || { fake: { token: TOKEN, dmPolicy: "pairing", allowFrom: [], codex: false, accountId: "default", envPassthrough: ["MGR_PASS"] } },
     adapters: adapters || [adapter], state, sessions, pairing,
-    approvals: new Approvals({ now }),
+    approvals: new Approvals({ now, ...(approvalTtlMs ? { ttlMs: approvalTtlMs } : {}) }),
     limiter: new RateLimiter({ now }),
     runAgent: runAgent ? runAgent.fn : undefined,
     runTurn: runTurn ? runTurn.fn : undefined,
     runModel: async ({ prompt }) => ({ result: classify ? await classify(prompt) : "read" }),
     bridgePing: async () => ({ ok: true, text: '{"pong":true,"version":"test"}' }),
     jobsTable: () => "job   mode\n toll  economy",
-    log: process.env.FAKES_LOG ? (l) => console.log("LOG", l) : () => {}, now, processLooksLikeOurs, killProcessGroup, timers,
+    log: log || (process.env.FAKES_LOG ? (l) => console.log("LOG", l) : () => {}), now, processLooksLikeOurs, killProcessGroup, timers,
   });
   return { m, state, sessions };
 }

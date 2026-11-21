@@ -440,7 +440,8 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       if (decision === "cancelled") throw abortError();
       if (decision !== "approved") {
         blocker = "declined";
-        finalVerdict = { verdict: "declined", feedback: "write-risk recipe not approved; nothing was run" };
+        const what = "write-risk recipe not approved; nothing was run";
+        finalVerdict = { verdict: "declined", feedback: decision === "expired" ? `approval expired: ${what}` : what };   // "expired" = nobody answered, not a refusal
       }
     }
     recipeResult = blocker ? { ok: false, evidence: "", steps: [], failure: { step: -1, do: "approval", error: "declined", kind: "declined" } } : await D.runRecipe(recipe, recipeOpts);
@@ -539,7 +540,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         if (decision === "cancelled") throw abortError();
         if (decision !== "approved") {
           blocker = "declined";
-          finalVerdict = { verdict: "declined", feedback: `not approved: ${pending}` };
+          finalVerdict = { verdict: "declined", feedback: decision === "expired" ? `approval expired: ${pending}` : `not approved: ${pending}` };
           break;
         }
         const again = await run(runOpts({

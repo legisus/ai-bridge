@@ -14,7 +14,7 @@ const { ChannelState } = require("./state");
 const { chunk } = require("./chunk");
 const outbox = require("./outbox");
 const { cleanEnv, isInstructionPath } = require("./restricted");
-const { classifyIntent, DEFAULT_KEYWORDS } = require("./intent");
+const { explainIntent, DEFAULT_KEYWORDS } = require("./intent");
 const { SessionStore, parseRoute, MODELS, DEFAULT_MODEL_KEY } = require("./sessions");
 const { redact } = require("./config");
 const agent = require("../agent");
@@ -150,8 +150,8 @@ class Manager {
         catch (e) {
           if (/not modified/i.test(e.message)) { ack.text = text; return; }
           this.log(`progress edit failed to ${adapter.id}:${ack.chatId}: ${e.message}`);
-          if (!e.permanent) return;          // transient: this tick is skipped, the line stays editable
-          ack.messageId = null;              // Telegram will not edit it any more: continue below
+          if (!e.permanent && !final) return;   // transient tick: skipped, the line stays editable
+          ack.messageId = null;                 // not editable (or the final line must land): continue below
         }
       }
       const sent = await this.send(adapter, item.chatId, text, { silent: true });
@@ -173,6 +173,7 @@ class Manager {
       : v === "cancelled" ? `⏹ ${label}stopped after ${this.elapsed(item)}`
       : v === "dropped" ? `⏹ ${label}dropped (never ran)`
       : v === "declined" ? `🚫 ${label}declined`
+      : v === "expired" ? `⏳ ${label}no answer in ${this.ttlText()}`
       : `❌ ${label}failed after ${this.elapsed(item)}`;
     await this.progress(adapter, item, text, { final: true });
   }
@@ -629,22 +630,46 @@ class Manager {
       accountId: item.accountId, chatId: item.chatId, senderId: item.senderId, signal });
     text = this.red(label + text);   // redacted before truncation; the stored body is what was sent
     const limit = adapter.capabilities.textLimit || 4000;
-    let messageId = null;
-    if (adapter.capabilities.buttons && adapter.sendButtons) {
-      const body = text.length > limit - 20 ? text.slice(0, limit - 20) + "…" : text;
-      const r = await adapter.sendButtons(item.chatId, body, [{ label: "Approve", data: encode(kind, "a", id) }, { label: "Cancel", data: encode(kind, "d", id) }]);
-      messageId = r && r.messageId;
-      this.prompts.set(id, { adapter, chatId: item.chatId, messageId, text: body });
-    } else {
-      const tail = `\nreply /approve ${id} yes or /approve ${id} no`;
-      const body = (text.length + tail.length > limit ? text.slice(0, limit - tail.length - 1) + "…" : text) + tail;
-      await adapter.sendText(item.chatId, body);
-    }
+    const withButtons = !!(adapter.capabilities.buttons && adapter.sendButtons);
+    const tail = `\nreply /approve ${id} yes or /approve ${id} no`;
+    const body = withButtons ? (text.length > limit - 20 ? text.slice(0, limit - 20) + "…" : text)
+      : (text.length + tail.length > limit ? text.slice(0, limit - tail.length - 1) + "…" : text) + tail;
+    // Registered before the send: a tap that arrives while the send's response is still in
+    // flight finds the prompt and its edit waits for `ready` (the delivery), serialized on `chain`.
+    const prompt = { adapter, chatId: item.chatId, messageId: null, text: body, ready: null, chain: Promise.resolve() };
+    this.prompts.set(id, prompt);
+    prompt.ready = (withButtons
+      ? adapter.sendButtons(item.chatId, body, [{ label: "Approve", data: encode(kind, "a", id) }, { label: "Cancel", data: encode(kind, "d", id) }])
+      : adapter.sendText(item.chatId, body)
+    ).then((r) => { if (r && r.messageId != null && adapter.capabilities.edit && adapter.editMessage) prompt.messageId = r.messageId; });
+    try { await prompt.ready; } catch (e) { this.prompts.delete(id); throw e; }
     let decision = await promise;
     if (signal && signal.aborted) decision = "cancelled";   // /cancel while waiting is a cancel, not a decline
     this.log(`approval ${id} (${kind}) for run ${item.runId}: ${decision}`);
+    if (decision === "expired") {
+      // Nobody answered: say so on the prompt itself and take the buttons away. Not awaited —
+      // a stalled edit must not hold the run's bookkeeping. The entry stays in `prompts` so a
+      // late tap is answered under this line, not over it.
+      this.editPrompt(prompt, `→ expired (no answer in ${this.ttlText()})`);
+    }
     return decision;
   }
+
+  // Append a line to an approval prompt. Edits of one prompt run in order, after its delivery;
+  // the stored text follows every edit, so later lines stack instead of replacing each other.
+  editPrompt(prompt, line) {
+    const step = async () => {
+      await prompt.ready;
+      if (prompt.messageId == null) return;
+      prompt.text = `${prompt.text}\n${line}`;
+      await prompt.adapter.editMessage(prompt.chatId, prompt.messageId, prompt.text, []);
+    };
+    prompt.chain = prompt.chain.then(step, step).catch((e) => this.log(`edit failed: ${e.message}`));
+    return prompt.chain;
+  }
+
+  // The approval window, for chat lines: "10m", "1h", "45s".
+  ttlText() { return fmtShort(this.approvals.ttlMs); }
 
   async handleAction(adapter, action) {
     const ack = typeof action.ack === "function" ? action.ack : async () => {};
@@ -658,10 +683,11 @@ class Manager {
     await ack(result === "forbidden" ? "not yours" : undefined);
     if (result === "forbidden") return;
     if (prompt && prompt.adapter !== adapter) return;   // a prompt is edited only through the bot that sent it
-    const target = prompt || { adapter, chatId: action.chatId, messageId: action.messageId, text: "" };
-    if (!adapter.editMessage || target.messageId == null) return;
     const suffix = result === "approved" ? "→ approved" : result === "denied" ? "→ declined" : "(no longer pending)";
-    try { await adapter.editMessage(target.chatId, target.messageId, `${target.text ? target.text + "\n" : ""}${suffix}`, []); } catch (e) { this.log(`edit failed: ${e.message}`); }
+    if (prompt) await this.editPrompt(prompt, suffix);
+    else if (adapter.editMessage && action.messageId != null) {   // a prompt this daemon did not send (restart): annotate the tapped message
+      try { await adapter.editMessage(action.chatId, action.messageId, suffix, []); } catch (e) { this.log(`edit failed: ${e.message}`); }
+    }
     if (result !== "stale") this.prompts.delete(parsed.id);
   }
 
@@ -747,10 +773,12 @@ class Manager {
       }
       if (item.sessionId) { await this.runSessionTurn(adapter, cfg, item, controller, setStatus); return; }
       // Gate 1: intent.
-      const intent = await classifyIntent(item.task, {
+      const { intent, reason } = await explainIntent(item.task, {
         keywords: cfg.intentKeywords || DEFAULT_KEYWORDS,
         classify: async (prompt) => String((await this.runModel({ model: agent.MATCH_MODEL, prompt, allowedTools: [], timeoutMs: 60000, baseEnv: cleanEnv(process.env, cfg.envPassthrough) })).result || ""),
+        redact: (t) => this.red(t),
       });
+      this.log(this.red(`intent for run ${item.runId}: ${intent} (${reason})`));
       if (intent === "write") {
         setStatus("awaiting-approval");
         const decision = await this.ask(adapter, item, { kind: "intent", signal: controller.signal,
@@ -758,6 +786,12 @@ class Manager {
         if (decision === "cancelled") {
           this.journalRun(item, "cancelled", "cancelled while awaiting approval");
           await this.send(adapter, item.chatId, `⏹ cancelled — "${this.quote(item.task)}" was not run`);
+          return;
+        }
+        if (decision === "expired") {
+          this.journalDeclined(item, `approval expired (no answer in ${this.ttlText()})`);
+          await this.finishAck(adapter, item, "expired");
+          await this.send(adapter, item.chatId, `⏳ no answer in ${this.ttlText()} — send "${this.quote(item.task)}" again to run it`);
           return;
         }
         if (decision !== "approved") {
@@ -791,7 +825,8 @@ class Manager {
       });
       this.journalOneShot(item, report);
       setStatus("done");
-      await this.finishAck(adapter, item, (report && report.verdict) || "fail");
+      const v = (report && report.verdict) || "fail";
+      await this.finishAck(adapter, item, this.expiredWhat(v) !== null ? "expired" : v);
       await this.deliver(adapter, item, report, dir);
     } catch (e) {
       this.log(`run ${item.runId} error: ${e.message}`);
@@ -899,10 +934,12 @@ class Manager {
         since = outbox.snapshot(dir);   // once; continuations add to the same turn
 
         // Gate: intent, with the conversation's earlier messages as context.
-        const intent = await classifyIntent(item.task, {
+        const { intent, reason } = await explainIntent(item.task, {
           keywords: cfg.intentKeywords || DEFAULT_KEYWORDS, context: item.context || [],
           classify: async (prompt) => String((await this.runModel({ model: agent.MATCH_MODEL, prompt, allowedTools: [], timeoutMs: 60000, baseEnv: cleanEnv(process.env, cfg.envPassthrough) })).result || ""),
+          redact: (t) => this.red(t),
         });
+        this.log(this.red(`intent for run ${item.runId}: ${intent} (${reason})`));
         let gate = "approved";
         if (intent === "write") {
           setStatus("awaiting-approval");
@@ -911,6 +948,7 @@ class Manager {
           setStatus("running");
         }
         if (gate === "cancelled") { why = "intent"; verdict = "cancelled"; feedback = "cancelled while awaiting approval"; }
+        else if (gate === "expired") { why = "expired"; verdict = "declined"; feedback = `approval expired (no answer in ${this.ttlText()})`; }
         else if (gate !== "approved") { why = "intent"; verdict = "declined"; feedback = "message not approved"; }
         else if ((why = recheck())) {
           verdict = why === "aborted" ? "cancelled" : "declined"; feedback = whyFeedback(why, "before the turn ran");
@@ -931,6 +969,7 @@ class Manager {
             setStatus("awaiting-approval");
             const decision = await this.ask(adapter, item, { kind: "step", signal, label, text: `Approval needed: ${what}`, digest: crypto.createHash("sha256").update(what).digest("hex") });
             if (decision === "cancelled") { verdict = "cancelled"; feedback = "stopped by user; actions already performed were not undone"; break; }
+            if (decision === "expired") { why = "step-expired"; verdict = "declined"; feedback = `approval expired (no answer in ${this.ttlText()}): ${what}`; break; }   // not a refusal: not remembered
             if (decision !== "approved") { declinedNow.push(what); verdict = "declined"; feedback = `not approved: ${what}`; break; }
             setStatus("running");
             if ((why = recheck())) { verdict = why === "aborted" ? "cancelled" : "declined"; feedback = whyFeedback(why, "before the continuation"); break; }
@@ -957,7 +996,7 @@ class Manager {
     }
     setStatus("done");
     this.log(`run ${item.runId} [${name}] ${verdict}${feedback ? `: ${feedback}` : ""}`);
-    await this.finishAck(adapter, item, verdict);
+    await this.finishAck(adapter, item, why === "expired" || why === "step-expired" ? "expired" : verdict);
     if (verdict === "reply") return this.deliverTurn(adapter, item, text, dir, since);
     if (verdict === "cancelled") await status("⏹", why === "intent" ? `cancelled — "${this.quote(item.task)}" was not run` : "cancelled");
     else if (verdict === "declined") {
@@ -965,6 +1004,8 @@ class Manager {
       else if (why === "unpaired") await status("🚫", "you are no longer paired");
       else if (why === "paused") await status("🚫", "dropped — session paused or stopped");
       else if (why === "intent") await status("🚫", `declined — "${this.quote(item.task)}" was not run`);
+      else if (why === "expired") await status("⏳", `no answer in ${this.ttlText()} — send "${this.quote(item.task)}" again to run it`);
+      else if (why === "step-expired") await status("⏳", `no answer in ${this.ttlText()} — not done: ${lastWhat}`);
       else if (/within the limit/.test(feedback)) await status("⏹", `stopped: "${lastWhat}" was not approved within the limit`);
       else await status("🚫", `not approved: ${lastWhat}`);
     } else {
@@ -1008,10 +1049,18 @@ class Manager {
     }
   }
 
+  // The step a one-shot run's expired approval was about (from the agent's feedback), else null.
+  expiredWhat(v) {
+    const m = v && typeof v === "object" && v.verdict === "declined" ? /^approval expired: (.*)$/s.exec(v.feedback || "") : null;
+    return m ? m[1] : null;
+  }
+
   async deliver(adapter, item, report, dir) {
     const v = (report && report.verdict) || { verdict: "fail", feedback: "no verdict" };
     const icon = { pass: "✅", fail: "❌", declined: "🚫", cancelled: "⏹" }[v.verdict] || "❔";
-    await this.send(adapter, item.chatId, `${icon} ${v.verdict}${v.feedback ? " — " + v.feedback : ""}`);
+    const expired = this.expiredWhat(v);
+    if (expired !== null) await this.send(adapter, item.chatId, `⏳ no answer in ${this.ttlText()} — not done: ${expired}`);
+    else await this.send(adapter, item.chatId, `${icon} ${v.verdict}${v.feedback ? " — " + v.feedback : ""}`);
     if (report && report.evidence) await this.send(adapter, item.chatId, report.evidence);
     if (v.verdict === "fail") await this.send(adapter, item.chatId, "reply /retry to run again");
     if (!dir) return;
@@ -1039,6 +1088,9 @@ function fmtDuration(ms) {
   if (h < 24) return `${h}h ${min % 60}m`;
   return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
+
+// Like fmtDuration without a zero remainder: "10m", "1h", "45s", "2d 3h".
+function fmtShort(ms) { return fmtDuration(ms).replace(/ 0[smh]$/, ""); }
 
 function defaultKillProcessGroup(pid) {
   if (!(Number.isInteger(pid) && pid > 1)) return;

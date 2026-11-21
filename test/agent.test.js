@@ -388,6 +388,9 @@ function mockRun(judgeVerdicts) {
     let st = jobs.getJob("wr");
     assert(st.auditPasses === 1 && st.history.length === 0 && st.mode === "audit", "recipe gate: job state untouched on decline");
     assert(journal.readJournal({}).some((x) => x.runId === "appr0000001" && x.verdict === "declined"), "recipe gate: journaled as declined");
+    m = mockRun([]);
+    r = await runAgent("send it", { job: "wr", runId: "appr0000001x", approve: async () => "expired" }, m.run, deps);
+    assert(r.verdict.verdict === "declined" && r.verdict.feedback === "approval expired: write-risk recipe not approved; nothing was run" && recipeRuns === 0 && m.calls.length === 0, "recipe gate: expired → declined with the expiry as feedback, nothing ran");
 
     // approved → recipe ran, then judged as usual
     seed();
@@ -429,6 +432,9 @@ function mockRun(judgeVerdicts) {
     let s2 = scripted([needs], []);
     r = await runAgent("email Bob the draft", { runId: "appr0000007", approve: async () => "denied" }, s2.run, {});
     assert(r.verdict.verdict === "declined" && s2.calls.length === 1, "step gate: denied → declined after one ops call, no judge");
+    let s2x = scripted([needs], []);
+    r = await runAgent("email Bob the draft", { runId: "appr0000007x", approve: async () => "expired" }, s2x.run, {});
+    assert(r.verdict.verdict === "declined" && r.verdict.feedback === "approval expired: click Send on the draft to Bob" && s2x.calls.length === 1, "step gate: expired → declined with the expiry as feedback, no rerun");
 
     // without approve hook the NEEDS APPROVAL evidence just goes to the judge
     let s3 = scripted([needs], ['{"verdict":"fail","feedback":"not sent"}', '{"verdict":"fail","feedback":"x"}', '{"verdict":"fail","feedback":"y"}']);

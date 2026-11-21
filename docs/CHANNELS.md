@@ -48,9 +48,10 @@ Plain text is a task. The daemon replies `⏳ working on it` (or `⏳ queued
 it · ops:opus-5.5 · 45s`, at most every 15 s; only when the line cannot be
 edited, e.g. after a daemon restart, does progress go out as a message, and
 then without sound), ends it as `✅ done in 52s` (`⏹ stopped after …`,
-`🚫 declined`, `❌ failed after …`), and sends:
+`🚫 declined`, `⏳ no answer in 10m`, `❌ failed after …`), and sends:
 
-- `✅ pass — …` / `❌ fail — …` / `🚫 declined — …` / `⏹ cancelled`
+- `✅ pass — …` / `❌ fail — …` / `🚫 declined — …` / `⏹ cancelled` /
+  `⏳ no answer in 10m — send "…" again to run it`
 - the evidence report, split to the messenger's message limit
 - every file the run left in its outbox, as attachments (see Files)
 - `reply /retry to run again` after a failure
@@ -186,8 +187,11 @@ has no buttons, a `/approve <id> yes` reply — before anything irreversible hap
 1. **Intent.** A task that looks like it will send, submit, pay, book, delete,
    reply, publish … is quoted back and must be approved before the agent starts.
    The keyword list is configurable (`"intentKeywords": [...]` per channel); when
-   no keyword matches, a cheap model classifies, and anything unclear counts as
-   a write.
+   no keyword matches, a cheap model classifies: looking up or comparing
+   published prices, rates, availability, reviews or news is a read, buying,
+   booking, applying, signing up, requesting a quote or submitting a form is a
+   write, and anything unclear counts as a write. The verdict and why (`keyword
+   "send"`, `model`, `classifier error: …`) go to the log as `intent for run …`.
 2. **Recipe.** A learned recipe whose effective risk is `write` asks every time,
    in audit and economy mode alike.
 3. **Stop-before-send.** The agent is told to stop before any irreversible action
@@ -196,8 +200,13 @@ has no buttons, a `/approve <id> yes` reply — before anything irreversible hap
 
 Only the person who started the task can approve it. Approvals are single use
 and expire after 10 minutes; declined, expired, cancelled and daemon restarts
-all mean **stopped**, never "fall back and do it anyway". The ops playbook's
-hard rule against clicking Pay / Submit Payment is unchanged.
+all mean **stopped**, never "fall back and do it anyway". An unanswered prompt
+is not a refusal: it is edited to `→ expired (no answer in 10m)` (where the chat
+can edit messages; the `/approve` text form included), the task ends
+as `⏳ no answer in 10m — send "…" again to run it` (a mid-turn step: `⏳ no
+answer in 10m — not done: <step>`), and nothing is remembered as declined for
+the session. The ops playbook's hard rule against clicking Pay / Submit Payment
+is unchanged.
 
 ## Files
 
@@ -326,8 +335,11 @@ unchanged. A built-in reverse connection is on the roadmap.
 - **`channels.json is group/world readable`** — `chmod 600` it.
 - **`bridge down`** on `/ping` — start the relay (`npm start`) and reload the
   extension.
-- **Tasks always ask for approval** — a keyword matched; narrow `intentKeywords`
-  or rephrase ("show", "read", "list").
+- **Tasks always ask for approval** — a keyword matched, or the classifier
+  said write; the log line `intent for run …: write (keyword "send")` says
+  which. Narrow `intentKeywords` or rephrase ("show", "read", "list").
+- **`⏳ no answer in 10m`** — an approval prompt went unanswered; send the
+  message again and tap Approve.
 - **`[turo] this session's conversation is no longer available`** — Claude's
   transcript for that session expired or was removed; `/stop turo`, then
   `/new turo`. The daemon never substitutes another conversation.
