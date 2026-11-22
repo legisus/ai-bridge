@@ -144,8 +144,9 @@ bridge recordStop  '{"recId":"rec-ab12cd34"}' --out manual.mp4    # → manual.m
 - `area`: `"content"` (**default**) records only the page — the tab strip, address bar, bookmarks and the
   “started debugging” bar are cut off with ScreenCaptureKit's `sourceRect`; `"window"` records the whole window.
   For `content` the CLI measures the page through the tab (`innerWidth/innerHeight/outerWidth/outerHeight`
-  via `eval`, so “Allow User Scripts” must be on, or pass `--debugger`) and crops `outerHeight − innerHeight`
-  from the top. **The crop is fixed at start**: resizing the window during a recording does not recompute
+  via the size of a visible-tab screenshot — no User Scripts, no debugger needed; fallback: `eval` of
+  `innerHeight/outerHeight`, which needs “Allow User Scripts” or `--debugger`) and crops everything above the
+  viewport (+1 px) from the top. The tab must be the visible one of its window (`activateTab`). **The crop is fixed at start**: resizing the window during a recording does not recompute
   it, so set the window size *before* `recordStart`. Keep page zoom at 100 % and DevTools undocked.
 - `window`: a substring of the window title, or `app=<name>` (default `app=Google Chrome`, the active
   Chrome window). `{"tabId":N}` instead of `window` finds the window by that tab's title.
@@ -163,6 +164,13 @@ bridge recordStop  '{"recId":"rec-ab12cd34"}' --out manual.mp4    # → manual.m
   without it the command fails with exit code 7 and this path in the message. macOS ties the grant to the
   app's code signature — an ad-hoc rebuild (`macos/build-app.sh`) may need the switch turned off/on again;
   a Developer-ID-signed release keeps it.
+- **Native popups are not recorded.** A `<select>` dropdown, autofill/permission bubbles and other Chrome
+  popups are separate macOS windows, and a single-window capture contains only that one window (not verified
+  on a live dropdown: synthetic mouse events need an Accessibility grant that the test machine did not have).
+  For manuals: avoid opening native dropdowns on camera — set the value with `eval`/`click` on a custom
+  widget, or use `<select size=…>`/in-page menus. If a popup must be shown, the workaround is a display
+  capture with a crop to the page (`SCContentFilter(display:…)` + `sourceRect`, not implemented yet; it records
+  everything visible on that display, so keep it clear of other windows).
 - The window must be **visible and not covered**: Chrome stops painting occluded windows, so the recording would show an empty page. Open the page in its own window (`newTab` with `newWindow:true`) and `activateTab` it before `recordStart`.
 - The `.mp4` is moved to `--out` by the CLI (so the app never needs access to Documents/Desktop).
 

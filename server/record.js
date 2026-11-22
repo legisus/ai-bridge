@@ -102,17 +102,29 @@ async function main(argv) {
         if (cands.length !== 1) fail(`cannot tell which tab is shown in the window “${w.title}” (${cands.length} candidates) — pass {"tabId":N} or "area":"window"`);
         tabId = cands[0].id;
       }
-      let m;
+      // 1) screenshot of the visible page (needs no User Scripts, no debugger): its pixel size is the viewport
+      // 2) fallback: eval of innerWidth/innerHeight/outerHeight (User Scripts, or --debugger when the caller passes it)
+      const win = await appCallStarting("recordResolve", { window: params.window || "" });
+      let crop = null;
       try {
-        m = await bridgeCall("eval", { tabId, code: "JSON.stringify([innerWidth,innerHeight,outerWidth,outerHeight])" }, !flags.debugger);
-      } catch (e) {
-        fail(`cannot measure the page area (${e.message}). Enable “Allow User Scripts” on the extension card, pass --debugger, or use "area":"window".`);
+        const shot = await bridgeCall("screenshot", { tabId });
+        const png = Buffer.from(shot.base64, "base64");
+        const pw = png.readUInt32BE(16), ph = png.readUInt32BE(20);
+        const scale = Math.max(1, Math.round((pw / win.width) * 2) / 2);   // pixels per point
+        crop = { top: Math.ceil(win.height - ph / scale) + 1, width: pw / scale };   // +1: skip the infobar border line
+      } catch {}
+      if (!crop) {
+        let m;
+        try {
+          m = await bridgeCall("eval", { tabId, code: "JSON.stringify([innerWidth,innerHeight,outerWidth,outerHeight])" }, !flags.debugger);
+        } catch (e) {
+          fail(`cannot measure the page area (${e.message}). Make the tab visible (activateTab), enable “Allow User Scripts”, pass --debugger, or use "area":"window".`);
+        }
+        const [iw, ih, ow, oh] = JSON.parse(typeof m === "string" ? m : (m && (m.value ?? m.result)) ?? m);
+        crop = { top: oh - ih, width: iw };
       }
-      const v = JSON.parse(typeof m === "string" ? m : (m && (m.value ?? m.result)) ?? m);
-      const [iw, ih, ow, oh] = v;
-      if (!(ih > 100 && oh >= ih)) fail(`unexpected window metrics ${JSON.stringify(v)}`);
-      params.crop = { top: oh - ih, width: iw };
-      params.tabId = undefined;
+      if (!(crop.top >= 0 && crop.top < win.height - 100)) fail(`unexpected page area ${JSON.stringify(crop)}`);
+      params.crop = crop;
     }
     delete params.tabId; delete params.area;
   }
