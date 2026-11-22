@@ -29,8 +29,8 @@ enum Config {
 SWIFT
 
 echo "compiling app…"
-swiftc -O -swift-version 5 -target "${ARCH}-apple-macosx13.0" \
-  -framework Cocoa -framework ServiceManagement \
+swiftc -O -swift-version 5 -target "${ARCH}-apple-macosx13.1" \
+  -framework Cocoa -framework ServiceManagement -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia \
   macos/AIBridge/Sources/*.swift "$GEN/Config.swift" \
   -o "$BUNDLE/Contents/MacOS/$APP"
 

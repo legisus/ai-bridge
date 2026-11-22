@@ -10,9 +10,10 @@
   <key>CFBundleShortVersionString</key><string>@VERSION@</string>
   <key>CFBundleVersion</key><string>@VERSION@</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>13.1</string>
   <key>LSUIElement</key><true/>
   <key>NSHumanReadableCopyright</key><string>MIT © 2026 Mykola Bielousov</string>
+  <key>NSScreenCaptureUsageDescription</key><string>AI Browser Bridge records a browser window (with its sound) when your AI agent asks it to, to make video manuals.</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

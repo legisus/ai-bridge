@@ -24,6 +24,7 @@ enum BridgeState { case connected, serverDown, extensionMissing, noToken, unknow
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private var control: ControlServer?
     private var state: BridgeState = .unknown("starting")
     private let stateItem = NSMenuItem(title: "Checking…", action: nil, keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Start at login", action: #selector(toggleLogin), keyEquivalent: "")
@@ -49,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = symbol("point.3.connected.trianglepath.dotted")
         statusItem.menu = buildMenu()
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+
+        let hub = RecorderHub(stateDir: stateDir)
+        control = ControlServer(stateDir: stateDir, hub: hub)
+        control?.start()
 
         ensureRegistered(force: false)
         ensureServer()
