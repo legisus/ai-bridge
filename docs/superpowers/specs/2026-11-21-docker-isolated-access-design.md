@@ -1,8 +1,8 @@
 # Docker-isolated agent with host-side access control — design
 
-**Status:** design, 2026-11-21, revised the same day after three rounds of the Codex
-`gpt-6-astra` review (30 + 7 + 3 findings folded in; the review text is not part of
-the repo). Ships as the
+**Status:** design, 2026-11-21, revised the same day after four rounds of the Codex
+`gpt-6-astra` review (30 + 7 + 3 + 1 findings folded in; the review text is not part
+of the repo). Ships as the
 `docker-isolated` branch on top of the channels chain (`feat/channels-core` →
 `fix/intent-gate-expiry`). User-facing guide: `docs/DOCKER.md`. Builds on the relay
 protocol in `server/server.js`, the extension's `handle()` in
@@ -190,18 +190,37 @@ manualMode:  true | false                      // Options; true = never call the
 access:      { granted: bool, until: null | number, gen: number }   // written by the worker only
 ```
 
+Also in `chrome.storage.local` (download ids are stable across browser sessions,
+so ownership can be kept):
+
+```
+bridgeDownloads: { [downloadId]: { gen } }     // downloads started by the bridge
+```
+
 And in `chrome.storage.session` (survives service-worker restarts, cleared by Chrome
 on browser restart, extension reload, update or disable):
 
 ```
 agentTabs:       { [tabId]: { gen, url } }     // tabs opened by newTab in this browser session
-bridgeDownloads: { [downloadId]: { gen } }     // downloads started by the bridge in this browser session
 pending:         [ { kind: "tab"|"download", nonce, gen, url, startedAt } ]   // creations dispatched, id not yet known
 ```
 
 They live in storage, not in worker globals, because the service worker is
-terminated and restarted at will; they live in **session** storage, not local,
-because Chrome guarantees tab ids unique only within one browser session. A tab id
+terminated and restarted at will; tab records live in **session** storage, not
+local, because Chrome guarantees tab ids unique only within one browser session.
+
+Session storage is also cleared by an extension reload, and the bridge has a remote
+`reloadExtension` command (today it just schedules `chrome.runtime.reload()`). A
+granted agent must not be able to use it to erase the tab records and continue, so:
+`reloadExtension` runs the full revoke transition with `closeTabs:true` (close agent
+tabs, cancel in-progress bridge downloads, detach) and awaits it **before**
+scheduling the reload; and `chrome.runtime.onInstalled` (fired after any reload,
+update or install, including a manual reload from `chrome://extensions`) writes
+`access:{granted:false}` with a bumped gen and sets a popup notice "access was
+revoked because the extension was reloaded; tabs opened before the reload are no
+longer tracked". The grant survives a browser restart, not a reload. Downloads,
+being in local storage, are still cancelled by the next revoke after a manual
+reload. A tab id
 that exists after a browser restart proves nothing about who opened it, so a
 persisted numeric id must never authorise closing a tab. After a browser restart
 both maps are empty by construction (`chrome.runtime.onStartup`), and a tab opened
@@ -212,9 +231,10 @@ moves it into the map when the id returns; a completion that arrives after a rev
 (the gen no longer matches) closes the tab or cancels the download itself instead of
 returning it. On worker startup the maps are reconciled against `chrome.tabs.query` /
 `chrome.downloads.search` (entries whose tab or download no longer exists are
-dropped) and `pending` is resolved: a pending download is matched exactly by
-`chrome.downloads.search({ byExtensionId: chrome.runtime.id })` with `startTime ≥
-startedAt`, and adopted; a pending tab has no such marker (Chrome records no creator
+dropped) and `pending` is resolved: a pending download is matched by
+`chrome.downloads.search({ startedAfter: startedAt, orderBy: ["-startTime"] })`
+(`DownloadQuery` has no `byExtensionId` field) with the returned items filtered on
+`item.byExtensionId === chrome.runtime.id`, and adopted; a pending tab has no such marker (Chrome records no creator
 or creation time on a tab), so it is **not** guessed from its URL. It is dropped and
 counted, and the popup shows "N tab(s) the agent may have opened could not be
 identified" until the user dismisses it. Failing toward "do not close a tab we
@@ -238,9 +258,14 @@ this order: compare the in-memory generation, await `transition`, read the store
 record, then **compare the in-memory generation again after the read** and only then
 return. The second comparison is what closes the window Astra pointed at: a revoke
 that lands while the storage read is in flight bumps `accessGen`, so the command
-fails even though the read returned the old granted record. The caller dispatches
-the browser operation synchronously after `assertAccess` resolves, with no further
-`await` in between; a command that starts during the write waits for it. Every command captures `gen = accessGen` when it starts;
+fails even though the read returned the old granted record. Because `await assertAccess(gen)` resumes the caller in a later microtask, a
+revoke can still land between the check and the dispatch; the final check and the
+dispatch therefore happen in the **same synchronous continuation**:
+`dispatch(gen, () => chrome.debugger.sendCommand(...))` re-compares `accessGen`
+and the deadline synchronously and, in the same tick, calls the thunk. No `await`
+separates the last check from the browser call. The deterministic harness test for
+this is "check passed → revoke → dispatch", which must fail the command. A command
+that starts during the write waits for it. Every command captures `gen = accessGen` when it starts;
 `assertAccess(gen)` throws `access_revoked` if `accessGen !== gen` or the stored
 record is not live. The check runs:
 
@@ -318,21 +343,28 @@ document it was validated for:
   documentIds:[documentId]}`, so Chrome itself refuses to run the code if the
   document has been replaced (the call rejects; the worker reports `target
   changed`). One check, one document, one injection.
-- Debugger route: after attach the worker runs `Page.enable` and
-  `Page.getFrameTree`, records the main frame's `loaderId`, and subscribes to
-  `Page.frameNavigated`. Every `Runtime.evaluate`/`Input.*`/`Page.captureScreenshot`
-  is sent with the frame's current `loaderId` compared to the recorded one
-  immediately before; a `frameNavigated` event for that frame fails the running
-  command with `target changed` and, if the new URL is privileged or outside the
-  allowlist, detaches at once. Input events and screenshots have no document
-  parameter in CDP, so for them the residual window is the one CDP round-trip; the
-  spec accepts that and the guide's "cannot" list keeps saying revoke does not
-  undo page effects.
-- Direct-mode `screenshot` (`captureVisibleTab`): the worker checks `tab.active`
-  and the main frame's `documentId` immediately before the capture and again
-  after; if the document changed across the capture, the image is discarded and the
-  command fails `target changed` rather than returning a picture of a page that was
-  never validated.
+- Debugger route, code execution: after attach the worker runs `Runtime.enable`
+  and records, from `Runtime.executionContextCreated`, the `uniqueId` of the main
+  world context of the validated frame (matched by `auxData.frameId` and
+  `auxData.isDefault`). Every `Runtime.evaluate` / `Runtime.callFunctionOn` is sent
+  with `uniqueContextId` set to it; CDP rejects the call if that context is gone
+  (navigation destroys it), so code never runs in a document that was not
+  validated. A new context for the frame is adopted only after a fresh
+  `assertTarget`/`assertAllowed` on the frame's current URL.
+- Debugger route, input and capture: `Input.*` and `Page.captureScreenshot` have no
+  context parameter. `Page.enable` + `Page.frameNavigated` and the `loaderId`
+  comparison immediately before each send narrow the window to one CDP round-trip;
+  that residual is accepted and stated. (`Page.captureScreenshot` is at least bound
+  to the attached target, so it can never capture another tab.)
+- Direct-mode `screenshot` (`captureVisibleTab`): captures whatever tab is active
+  in the window at capture time, so a before/after check cannot see an A→B→A switch
+  during the capture. The worker therefore subscribes to `chrome.tabs.onActivated`
+  for the window across the capture (events queued during the capture are delivered
+  to the worker before the post-capture continuation that awaits one macrotask) and
+  discards the image if any activation happened or the main frame's `documentId`
+  changed; the command then fails `target changed`. This is event-ordering, not a
+  hard boundary; the guide says that the strict target boundary for screenshots is
+  the debugger route and recommends `--debugger` whenever the picture is evidence.
 
 A `chrome.tabs.onUpdated` listener still watches every attached or indicator-marked
 tab and detaches/fails on a URL change to a privileged or non-allowlisted one; it is
@@ -486,7 +518,12 @@ browser restarts.
   module, same stub storage) still finds the agent tabs and cancels the downloads;
   a simulated browser restart (session storage cleared) leaves an old tab id
   unowned and `closeTab` on it subject to the allowlist; a pending download is
-  adopted via `byExtensionId` and a pending tab is counted, not adopted.
+  adopted by filtering `search()` results on `byExtensionId` and a pending tab is
+  counted, not adopted; `reloadExtension` revokes, closes agent tabs and cancels
+  bridge downloads before the reload is scheduled; a simulated `onInstalled` after
+  a reload leaves access revoked with a bumped gen; "check passed → revoke →
+  dispatch" fails the command; a direct screenshot with a tab activation during
+  the capture is discarded.
 - Extension, by hand (the parts that need a real Chrome). Rows for
   `test/TEST-PLAN.md`: revoke during a `waitFor` stops within one tick;
   revoke during `type` stops mid-string; revoke while an attach is in flight ends

@@ -1,8 +1,8 @@
 # Running the bridge in Docker — isolated agent, your Chrome on the PC
 
 **Status:** draft on the `docker-isolated` branch, 2026-11-21, revised the same day
-after three rounds of the Codex `gpt-6-astra` review (30 + 7 + 3 findings folded in;
-the review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
+after four rounds of the Codex `gpt-6-astra` review (30 + 7 + 3 + 1 findings folded
+in; the review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
 machine it was written on, and the code changes it depends on (listed in
 [What has to change](#what-has-to-change-in-the-code)) are not implemented. The
 Dockerfile and compose file below are the target, not something that works today.
@@ -63,9 +63,9 @@ PC (Windows / Linux / macOS)                        Docker container  ai-bridge
   [Access](#access-grant-and-revoke), "manual mode"), otherwise a native host left
   over from a source install would overwrite the pasted token.
 - **Access** is a switch in the extension. Granted: commands run. Revoked: every
-  command is refused in the extension itself, the debugger is released from every
-  tab, and the server/CLI report `access revoked` so the agent fails fast instead of
-  retrying.
+  command except `ping` and `status` is refused in the extension itself, the
+  debugger is released from every tab, and the server/CLI report `access revoked`
+  so the agent fails fast instead of retrying.
 
 What stays on the PC: Chrome, the extension folder (loaded unpacked from the clone),
 Docker Desktop. What moves into the container: everything under `server/`, Node, the
@@ -320,6 +320,10 @@ get committed.
    `bridge screenshot '{"tabId":12}' --out page.png --debugger` (background tabs
    need the debugger route; or `bridge selectTab '{"tabId":12}'` first and omit
    `--debugger`). The screenshot appears in `deploy/docker/work/page.png`.
+   Use `--debugger` whenever the picture is evidence: a stealth screenshot captures
+   whichever tab is in front at that instant, and the extension can only detect,
+   not prevent, a tab switch during the capture; the debugger route is bound to
+   the tab it is attached to.
 8. **Agent and interactive use** happen inside the container:
    ```
    bridge agent "open https://example.com and report the title"
@@ -348,8 +352,8 @@ record, so the popup, the Options page and the expiry alarm can never race.
 |---|---|---|---|
 | **Granted** (`until: null`) | Commands run, subject to the allowlist and the privileged-origin block. Badge green `ON`. | `ping`/`status` show `access: "granted"`. | Works. |
 | **Granted until T** | Same until T, then revoked by the worker's alarm, or by the next command's own deadline check if the alarm is late. Badge shows the remaining time. | `until` is shown; the server also treats a past `until` as revoked on its own. | Works until T; a run crossing T fails at its next command. |
-| **Revoked** (default after install) | Every command except `ping` and `status` is refused with `access_revoked`; work already in flight stops at its next step; `chrome.debugger` is detached from every tab, including attachments that were still in progress; every download the bridge started in this browser session and not yet finished is cancelled; tab indicators are cleared. Badge grey. | The extension pushes `{type:"access", granted:false}`; the server fails every pending and new CLI request other than `ping`/`status` with `access revoked by user (session "work-chrome")` without forwarding it. | Every run is bound to the identity it started under: the server process (`serverId`), the extension connection (`extGen`) and the access **generation** (`accessGen`), all shown by `ping`. `bridge agent` and channel runs check before every model and judge start and poll while a model runs; any change of the three, not only a revoked state, ends the run, so a revoke followed by a quick re-grant, a server restart, or another Chrome profile taking over the connection all stop the old run. The ladder never climbs on an access error. |
-| **Revoke and close agent tabs** | As revoked, plus every tab the agent opened with `newTab` in this grant is closed. | Same. | Same. |
+| **Revoked** (default after install) | Every command except `ping` and `status` is refused with `access_revoked`; work already in flight stops at its next step; `chrome.debugger` is detached from every tab, including attachments that were still in progress; every download the bridge started in this browser session and not yet finished is cancelled; tab indicators are cleared. Badge grey. | The extension pushes `{type:"access", session:"work-chrome", granted:false, until:null, gen:4}`; the server fails every pending and new CLI request other than `ping`/`status` with `access revoked by user (session "work-chrome")` without forwarding it. | Every run is bound to the identity it started under: the server process (`serverId`), the extension connection (`extGen`) and the access **generation** (`accessGen`), all shown by `ping`. `bridge agent` and channel runs check before every model and judge start and poll while a model runs; any change of the three, not only a revoked state, ends the run, so a revoke followed by a quick re-grant, a server restart, or another Chrome profile taking over the connection all stop the old run. The ladder never climbs on an access error. |
+| **Revoke and close agent tabs** | As revoked, plus every tab the agent opened with `newTab` since Chrome last started (any grant) is closed. A tab whose opening was cut short by a service-worker restart before its id was recorded cannot be identified and is not closed; the popup shows a count of such tabs. | Same. | Same. |
 
 Rules the design holds to:
 
@@ -364,11 +368,17 @@ Rules the design holds to:
   the recommended way to leave an agent running unattended.
 - **Revoke stops the bridge, not the page.** See [Why](#why). Use "Revoke and close
   agent tabs" when you want the pages gone too.
-- **"Agent tabs" are remembered only until Chrome restarts.** Chrome reuses tab
-  numbers across restarts, so the extension forgets which tabs the agent opened
-  when the browser starts; after that they are ordinary tabs and "Revoke and close
-  agent tabs" leaves them alone. Close them yourself. The grant itself does survive
-  a restart.
+- **"Agent tabs" are remembered only until Chrome restarts or the extension is
+  reloaded.** Chrome reuses tab numbers across restarts, so the extension forgets
+  which tabs the agent opened when the browser starts, and Chrome also clears that
+  memory on an extension reload or update; after either, they are ordinary tabs and
+  "Revoke and close agent tabs" leaves them alone. Close them yourself. Downloads
+  are remembered across both (Chrome's download ids are stable). The grant survives
+  a browser restart but **not** an extension reload: after a reload the extension
+  starts revoked, with a popup note saying why, so the agent cannot use
+  `reloadExtension` to wipe the tab records and carry on; `reloadExtension` itself
+  first revokes, closes the agent tabs and cancels the bridge downloads, then
+  reloads.
 - **Revoke is not rotation.** A revoked container still holds the token, and so does
   anything that copied it. If you suspect the container, the sequence is:
   1. revoke in the popup;
@@ -382,11 +392,15 @@ Rules the design holds to:
   4. invalidate the model credentials **at the provider**, then issue new ones.
      Issuing a replacement does not kill the old one, and `codex logout` only
      deletes the local file:
-     - Codex: in the ChatGPT account, Settings → Security → **Active sessions**,
-       end the Codex session, or **Log out of all sessions** (takes up to 30 min);
-       then `codex login --device-auth` again. Accounts signed in through an
-       organisation's SSO may not have that page; use the organisation's session
-       controls.
+     - Codex: OpenAI's own help page says the ChatGPT **Active sessions** list
+       "does not show or manage" Codex CLI sessions, and **Log out of all
+       sessions** (Settings → Security, up to 30 min to propagate) does not say
+       whether it covers them. There is no verified way to invalidate a copied
+       Codex CLI login from the account; `codex logout` only deletes the local
+       file. Do all of: Log out of all sessions, change the account password, and
+       ask OpenAI support to revoke the Codex CLI grant; then `codex login
+       --device-auth` again. Until support confirms, treat the old login as live
+       and watch the account's usage.
      - Claude Code: there is no self-service revoke for a `claude setup-token`
        token as of this writing (the CLI only mints; feature requests
        anthropics/claude-code#48373 and #57400 are open). Treat the old token as
@@ -484,9 +498,12 @@ appears under `/work`.
 git pull
 docker compose -f deploy/docker/compose.yml up -d --build bridge                              # relay only
 docker compose -f deploy/docker/compose.yml --profile channels up -d --build bridge channels  # relay + daemon
-bridge reloadExtension        # or the reload icon on the extension card
-bridge ping
+bridge reloadExtension        # revokes, closes agent tabs, cancels bridge downloads, then reloads
+bridge ping                   # → access "revoked": grant again in the popup
 ```
+
+A reload (this command, the reload icon, or an extension update) always leaves the
+extension revoked; grant again afterwards.
 
 Name both services in the second form: with a profile active, `up --build bridge`
 alone rebuilds the relay and leaves the daemon on the old image.
