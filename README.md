@@ -157,6 +157,7 @@ bridge recordStop  '{"recId":"rec-ab12cd34"}' --out manual.mp4    # → manual.m
   without it the command fails with exit code 7 and this path in the message. macOS ties the grant to the
   app's code signature — an ad-hoc rebuild (`macos/build-app.sh`) may need the switch turned off/on again;
   a Developer-ID-signed release keeps it.
+- The window must be **visible and not covered**: Chrome stops painting occluded windows, so the recording would show an empty page. Open the page in its own window (`newTab` with `newWindow:true`) and `activateTab` it before `recordStart`.
 - The `.mp4` is moved to `--out` by the CLI (so the app never needs access to Documents/Desktop).
 
 ## Agent mode — hand it a whole task

@@ -86,7 +86,6 @@ final class Recording: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Se
 
         try? FileManager.default.removeItem(at: mp4)
         writer = try AVAssetWriter(outputURL: mp4, fileType: .mp4)
-        writer.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600) // survives a crash; long recordings stay on disk
         let bitrate = min(max(Int(Double(w * h * fps) * 0.07), 4_000_000), 24_000_000)
         vIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
