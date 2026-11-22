@@ -1,8 +1,8 @@
 # Running the bridge in Docker — isolated agent, your Chrome on the PC
 
 **Status:** draft on the `docker-isolated` branch, 2026-11-21, revised the same day
-after two rounds of the Codex `gpt-6-astra` review (30 + 7 findings folded in; the
-review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
+after three rounds of the Codex `gpt-6-astra` review (30 + 7 + 3 findings folded in;
+the review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
 machine it was written on, and the code changes it depends on (listed in
 [What has to change](#what-has-to-change-in-the-code)) are not implemented. The
 Dockerfile and compose file below are the target, not something that works today.
@@ -132,7 +132,7 @@ FROM node:22-bookworm-slim
 # procps: the channels daemon's crash recovery calls `ps` to inspect a recorded pid.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git procps \
  && rm -rf /var/lib/apt/lists/* \
- && npm install -g @anthropic-ai/claude-code@2.1.0 @openai/codex@0.171.0
+ && npm install -g @anthropic-ai/claude-code@2.1.317 @openai/codex@0.171.0
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
@@ -163,10 +163,10 @@ CMD ["node", "/app/server/server.js"]
   `--sandbox workspace-write`, which needs kernel features the hardened container
   drops. Whether the pinned Codex works under this compose file is one of the things
   the first real run has to establish.
-- The pinned `claude` version is a placeholder and the pair (`claude` 2.1.0,
-  `codex` 0.171.0) is **untested** in this container. The first build fixes the
-  pair that passes the Docker smoke job and records it here; after that, bump only
-  with the smoke job.
+- The pinned pair (`claude` 2.1.317, `codex` 0.171.0) is the pair installed on the
+  machine this guide was written on; it is **untested** in this container and under
+  this compose file. The first build fixes the pair that passes the Docker smoke job
+  and records it here; after that, bump only with the smoke job.
 
 ### .dockerignore (repo root)
 
@@ -300,7 +300,7 @@ get committed.
 6. **Smoke test from the PC:**
    ```
    docker compose -f deploy/docker/compose.yml exec -T bridge node /app/server/cli.js ping
-   # {"pong":true,"version":"0.1.11","session":"work-chrome","access":"granted","until":null,"accessGen":3}
+   # {"pong":true,"version":"0.1.11","session":"work-chrome","access":"granted","until":null,"accessGen":3,"extGen":1,"serverId":"7f3a…"}
    ```
 7. **Shell helper.** PowerShell **7.3 or newer** (5.1 mangles the JSON quotes):
    ```powershell
@@ -325,8 +325,10 @@ get committed.
    bridge agent "open https://example.com and report the title"
    docker compose -f deploy/docker/compose.yml exec -it bridge claude     # interactive Claude Code, cwd /work
    ```
-   For the Telegram daemon, write `channels.json` into the data volume
-   (`docker compose -f deploy/docker/compose.yml exec -T bridge sh -c 'cat > /data/channels.json' < channels.json`)
+   For the Telegram daemon, keep your `channels.json` at
+   `deploy/docker/channels.json` (that path is git-ignored; the repo root is not),
+   write it into the data volume
+   (`docker compose -f deploy/docker/compose.yml exec -T bridge sh -c 'cat > /data/channels.json' < deploy/docker/channels.json`)
    and start it with its profile:
    ```
    docker compose -f deploy/docker/compose.yml --profile channels up -d
@@ -346,7 +348,7 @@ record, so the popup, the Options page and the expiry alarm can never race.
 |---|---|---|---|
 | **Granted** (`until: null`) | Commands run, subject to the allowlist and the privileged-origin block. Badge green `ON`. | `ping`/`status` show `access: "granted"`. | Works. |
 | **Granted until T** | Same until T, then revoked by the worker's alarm, or by the next command's own deadline check if the alarm is late. Badge shows the remaining time. | `until` is shown; the server also treats a past `until` as revoked on its own. | Works until T; a run crossing T fails at its next command. |
-| **Revoked** (default after install) | Every command except `ping` and `status` is refused with `access_revoked`; work already in flight stops at its next step; `chrome.debugger` is detached from every tab, including attachments that were still in progress; downloads the bridge started and not yet finished are cancelled; tab indicators are cleared. Badge grey. | The extension pushes `{type:"access", granted:false}`; the server fails every pending and new CLI request other than `ping`/`status` with `access revoked by user (session "work-chrome")` without forwarding it. | Every run is bound to the access **generation** it started under (`accessGen` in `ping`). `bridge agent` and channel runs check before every model and judge start and poll while a model runs; any change of generation, not only a revoked state, ends the run, so a revoke followed by a quick re-grant still stops the old run. The ladder never climbs on an access error. |
+| **Revoked** (default after install) | Every command except `ping` and `status` is refused with `access_revoked`; work already in flight stops at its next step; `chrome.debugger` is detached from every tab, including attachments that were still in progress; every download the bridge started in this browser session and not yet finished is cancelled; tab indicators are cleared. Badge grey. | The extension pushes `{type:"access", granted:false}`; the server fails every pending and new CLI request other than `ping`/`status` with `access revoked by user (session "work-chrome")` without forwarding it. | Every run is bound to the identity it started under: the server process (`serverId`), the extension connection (`extGen`) and the access **generation** (`accessGen`), all shown by `ping`. `bridge agent` and channel runs check before every model and judge start and poll while a model runs; any change of the three, not only a revoked state, ends the run, so a revoke followed by a quick re-grant, a server restart, or another Chrome profile taking over the connection all stop the old run. The ladder never climbs on an access error. |
 | **Revoke and close agent tabs** | As revoked, plus every tab the agent opened with `newTab` in this grant is closed. | Same. | Same. |
 
 Rules the design holds to:
@@ -362,6 +364,11 @@ Rules the design holds to:
   the recommended way to leave an agent running unattended.
 - **Revoke stops the bridge, not the page.** See [Why](#why). Use "Revoke and close
   agent tabs" when you want the pages gone too.
+- **"Agent tabs" are remembered only until Chrome restarts.** Chrome reuses tab
+  numbers across restarts, so the extension forgets which tabs the agent opened
+  when the browser starts; after that they are ordinary tabs and "Revoke and close
+  agent tabs" leaves them alone. Close them yourself. The grant itself does survive
+  a restart.
 - **Revoke is not rotation.** A revoked container still holds the token, and so does
   anything that copied it. If you suspect the container, the sequence is:
   1. revoke in the popup;
@@ -372,11 +379,26 @@ Rules the design holds to:
      and create a fresh, empty one. The old one is where a compromised agent could
      have left instructions or config for its successor; copy back only files you
      have read;
-  4. revoke the model credentials at their source: a new `claude setup-token` (the
-     old `CLAUDE_CODE_OAUTH_TOKEN` may have been copied out of the container) and
-     `codex logout` / a fresh device login;
-  5. `up -d --build bridge` → paste the new token → grant.
-  Until change #11 ships that is the procedure.
+  4. invalidate the model credentials **at the provider**, then issue new ones.
+     Issuing a replacement does not kill the old one, and `codex logout` only
+     deletes the local file:
+     - Codex: in the ChatGPT account, Settings → Security → **Active sessions**,
+       end the Codex session, or **Log out of all sessions** (takes up to 30 min);
+       then `codex login --device-auth` again. Accounts signed in through an
+       organisation's SSO may not have that page; use the organisation's session
+       controls.
+     - Claude Code: there is no self-service revoke for a `claude setup-token`
+       token as of this writing (the CLI only mints; feature requests
+       anthropics/claude-code#48373 and #57400 are open). Treat the old token as
+       live for its full lifetime (one year), change the account password and
+       ask Anthropic support to revoke the token, then mint a new one with
+       `claude setup-token`. The token's scope is inference only, so the exposure
+       is model usage billed to the account, not chat history.
+     Put the new token into `deploy/docker/.env` **before** the next step;
+  5. `up -d --build bridge` → paste the new bridge token into the extension →
+     grant.
+  Until change #11 ships that is the procedure. The bridge token itself is
+  replaced by `down -v` (a fresh `/data` means a fresh token).
 - **The hard stop is still Docker.** `docker compose -f deploy/docker/compose.yml
   --profile channels stop` kills the daemon, the agent, the server and any model
   session mid-flight (keep `--profile channels` even if you never started the
@@ -447,7 +469,7 @@ appears under `/work`.
 | Options show "not provisioned" / `extension not connected` | Token not pasted, or the server still binds `127.0.0.1` inside the container so the published port is dead. | Check the log says `listening on ws://0.0.0.0:8765`; re-paste the token; reload the extension. |
 | Token in Options changes by itself | A native host from an old source install re-provisioned the extension. | Tick **Manual mode** in Options; unregister the host (prerequisites). |
 | `EACCES … /data/token` in the logs | The `/data` volume is not owned by uid 1000 (an image built without the `chown` line, or a volume created by an older image). | Rebuild; `docker compose … down -v` and start again if the volume predates the fix. |
-| `EACCES` writing `--out` files | `./work` on a Linux host was created by Docker as root. | `chown 1000 deploy/docker/work`, or add `user:` to the services. |
+| `EACCES` writing `--out` files | `./work` on a Linux host was created by Docker as root. | `sudo chown 1000 deploy/docker/work`. Do not add `user:` to the services (see the note under `.env.example`). |
 | `access revoked by user` (exit 8) | You revoked, or a timed grant ran out. | Popup → Grant. |
 | `access not granted` (exit 8) | Fresh install, or the extension reconnected and has not sent its state yet. | Popup → Grant; wait a second and retry. |
 | Chrome's `…is debugging this browser` banner stays | A `--debugger` command ran and `idleDetachMs` has not elapsed. | `bridge detachAll`, or revoke (which detaches). |

@@ -1,8 +1,8 @@
 # Docker-isolated agent with host-side access control — design
 
-**Status:** design, 2026-11-21, revised the same day after two rounds of the Codex
-`gpt-6-astra` review (30 + 7 findings folded in; the review text is not part of the
-repo). Ships as the
+**Status:** design, 2026-11-21, revised the same day after three rounds of the Codex
+`gpt-6-astra` review (30 + 7 + 3 findings folded in; the review text is not part of
+the repo). Ships as the
 `docker-isolated` branch on top of the channels chain (`feat/channels-core` →
 `fix/intent-gate-expiry`). User-facing guide: `docs/DOCKER.md`. Builds on the relay
 protocol in `server/server.js`, the extension's `handle()` in
@@ -138,11 +138,18 @@ revoked (they touch no tab), and the server merges `session`, `access`
 (`"granted"` | `"revoked"` | `"not_granted"`) and `until` into the result:
 
 ```json
-{"pong":true,"version":"0.1.11","session":"work-chrome","access":"granted","until":null,"accessGen":3}
+{"pong":true,"version":"0.1.11","session":"work-chrome","access":"granted","until":null,
+ "accessGen":3,"extGen":1,"serverId":"7f3a9c…"}
 ```
 
 `accessGen` is the `gen` from the last `access` message of the current extension
-socket, or `0` when none has arrived.
+socket, or `0` when none has arrived. It is a counter local to one extension
+instance, so two Chrome profiles can both be at `3`; on its own it does not identify
+*which* browser answered. `extGen` is the server's extension-connection generation
+(see Server) and `serverId` a random 128-bit value chosen once per server process.
+The triple `(serverId, extGen, accessGen)` is the identity a run latches: any change
+means a different server, a different (or reconnected) extension, or a different
+grant.
 
 **Server bind.** `BRIDGE_BIND` (default `127.0.0.1`) is the listen address. The CLI
 keeps connecting to `127.0.0.1:BRIDGE_PORT`; no client-side variable is added in v1.
@@ -158,9 +165,10 @@ the server's `listening` event, not before it.
   messages are accepted only from the current generation.
 - Pending requests are tagged with the generation that received them. On extension
   disconnect or supersession every pending request of that generation is answered
-  `extension disconnected`. On an `access` flip to revoked every pending request is
-  answered `access_revoked` (the extension will refuse them anyway; the CLI should
-  not wait for that).
+  `extension disconnected`. On an `access` flip to revoked every pending request
+  **other than `ping`/`status`** is answered `access_revoked` (the extension will
+  refuse them anyway; the CLI should not wait for that); pending `ping`/`status`
+  are left to complete, so a revoke never makes them fail.
 - A CLI `request` other than `ping`/`status` while access is not `granted`, or while
   `until` is a number in the past, is answered without forwarding. The server
   evaluates `until` itself on every request, so a dead extension socket that never
@@ -180,17 +188,37 @@ New keys in `chrome.storage.local` next to `token`, `port`, `allowlist`,
 sessionName: "chrome"                          // Options
 manualMode:  true | false                      // Options; true = never call the native host
 access:      { granted: bool, until: null | number, gen: number }   // written by the worker only
-agentTabs:   { [tabId]: gen }                  // tabs opened by newTab, per grant; written by the worker only
-bridgeDownloads: { [downloadId]: gen }         // downloads started by the bridge, per grant
 ```
 
-`agentTabs` and `bridgeDownloads` live in storage, not in worker globals, because the
-service worker is terminated and restarted at will. A `newTab` or `download` registers
-a placeholder **before** calling Chrome and fills in the id after; a completion that
-arrives after a revoke (the gen no longer matches) closes the tab or cancels the
-download itself instead of returning it. On worker startup both maps are reconciled
-against `chrome.tabs.query` / `chrome.downloads.search`: entries whose tab or download
-no longer exists are dropped.
+And in `chrome.storage.session` (survives service-worker restarts, cleared by Chrome
+on browser restart, extension reload, update or disable):
+
+```
+agentTabs:       { [tabId]: { gen, url } }     // tabs opened by newTab in this browser session
+bridgeDownloads: { [downloadId]: { gen } }     // downloads started by the bridge in this browser session
+pending:         [ { kind: "tab"|"download", nonce, gen, url, startedAt } ]   // creations dispatched, id not yet known
+```
+
+They live in storage, not in worker globals, because the service worker is
+terminated and restarted at will; they live in **session** storage, not local,
+because Chrome guarantees tab ids unique only within one browser session. A tab id
+that exists after a browser restart proves nothing about who opened it, so a
+persisted numeric id must never authorise closing a tab. After a browser restart
+both maps are empty by construction (`chrome.runtime.onStartup`), and a tab opened
+before the restart is an ordinary user tab from then on; the guide says so.
+
+A `newTab` or `download` appends a `pending` entry **before** calling Chrome and
+moves it into the map when the id returns; a completion that arrives after a revoke
+(the gen no longer matches) closes the tab or cancels the download itself instead of
+returning it. On worker startup the maps are reconciled against `chrome.tabs.query` /
+`chrome.downloads.search` (entries whose tab or download no longer exists are
+dropped) and `pending` is resolved: a pending download is matched exactly by
+`chrome.downloads.search({ byExtensionId: chrome.runtime.id })` with `startTime ≥
+startedAt`, and adopted; a pending tab has no such marker (Chrome records no creator
+or creation time on a tab), so it is **not** guessed from its URL. It is dropped and
+counted, and the popup shows "N tab(s) the agent may have opened could not be
+identified" until the user dismisses it. Failing toward "do not close a tab we
+cannot prove is ours" is the deliberate choice.
 
 `readAccess()` normalises: anything not matching the shape is `{granted:false}`. A
 timed grant is live only while `Date.now() < until`.
@@ -205,11 +233,14 @@ through one promise chain, writes storage, and only then acts.
 
 Every grant and every revoke increments an in-memory `accessGen`, also persisted in
 the record. The transition is fail-closed: the worker bumps `accessGen` and sets a
-`transition` promise **before** the storage write, and `assertAccess` awaits that
-promise, compares the in-memory generation first and reads the stored record second.
-A command that started under the previous generation therefore fails even if its
-storage read still returns the old granted record; a command that starts during the
-write waits for it. Every command captures `gen = accessGen` when it starts;
+`transition` promise **before** the storage write, and `assertAccess(gen)` runs in
+this order: compare the in-memory generation, await `transition`, read the stored
+record, then **compare the in-memory generation again after the read** and only then
+return. The second comparison is what closes the window Astra pointed at: a revoke
+that lands while the storage read is in flight bumps `accessGen`, so the command
+fails even though the read returned the old granted record. The caller dispatches
+the browser operation synchronously after `assertAccess` resolves, with no further
+`await` in between; a command that starts during the write waits for it. Every command captures `gen = accessGen` when it starts;
 `assertAccess(gen)` throws `access_revoked` if `accessGen !== gen` or the stored
 record is not live. The check runs:
 
@@ -229,22 +260,27 @@ restart with a stale value.
 ### Revoke (popup, Options, expiry alarm, or startup reconciliation)
 
 1. `accessGen++`; write `access:{granted:false, until:null, gen}`.
-2. Cancel every download in `bridgeDownloads` for this grant that is still
-   `in_progress` (`chrome.downloads.cancel`); finished downloads are left alone and
-   the guide says so.
+2. Cancel every download in `bridgeDownloads` (every grant of this browser session,
+   not only the current one: a renewed grant must not leave an older grant's
+   download running) that is still `in_progress` (`chrome.downloads.cancel`), and
+   every `pending` download once its id resolves; finished downloads are left alone
+   and the guide says so.
 3. Detach: for every tab in `attached` **and** every in-flight promise in
    `attaching`, await the attach if pending, then `chrome.debugger.detach`; clear the
    frame and favicon badge. A late attach completion that finds `accessGen` moved
    detaches itself before returning.
-4. If `closeTabs`, close every tab in `agentTabs` for this grant.
-5. Send `{type:"access", session, granted:false, until:null}` if the socket is open.
+4. If `closeTabs`, close every tab in `agentTabs` (every grant of this browser
+   session) and every `pending` tab whose id resolves later.
+5. Send `{type:"access", session, granted:false, until:null, gen}` if the socket is
+   open.
 6. Badge grey, no text. Clear the `access-expiry-<gen>` alarm.
 
 ### Grant
 
-1. `accessGen++`; write `access:{granted:true, until, gen}`; the previous grant's
-   `agentTabs`/`bridgeDownloads` entries stay recorded under their old gen (a renewed
-   grant does not adopt them; "revoke and close" closes only the current grant's).
+1. `accessGen++`; write `access:{granted:true, until, gen}`. Earlier grants'
+   `agentTabs`/`bridgeDownloads` entries of this browser session stay recorded under
+   their old gen; the gen is kept for logging only, "revoke" and "revoke and close"
+   act on all of them.
 2. Clear every `access-expiry-*` alarm, then create `access-expiry-<gen>` at `until`
    if set. The handler parses the gen out of the alarm name and revokes only if the
    record's `gen` still matches, so a stale alarm from an earlier grant cannot revoke
@@ -268,14 +304,38 @@ from the caller); every frame before `scripting.executeScript`,
 still means "any http(s) host". `listTabs` reports such tabs with `url:"redacted"`
 and no title.
 
-Validation is bound to the document, not to the command: `assertTarget` and
-`assertAllowed` run on the tab's current URL **immediately before each browser
-operation** (each `chrome.debugger.sendCommand`, each script execution, each
-capture), not once at the top of `handle()`. A `chrome.tabs.onUpdated` listener
-watches every attached or indicator-marked tab: when its URL changes to a privileged
-or non-allowlisted one (a redirect, a page script navigating, a `window.open`), the
-worker detaches the debugger from it at once and fails the running command with
-`target changed`.
+Validation is bound to the **document**, not to the tab or the command. A URL
+re-check before dispatch narrows the race but does not close it (the page can
+navigate between the check and the operation), so every operation names the
+document it was validated for:
+
+- Direct route: validation calls `chrome.webNavigation.getFrame({tabId, frameId})`
+  (the manifest gains the `webNavigation` permission; it is optional-permission
+  free and prompts nothing new at install)
+  and keeps the returned `documentId` with the URL it checked. `scripting.
+  executeScript` / `userScripts.execute` are then called with `target:{tabId,
+  documentIds:[documentId]}`, so Chrome itself refuses to run the code if the
+  document has been replaced (the call rejects; the worker reports `target
+  changed`). One check, one document, one injection.
+- Debugger route: after attach the worker runs `Page.enable` and
+  `Page.getFrameTree`, records the main frame's `loaderId`, and subscribes to
+  `Page.frameNavigated`. Every `Runtime.evaluate`/`Input.*`/`Page.captureScreenshot`
+  is sent with the frame's current `loaderId` compared to the recorded one
+  immediately before; a `frameNavigated` event for that frame fails the running
+  command with `target changed` and, if the new URL is privileged or outside the
+  allowlist, detaches at once. Input events and screenshots have no document
+  parameter in CDP, so for them the residual window is the one CDP round-trip; the
+  spec accepts that and the guide's "cannot" list keeps saying revoke does not
+  undo page effects.
+- Direct-mode `screenshot` (`captureVisibleTab`): the worker checks `tab.active`
+  and the main frame's `documentId` immediately before the capture and again
+  after; if the document changed across the capture, the image is discarded and the
+  command fails `target changed` rather than returning a picture of a page that was
+  never validated.
+
+A `chrome.tabs.onUpdated` listener still watches every attached or indicator-marked
+tab and detaches/fails on a URL change to a privileged or non-allowlisted one; it is
+the early signal, the document binding above is the guarantee.
 
 ### Allowlist on every target
 
@@ -287,7 +347,8 @@ re-reading the tab's URL, so a redirect out of the allowlist stops the poll),
 time; otherwise `tab not active` rather than capturing whatever is in front).
 `listTabs` returns only tabs whose host is allowed, the rest as
 `{id, url:"redacted"}`. `closeTab` on a redacted tab is allowed only if the tab is in
-`agentTabs` (the agent opened it); any other tab stays subject to the allowlist.
+`agentTabs` of the **current browser session** (the agent opened it since Chrome
+last started); any other tab stays subject to the allowlist.
 
 ### Manual mode and reconnection
 
@@ -298,7 +359,10 @@ time; otherwise `tab not active` rather than capturing whatever is in front).
   transition (so in-flight commands fail on the generation bump and the debugger is
   released), then closes the socket, then calls `connect()`. The new server starts
   `not_granted`; the user grants again. Messages from the old socket are ignored
-  after `ws` is replaced (the existing `ws !== sock` guard).
+  after `ws` is replaced: today the `ws !== sock` guard exists only in
+  `sock.onclose`; it is added to `sock.onmessage` as well, so a command that arrives
+  on a superseded socket is dropped, and a command already accepted from it fails on
+  the generation bump that the revoke transition performed before the close.
 - The socket stays open while revoked: `ping`/`status` keep working so the popup can
   show "connected", and re-grant needs no reconnect. The `access` message is sent on
   every `auth ok`, so the server never carries a stale grant across reconnects.
@@ -319,8 +383,10 @@ browser restarts.
   (channel session turns). `ping` is an injectable option of these functions (like
   the model runner the tests already inject), defaulting to spawning the CLI.
 - The pre-flight parses `ping`'s stdout, requires `access === "granted"`, and
-  **latches `accessGen`** for the run. Every later check requires the same
-  generation; a different one, a non-granted state, `extension not connected`, a
+  **latches the triple `(serverId, extGen, accessGen)`** for the run. Every later
+  check requires the same triple; any change (a revoke-then-regrant, a server
+  restart, another extension instance taking over the connection, a disconnect and
+  reconnect of the same one), a non-granted state, `extension not connected`, a
   malformed reply, or two consecutive ping timeouts (5 s each) all end the run with
   the structured terminal error `access_revoked` (fail closed). The ladder does not
   climb on it (a stronger model cannot help).
@@ -356,8 +422,10 @@ browser restarts.
   `--dangerously-bypass-approvals-and-sandbox` instead of `-s workspace-write`
   (Codex's Linux sandbox needs namespaces/landlock that the hardened container
   denies). The flag is honoured only when the variable is set; the default stays
-  `workspace-write`. Both CLIs are pinned in the Dockerfile; the pair is untested
-  until the Docker smoke job has run once, and the guide records the pair that passed.
+  `workspace-write`. Both CLIs are pinned in the Dockerfile to the versions installed on the
+  authoring machine (`claude` 2.1.317, `codex` 0.171.0); the pair is untested
+  under the compose restrictions until the Docker smoke job has run once, and the
+  guide records the pair that passed.
 - `procps` is installed: the daemon's crash recovery runs `ps` to inspect a recorded
   pid, and without it every recovery reads as unknown and holds queued turns.
 - Recovery after a suspected compromise replaces the named volumes **and** the
@@ -382,15 +450,20 @@ browser restarts.
   revoked` → CLI gets `access_revoked`, extension receives nothing, a request that
   was pending is answered `access_revoked`; `until` in the past → treated as revoked
   with no message; `ping`/`status` forwarded while revoked and carrying `session`,
-  `access`, `until`; a new extension socket authenticating while the old one is open
-  resets access to `not_granted`, and an `access` message from the old socket is
-  ignored; pending requests of the superseded socket get `extension disconnected`.
+  `access`, `until`, `accessGen`, `extGen`, `serverId`; a new extension socket
+  authenticating while the old one is open resets access to `not_granted`, bumps
+  `extGen`, and an `access` message from the old socket is ignored; pending requests
+  of the superseded socket get `extension disconnected`; a pending `ping` survives a
+  revoke while a pending `eval` gets `access_revoked`; `serverId` differs between two
+  server processes.
 - `test/cli.*`: exit 8 on both access errors; the strings are matched verbatim.
 - `test/agent.test.js` (injected model runner plus the new injected `ping`):
   pre-flight with `access:"revoked"` spawns no model; a run whose ping flips to
   revoked between rungs ends with `access_revoked` and does not climb; a child is
   aborted when the 10-s ping sees revoked; a ping that returns `granted` with a
-  **different `accessGen`** (revoke then re-grant between polls) also ends the run;
+  **different `accessGen`** (revoke then re-grant between polls), a different
+  `extGen` (another extension with the same counter value took over) or a different
+  `serverId` (server restarted) also ends the run;
   two consecutive ping timeouts end the run; `runTurn` and the classifier go through
   the same gate.
 - `test/channels.restricted.test.js`: `cleanEnv` passes `AI_BRIDGE_HOME`,
@@ -399,8 +472,22 @@ browser restarts.
 - Server bind: start with `BRIDGE_BIND=0.0.0.0` on a dynamic port, connect from
   `127.0.0.1`, assert the warning suffix; with the default, assert the bind in the
   startup line.
-- Extension: no automated harness exists (plain MV3, loaded unpacked). Rows for
-  `test/TEST-PLAN.md`, run by hand: revoke during a `waitFor` stops within one tick;
+- Extension, deterministic: the access logic (`assertAccess`, the transition,
+  `agentTabs`/`bridgeDownloads`/`pending` bookkeeping, `assertTarget`, document
+  binding) is factored into `extension/access.js`, loaded by `background.js` via
+  `importScripts` and loadable in Node with a stub `chrome` object
+  (`test/extension.access.test.js`). The stub's storage and tab calls are
+  promise-based with controllable resolution, so the races are tested without a
+  browser: a revoke resolved **during** `assertAccess`'s storage read fails the
+  command; a `documentId` change between validation and injection fails with
+  `target changed`; an attach promise that resolves after a revoke detaches itself;
+  a `newTab` whose id returns after a revoke is closed; a worker restart (fresh
+  module, same stub storage) still finds the agent tabs and cancels the downloads;
+  a simulated browser restart (session storage cleared) leaves an old tab id
+  unowned and `closeTab` on it subject to the allowlist; a pending download is
+  adopted via `byExtensionId` and a pending tab is counted, not adopted.
+- Extension, by hand (the parts that need a real Chrome). Rows for
+  `test/TEST-PLAN.md`: revoke during a `waitFor` stops within one tick;
   revoke during `type` stops mid-string; revoke while an attach is in flight ends
   with no tab attached and no banner; a queued direct screenshot after revoke is not
   captured; expiry alarm fires after a service-worker restart, and a late alarm does
