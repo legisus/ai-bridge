@@ -310,8 +310,9 @@ navigate between the check and the operation), so every operation names the
 document it was validated for:
 
 - Direct route: validation calls `chrome.webNavigation.getFrame({tabId, frameId})`
-  (the manifest gains the `webNavigation` permission; it is optional-permission
-  free and prompts nothing new at install)
+  (the manifest gains the `webNavigation` permission; its install warning, "read
+  your browsing history", is the one the existing `tabs` permission already shows,
+  so the prompt does not change)
   and keeps the returned `documentId` with the URL it checked. `scripting.
   executeScript` / `userScripts.execute` are then called with `target:{tabId,
   documentIds:[documentId]}`, so Chrome itself refuses to run the code if the
