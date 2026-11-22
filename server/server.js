@@ -10,6 +10,7 @@
 const { WebSocketServer } = require("ws");
 const fs = require("fs");
 const { TOKEN_FILE, LOG_FILE, ensureToken } = require("./token");
+const { logRecordedStep, logRecordedEnd } = require("./record-events");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
 
@@ -56,6 +57,7 @@ wss.on("connection", (sock) => {
         return sock.send(JSON.stringify({ type: "response", id: msg.id, ok: false, error: "extension not connected" }));
       }
       pending.set(msg.id, sock);
+      logRecordedStep(msg);
       log(`cmd ${msg.cmd} ${JSON.stringify(msg.params || {}).slice(0, 200)}`);
       extension.send(JSON.stringify({ type: "command", id: msg.id, cmd: msg.cmd, params: msg.params }));
       return;
@@ -64,6 +66,7 @@ wss.on("connection", (sock) => {
     if (role === "extension" && msg.type === "response") {
       const cli = pending.get(msg.id);
       pending.delete(msg.id);
+      logRecordedEnd(msg.id);
       if (cli && cli.readyState === 1) cli.send(JSON.stringify(msg));
       return;
     }

@@ -38,6 +38,8 @@ if (argv.length === 0) {
   console.error("usage: bridge <cmd> [params-json] [--file js] [--out file] [--timeout ms] [--debugger]");
   console.error('       bridge agent "task description" [--timeout ms] [--verbose]');
   console.error("       bridge claude-md [--project] [--print]   # teach Claude Code the bridge (writes CLAUDE.md)");
+  console.error("       bridge recordStart '{\"window\":\"title substring | app=Google Chrome\",\"fps\":30,\"audio\":true}'   # macOS app: window video + sound");
+  console.error("       bridge mark '{\"recId\":\"…\",\"label\":\"…\"}' | recordStatus | recordStop '{\"recId\":\"…\"}' --out file.mp4");
   console.error("  Direct mode is the DEFAULT: commands use ordinary extension APIs and");
   console.error("  never attach chrome.debugger (no DevTools session, no debugging banner).");
   console.error("  eval runs via chrome.userScripts (enable \"Allow User Scripts\" once on the");
@@ -60,6 +62,11 @@ if (argv[0] === "agent") {
 }
 
 const cmd = argv[0];
+// Window recorder (lives in the macOS app, not the extension): recordStart/recordStop/recordStatus/mark.
+if (["recordStart", "recordStop", "recordStatus", "mark"].includes(cmd)) {
+  require("./record").main(argv).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
+  return;
+}
 let params = {};
 const flags = {};
 for (let i = 1; i < argv.length; i++) {

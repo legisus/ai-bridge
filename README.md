@@ -128,6 +128,37 @@ bridge reloadExtension                                        # reload the exten
 For an AI agent, the contract is simple: every command is one shell invocation that
 prints JSON to stdout and exits non-zero on failure.
 
+## Record a browser window with sound (macOS app)
+
+For video manuals the **AI Browser Bridge** menu-bar app records one window with ScreenCaptureKit
+(real cursor, Retina pixels, H.264 + AAC, written to disk as it goes — hours-long recordings are fine):
+
+```bash
+bridge recordStart '{"window":"app=Google Chrome","fps":30,"audio":true,"cursor":true}'   # → {"recId":"rec-ab12cd34",…}
+bridge mark        '{"recId":"rec-ab12cd34","label":"Open the Settings page"}'          # step label for the voice-over
+# …drive the browser: click / type / key / navigate are journaled automatically…
+bridge recordStatus
+bridge recordStop  '{"recId":"rec-ab12cd34"}' --out manual.mp4    # → manual.mp4 + manual.mp4.steps.json
+```
+
+- `window`: a substring of the window title, or `app=<name>` (default `app=Google Chrome`, the active
+  Chrome window). `{"tabId":N}` instead of `window` finds the window by that tab's title.
+- `manual.mp4.steps.json` lists `mark` labels plus every bridge `click`/`type`/`key`/`navigate`/`scroll`
+  (selector, url, key, text *length* — typed text is never stored) with `t` / `end` in seconds from the
+  start of the video. Use it to lay the voice-over over the steps. The relay (`ai-bridge serve`) must be
+  the build that contains this feature; restart a long-running server after updating.
+- Moving or resizing the window does not break the recording (the stream follows the window; a resized
+  window is scaled into the frame size fixed at start, aspect ratio kept). Closing it ends the recording
+  with the file intact; `recordStop` still returns it.
+- **Audio** is the sound of the *application* that owns the window (all Chrome tabs/windows, not other apps,
+  not this app's own sound). ScreenCaptureKit cannot isolate a single tab. Mute other tabs for a clean track.
+- **Permission, once, for the app** (not the terminal, not Claude): *System Settings → Privacy & Security →
+  Screen & System Audio Recording → AI Browser Bridge*. The first `recordStart` triggers the system prompt;
+  without it the command fails with exit code 7 and this path in the message. macOS ties the grant to the
+  app's code signature — an ad-hoc rebuild (`macos/build-app.sh`) may need the switch turned off/on again;
+  a Developer-ID-signed release keeps it.
+- The `.mp4` is moved to `--out` by the CLI (so the app never needs access to Documents/Desktop).
+
 ## Agent mode — hand it a whole task
 
 Instead of driving the bridge command-by-command, you can hand it a complete task
@@ -237,10 +268,10 @@ server/       relay server (server.js), CLI client (cli.js), token-saver agent (
               native messaging host (native-host.js) + its registrar (register-native-host.js),
               main.js = dispatcher for the single-executable build
 scripts/      build-sea.js — Node SEA build of the `ai-bridge` binary (npm run build:sea)
-macos/        menu-bar app (Swift/AppKit) + build-app.sh → .app and .dmg (npm run build:mac)
+macos/        menu-bar app (Swift/AppKit; Recorder.swift = ScreenCaptureKit window recorder) + build-app.sh → .app and .dmg (npm run build:mac)
 deploy/       launchd / systemd templates to run the server as a background service
 docs/         INSTALL.md (first-time setup) and CLAUDE-CODE.md (Claude Code integration)
-test/         protocol round-trip, agent ladder, native-host and binary tests
+test/         protocol round-trip, agent ladder, native-host, recording-journal and binary tests
 ```
 
 ## Contributing
