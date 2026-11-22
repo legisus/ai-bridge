@@ -44,7 +44,7 @@ async function appCallStarting(cmd, params) {
 }
 
 // Ask the extension through the relay (only for tabId → title).
-function bridgeCall(cmd, params) {
+function bridgeCall(cmd, params, direct = true) {
   const WebSocket = require("ws");
   const port = Number(process.env.BRIDGE_PORT || 8765);
   let token;
@@ -56,7 +56,7 @@ function bridgeCall(cmd, params) {
     ws.on("open", () => ws.send(JSON.stringify({ type: "auth", role: "cli", token })));
     ws.on("message", (data) => {
       const m = JSON.parse(data);
-      if (m.type === "auth" && m.ok) ws.send(JSON.stringify({ type: "request", id, cmd, params: { ...params, direct: true } }));
+      if (m.type === "auth" && m.ok) ws.send(JSON.stringify({ type: "request", id, cmd, params: { ...params, direct } }));
       else if (m.type === "response" && m.id === id) { clearTimeout(t); ws.close(); m.ok ? resolve(m.result) : reject(new Error(m.error)); }
     });
     ws.on("error", (e) => { clearTimeout(t); reject(new Error("connect failed: " + e.message)); });
@@ -72,21 +72,49 @@ function moveFile(src, dst) {
 async function main(argv) {
   const cmd = argv[0];
   let params = {}, out = null;
+  const flags = {};
   for (let i = 1; i < argv.length; i++) {
     if (argv[i] === "--out") out = argv[++i];
+    else if (argv[i] === "--debugger") flags.debugger = true;
     else if (argv[i] === "--timeout") i++;
     else params = JSON.parse(argv[i]);
   }
 
   if (cmd === "recordStart") {
+    const area = params.area || "content";
+    if (area !== "content" && area !== "window") fail(`area must be "content" (page only, default) or "window"`);
+    const tabs = (params.tabId != null || area === "content") ? await bridgeCall("listTabs", {}) : [];
     if (params.tabId != null && !params.window) {
-      const tabs = await bridgeCall("listTabs", {});
       const tab = tabs.find((t) => t.id === params.tabId);
       if (!tab) fail(`no tab ${params.tabId}`);
       params.window = tab.title || "";
       if (!params.window) fail(`tab ${params.tabId} has no title yet — pass "window" explicitly`);
     }
-    delete params.tabId;
+    if (area === "content") {
+      // Measure the page area through the tab itself: everything above the viewport
+      // (tab strip, address bar, bookmarks, "started debugging" bar) is cut away.
+      let tabId = params.tabId;
+      if (tabId == null) {
+        const w = await appCallStarting("recordResolve", { window: params.window || "" });
+        if (!w.ok) { console.error("ERROR:", w.error); process.exit(w.code === "permission" ? 7 : 1); }
+        const same = (a, b) => a === b || (a.includes("…") && (b.startsWith(a.split("…")[0]) && b.endsWith(a.split("…").pop())));
+        const cands = tabs.filter((t) => t.active && t.title && same(w.title, t.title));
+        if (cands.length !== 1) fail(`cannot tell which tab is shown in the window “${w.title}” (${cands.length} candidates) — pass {"tabId":N} or "area":"window"`);
+        tabId = cands[0].id;
+      }
+      let m;
+      try {
+        m = await bridgeCall("eval", { tabId, code: "JSON.stringify([innerWidth,innerHeight,outerWidth,outerHeight])" }, !flags.debugger);
+      } catch (e) {
+        fail(`cannot measure the page area (${e.message}). Enable “Allow User Scripts” on the extension card, pass --debugger, or use "area":"window".`);
+      }
+      const v = JSON.parse(typeof m === "string" ? m : (m && (m.value ?? m.result)) ?? m);
+      const [iw, ih, ow, oh] = v;
+      if (!(ih > 100 && oh >= ih)) fail(`unexpected window metrics ${JSON.stringify(v)}`);
+      params.crop = { top: oh - ih, width: iw };
+      params.tabId = undefined;
+    }
+    delete params.tabId; delete params.area;
   }
   if (cmd === "recordStop" && !out) fail("recordStop needs --out file.mp4");
 

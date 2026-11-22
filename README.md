@@ -141,6 +141,12 @@ bridge recordStatus
 bridge recordStop  '{"recId":"rec-ab12cd34"}' --out manual.mp4    # → manual.mp4 + manual.mp4.steps.json
 ```
 
+- `area`: `"content"` (**default**) records only the page — the tab strip, address bar, bookmarks and the
+  “started debugging” bar are cut off with ScreenCaptureKit's `sourceRect`; `"window"` records the whole window.
+  For `content` the CLI measures the page through the tab (`innerWidth/innerHeight/outerWidth/outerHeight`
+  via `eval`, so “Allow User Scripts” must be on, or pass `--debugger`) and crops `outerHeight − innerHeight`
+  from the top. **The crop is fixed at start**: resizing the window during a recording does not recompute
+  it, so set the window size *before* `recordStart`. Keep page zoom at 100 % and DevTools undocked.
 - `window`: a substring of the window title, or `app=<name>` (default `app=Google Chrome`, the active
   Chrome window). `{"tabId":N}` instead of `window` finds the window by that tab's title.
 - `manual.mp4.steps.json` lists `mark` labels plus every bridge `click`/`type`/`key`/`navigate`/`scroll`

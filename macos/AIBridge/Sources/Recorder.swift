@@ -31,6 +31,7 @@ final class Recording: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Se
     let fps: Int
     let wantAudio: Bool
     let size: (w: Int, h: Int)
+    let cropRect: CGRect?
 
     private let q = DispatchQueue(label: "ai-bridge.recorder.samples")
     private var stream: SCStream?
@@ -50,7 +51,7 @@ final class Recording: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Se
     private var marks: [[String: Any]] = []
     let startedWall = Date()
 
-    init(id: String, dir: URL, window: SCWindow, fps: Int, audio: Bool, cursor: Bool) async throws {
+    init(id: String, dir: URL, window: SCWindow, fps: Int, audio: Bool, cursor: Bool, crop: (top: Double, width: Double)? = nil) async throws {
         self.id = id
         mp4 = dir.appendingPathComponent("\(id).mp4")
         eventsURL = dir.appendingPathComponent("\(id).events.jsonl")
@@ -64,13 +65,22 @@ final class Recording: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Se
         let filter = SCContentFilter(desktopIndependentWindow: window)
         var scale: CGFloat = NSScreen.main?.backingScaleFactor ?? 2
         if #available(macOS 14.0, *) { scale = CGFloat(SCShareableContent.info(for: filter).pointPixelScale) }
-        let w = max(2, Int(window.frame.width * scale) & ~1)
-        let h = max(2, Int(window.frame.height * scale) & ~1)
+        // area "content": cut `top` points off the window (tab strip, address bar, bookmarks, infobars)
+        // and keep the page. The rect is fixed at start and never recomputed.
+        var rect = CGRect(x: 0, y: 0, width: window.frame.width, height: window.frame.height)
+        if let c = crop {
+            let top = min(max(c.top, 0), window.frame.height - 50)
+            rect = CGRect(x: 0, y: top, width: min(c.width, window.frame.width), height: window.frame.height - top)
+        }
+        let w = max(2, Int((rect.width * scale).rounded()) & ~1)
+        let h = max(2, Int((rect.height * scale).rounded()) & ~1)
         size = (w, h)
+        cropRect = crop == nil ? nil : rect
         super.init()
 
         let cfg = SCStreamConfiguration()
         cfg.width = w; cfg.height = h
+        if crop != nil { cfg.sourceRect = rect }
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         cfg.pixelFormat = kCVPixelFormatType_32BGRA
         cfg.showsCursor = cursor
@@ -211,6 +221,10 @@ actor RecorderHub {
             case "recordStart": return try await start(params)
             case "recordStop": return try await stop(params)
             case "recordStatus": return status()
+            case "recordResolve":
+                let win = try await findWindow((params["window"] as? String) ?? "")
+                return ["ok": true, "title": win.title ?? "", "app": win.owningApplication?.applicationName ?? "",
+                        "width": win.frame.width, "height": win.frame.height]
             case "mark": return try mark(params)
             default: throw RecError(code: "unknown", message: "unknown command \(cmd)")
             }
@@ -261,9 +275,13 @@ actor RecorderHub {
         let audio = (p["audio"] as? Bool) ?? true
         let cursor = (p["cursor"] as? Bool) ?? true
         let win = try await findWindow(spec)
+        var crop: (top: Double, width: Double)? = nil
+        if let c = p["crop"] as? [String: Any], let t = (c["top"] as? NSNumber)?.doubleValue, let w = (c["width"] as? NSNumber)?.doubleValue {
+            crop = (t, w)
+        }
         let id = "rec-" + String(UUID().uuidString.prefix(8).lowercased())
         let r: Recording
-        do { r = try await Recording(id: id, dir: dir, window: win, fps: fps, audio: audio, cursor: cursor) }
+        do { r = try await Recording(id: id, dir: dir, window: win, fps: fps, audio: audio, cursor: cursor, crop: crop) }
         catch let e as RecError { throw e }
         catch {
             let m = error.localizedDescription
@@ -274,7 +292,7 @@ actor RecorderHub {
         // so the server starts logging immediately (firstEpoch is rewritten at the first frame)
         try? "{\"recId\":\"\(id)\"}".write(to: r.activeURL, atomically: true, encoding: .utf8)
         return ["ok": true, "recId": id, "window": ["title": r.windowTitle, "app": r.appName, "id": Int(r.windowID)],
-                "size": ["w": r.size.w, "h": r.size.h], "fps": fps, "audio": audio, "cursor": cursor,
+                "size": ["w": r.size.w, "h": r.size.h], "area": crop == nil ? "window" : "content", "fps": fps, "audio": audio, "cursor": cursor,
                 "audioScope": audio ? "app (all windows of \(r.appName))" : "none"]
     }
 
