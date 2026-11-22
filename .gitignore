@@ -3,5 +3,7 @@ node_modules/
 .DS_Store
 *.png
 dist/
-deploy/docker/.env
-deploy/docker/work/
+deploy/docker/.env*
+!deploy/docker/.env.example
+deploy/docker/work*/
+deploy/docker/channels*.json

@@ -1,8 +1,8 @@
 # Running the bridge in Docker — isolated agent, your Chrome on the PC
 
 **Status:** draft on the `docker-isolated` branch, 2026-11-21, revised the same day
-after the Codex `gpt-6-astra` review (30 findings folded in; the review text is not
-part of the repo). Nothing in this guide has been run: there is no Docker on the
+after two rounds of the Codex `gpt-6-astra` review (30 + 7 findings folded in; the
+review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
 machine it was written on, and the code changes it depends on (listed in
 [What has to change](#what-has-to-change-in-the-code)) are not implemented. The
 Dockerfile and compose file below are the target, not something that works today.
@@ -19,8 +19,9 @@ read every file that user can read and run every program that user can run. The
 browser is only one of the things it can reach.
 
 The Docker layout puts the agent in a container that owns **nothing on the PC**
-except the folders you mount into it. Its only way to act on the world is the bridge
-socket to your Chrome, and **you decide, from the browser, whether that socket is
+except the folders you mount into it. Its only way to act on **your browser** is the
+bridge socket (it can still reach the internet and your network directly, see
+[What the container can and cannot do](#what-the-container-can-and-cannot-do)), and **you decide, from the browser, whether that socket is
 live**: grant access when you want the agent working, revoke it when you do not.
 Revoke is enforced in the extension, on the trusted side of the boundary; the
 container cannot undo it.
@@ -89,6 +90,7 @@ for each is in
 | 9 | README security model and PRIVACY: "binds 127.0.0.1 only" becomes "binds 127.0.0.1 by default; in Docker the port is published on the host's loopback only". | Keeps the stated model true. | Docs |
 | 10 | Several browser sessions on one relay (Chrome + Edge, two profiles): registry keyed by session name, `--session` on the CLI. | Not needed for one browser; today a second extension supersedes the first. | Later |
 | 11 | `bridge token --rotate`. | Convenience; the manual procedure is below. | Later |
+| 12 | The restricted-run env filter (`server/channels/restricted.js`) passes `AI_BRIDGE_HOME`, `AI_BRIDGE_DEBUGGER` and `AI_BRIDGE_CODEX_SANDBOX` through to channel children (never messenger tokens). | Today it keeps only `BRIDGE_PORT`, so a channel run inside the container would look for the token under `/home/node/.ai-browser-bridge` and exit 6. | **Yes** |
 
 Nothing in the extension's command set changes. The wire protocol gains one message
 type, `access`, plus `session` and `access` fields on the results of `ping` and
@@ -127,7 +129,8 @@ FROM node:22-bookworm-slim
 # ca-certificates: outbound TLS to the model APIs. git: Claude Code wants it for
 # its own bookkeeping; the agent itself never touches a repo.
 # Pin the two CLIs: their sandbox and auth behaviour changes between releases.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
+# procps: the channels daemon's crash recovery calls `ps` to inspect a recorded pid.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git procps \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @anthropic-ai/claude-code@2.1.0 @openai/codex@0.171.0
 WORKDIR /app
@@ -160,8 +163,10 @@ CMD ["node", "/app/server/server.js"]
   `--sandbox workspace-write`, which needs kernel features the hardened container
   drops. Whether the pinned Codex works under this compose file is one of the things
   the first real run has to establish.
-- The pinned `claude` version is a placeholder: use whatever is current when the
-  image is first built, then keep it pinned.
+- The pinned `claude` version is a placeholder and the pair (`claude` 2.1.0,
+  `codex` 0.171.0) is **untested** in this container. The first build fixes the
+  pair that passes the Docker smoke job and records it here; after that, bump only
+  with the smoke job.
 
 ### .dockerignore (repo root)
 
@@ -174,8 +179,9 @@ macos
 test
 *.png
 *.log
-deploy/docker/.env
-deploy/docker/work
+deploy/docker/.env*
+deploy/docker/work*
+deploy/docker/channels*.json
 ```
 
 ### deploy/docker/compose.yml
@@ -251,11 +257,16 @@ Named volumes, not bind mounts, for `/data` and `/home/node`: the bridge writes
 mode-0600 files and takes file locks, which NTFS bind mounts on Windows do not
 honour. `/work` is a bind mount on purpose so you can see outputs and drop scripts in
 from the PC. On Linux Docker creates a missing bind directory as root, which uid 1000
-cannot write: create it yourself first (`mkdir -p deploy/docker/work && chown 1000
-deploy/docker/work`, or run with `user: "${UID}:${GID}"` added to both services).
-Docker Desktop on Windows and macOS maps ownership for you.
+cannot write: create it yourself first (`mkdir -p deploy/docker/work && sudo chown
+1000 deploy/docker/work`). Do not work around it with a compose `user:` override:
+that changes the process identity, not the ownership of `/data` (0700, uid 1000)
+or `/home/node`, and the token becomes unreadable. Docker Desktop on Windows and
+macOS maps ownership for you.
 
-`.gitignore` on this branch excludes `deploy/docker/.env` and `deploy/docker/work/`.
+`.gitignore` on this branch excludes `deploy/docker/.env*` (except `.env.example`),
+`deploy/docker/work*/` and `deploy/docker/channels*.json`, so a second instance's
+env file and work dir, and a `channels.json` kept next to the compose file, never
+get committed.
 
 ## Setup, step by step
 
@@ -289,7 +300,7 @@ Docker Desktop on Windows and macOS maps ownership for you.
 6. **Smoke test from the PC:**
    ```
    docker compose -f deploy/docker/compose.yml exec -T bridge node /app/server/cli.js ping
-   # {"pong":true,"version":"0.1.11","session":"work-chrome","access":"granted","until":null}
+   # {"pong":true,"version":"0.1.11","session":"work-chrome","access":"granted","until":null,"accessGen":3}
    ```
 7. **Shell helper.** PowerShell **7.3 or newer** (5.1 mangles the JSON quotes):
    ```powershell
@@ -320,6 +331,9 @@ Docker Desktop on Windows and macOS maps ownership for you.
    ```
    docker compose -f deploy/docker/compose.yml --profile channels up -d
    ```
+   From then on **every** compose command for this project carries
+   `--profile channels`, including `stop` and `down`; without it compose ignores
+   the daemon and leaves it running.
 
 ## Access: grant and revoke
 
@@ -332,7 +346,7 @@ record, so the popup, the Options page and the expiry alarm can never race.
 |---|---|---|---|
 | **Granted** (`until: null`) | Commands run, subject to the allowlist and the privileged-origin block. Badge green `ON`. | `ping`/`status` show `access: "granted"`. | Works. |
 | **Granted until T** | Same until T, then revoked by the worker's alarm, or by the next command's own deadline check if the alarm is late. Badge shows the remaining time. | `until` is shown; the server also treats a past `until` as revoked on its own. | Works until T; a run crossing T fails at its next command. |
-| **Revoked** (default after install) | Every command except `ping` and `status` is refused with `access_revoked`; work already in flight stops at its next step; `chrome.debugger` is detached from every tab, including attachments that were still in progress; downloads the bridge started are cancelled; tab indicators are cleared. Badge grey. | The extension pushes `{type:"access", granted:false}`; the server fails every pending and new CLI request with `access revoked by user (session "work-chrome")` without forwarding it. | `bridge agent` and channel runs check access **before** every model and judge start and fail fast; a running model session is terminated when a revoke is seen; the ladder never climbs on an access error. |
+| **Revoked** (default after install) | Every command except `ping` and `status` is refused with `access_revoked`; work already in flight stops at its next step; `chrome.debugger` is detached from every tab, including attachments that were still in progress; downloads the bridge started and not yet finished are cancelled; tab indicators are cleared. Badge grey. | The extension pushes `{type:"access", granted:false}`; the server fails every pending and new CLI request other than `ping`/`status` with `access revoked by user (session "work-chrome")` without forwarding it. | Every run is bound to the access **generation** it started under (`accessGen` in `ping`). `bridge agent` and channel runs check before every model and judge start and poll while a model runs; any change of generation, not only a revoked state, ends the run, so a revoke followed by a quick re-grant still stops the old run. The ladder never climbs on an access error. |
 | **Revoke and close agent tabs** | As revoked, plus every tab the agent opened with `newTab` in this grant is closed. | Same. | Same. |
 
 Rules the design holds to:
@@ -349,28 +363,43 @@ Rules the design holds to:
 - **Revoke stops the bridge, not the page.** See [Why](#why). Use "Revoke and close
   agent tabs" when you want the pages gone too.
 - **Revoke is not rotation.** A revoked container still holds the token, and so does
-  anything that copied it. If you suspect the container, the sequence is: revoke →
-  `docker compose -f deploy/docker/compose.yml down -v` (removes the container and
-  both volumes, including the token and the model logins) → `up -d --build bridge` →
-  paste the new token → grant. Until change #11 ships that is the procedure.
+  anything that copied it. If you suspect the container, the sequence is:
+  1. revoke in the popup;
+  2. `docker compose -f deploy/docker/compose.yml --profile channels down -v`
+     (removes both containers and both volumes, including the token and the model
+     logins);
+  3. quarantine the work dir: `mv deploy/docker/work deploy/docker/work.quarantine-<date>`
+     and create a fresh, empty one. The old one is where a compromised agent could
+     have left instructions or config for its successor; copy back only files you
+     have read;
+  4. revoke the model credentials at their source: a new `claude setup-token` (the
+     old `CLAUDE_CODE_OAUTH_TOKEN` may have been copied out of the container) and
+     `codex logout` / a fresh device login;
+  5. `up -d --build bridge` → paste the new token → grant.
+  Until change #11 ships that is the procedure.
 - **The hard stop is still Docker.** `docker compose -f deploy/docker/compose.yml
-  stop` kills the agent, the server and any model session mid-flight. Revoke is the
-  graceful version.
-- **The token identifies the container to the extension, not the other way round.**
-  The extension sends the token to whatever is listening on the published port; the
-  server checks it. Any process on the PC that can bind port 8765 before Docker does
-  would receive the token. That is the same property the non-Docker install has had
-  from the start; the prerequisite step of removing any host-side relay is what keeps
-  it harmless.
+  --profile channels stop` kills the daemon, the agent, the server and any model
+  session mid-flight (keep `--profile channels` even if you never started the
+  daemon; it is harmless then). Revoke is the graceful version.
+- **The token tells the server a legitimate client from a stranger; it proves
+  nothing to the extension.** The extension sends the token to whatever is listening
+  on the published port and the server checks it. Any process on the PC that can
+  bind port 8765 before Docker does would receive the token. That is the same
+  property the non-Docker install has had from the start; the prerequisite step of
+  removing any host-side relay is what keeps it harmless.
 
 Other sessions: every browser profile or browser with the extension installed is its
 own browser session with its own name, token field, allowlist and access switch. The
 current relay keeps one extension connected; a second supersedes the first. Two
 browsers on one container is change #10. Two browsers on two containers works once
-change #1 is in: run a second compose project with its own `.env`
-(`BRIDGE_PUBLISH_PORT=8766`, `BRIDGE_WORK_DIR=./work-edge`) and
-`docker compose -p bridge-edge -f deploy/docker/compose.yml up -d bridge`; in that
-browser's Options set port 8766. The named volumes are per project automatically.
+change #1 is in: give the second instance its own env file
+`deploy/docker/.env.edge` with `BRIDGE_PUBLISH_PORT=8766` and
+`BRIDGE_WORK_DIR=./work-edge`, then
+```
+docker compose -p bridge-edge --env-file deploy/docker/.env.edge -f deploy/docker/compose.yml up -d --build bridge
+```
+and in that browser's Options set port 8766. A second shell helper carries the same
+`-p` and `--env-file`. The named volumes are per project automatically.
 
 ## What the container can and cannot do
 
@@ -383,7 +412,8 @@ internet, and also the PC's other services and your LAN: Docker's bridge network
 restricts what comes *in* to the published port, not what the container connects
 *out* to. Add an egress rule on the host if that matters.
 
-Cannot: read or write the PC's file system except `/work`; run programs on the PC;
+Cannot: read or write the PC's file system directly, except `/work` (Chrome can
+still write a download it triggered, see below); run programs on the PC;
 read the Chrome profile folder, the cookie database or the password store directly;
 open `chrome://`, extension or `file://` pages (change #3); escalate privileges in
 the container (`cap_drop: ALL`, `no-new-privileges`, non-root, read-only root fs);
@@ -430,10 +460,14 @@ appears under `/work`.
 
 ```
 git pull
-docker compose -f deploy/docker/compose.yml up -d --build bridge        # add --profile channels if you run the daemon
+docker compose -f deploy/docker/compose.yml up -d --build bridge                              # relay only
+docker compose -f deploy/docker/compose.yml --profile channels up -d --build bridge channels  # relay + daemon
 bridge reloadExtension        # or the reload icon on the extension card
 bridge ping
 ```
+
+Name both services in the second form: with a profile active, `up --build bridge`
+alone rebuilds the relay and leaves the daemon on the old image.
 
 The token survives updates (it is in the `data` volume). Re-grant is not needed
 unless you reinstalled the extension.
