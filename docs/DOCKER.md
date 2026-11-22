@@ -1,8 +1,8 @@
 # Running the bridge in Docker — isolated agent, your Chrome on the PC
 
 **Status:** draft on the `docker-isolated` branch, 2026-11-21, revised the same day
-after four rounds of the Codex `gpt-6-astra` review (30 + 7 + 3 + 1 findings folded
-in; the review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
+after five rounds of the Codex `gpt-6-astra` review (30 + 7 + 3 + 1 + 1 findings
+folded in; the review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
 machine it was written on, and the code changes it depends on (listed in
 [What has to change](#what-has-to-change-in-the-code)) are not implemented. The
 Dockerfile and compose file below are the target, not something that works today.
@@ -508,5 +508,5 @@ extension revoked; grant again afterwards.
 Name both services in the second form: with a profile active, `up --build bridge`
 alone rebuilds the relay and leaves the daemon on the old image.
 
-The token survives updates (it is in the `data` volume). Re-grant is not needed
-unless you reinstalled the extension.
+The bridge token survives container updates (it is in the `data` volume).
+Reloading or updating the extension revokes access; grant again in the popup.

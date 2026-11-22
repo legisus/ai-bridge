@@ -1,8 +1,8 @@
 # Docker-isolated agent with host-side access control — design
 
-**Status:** design, 2026-11-21, revised the same day after four rounds of the Codex
-`gpt-6-astra` review (30 + 7 + 3 + 1 findings folded in; the review text is not part
-of the repo). Ships as the
+**Status:** design, 2026-11-21, revised the same day after five rounds of the Codex
+`gpt-6-astra` review (30 + 7 + 3 + 1 + 1 findings folded in; the review text is not
+part of the repo). Ships as the
 `docker-isolated` branch on top of the channels chain (`feat/channels-core` →
 `fix/intent-gate-expiry`). User-facing guide: `docs/DOCKER.md`. Builds on the relay
 protocol in `server/server.js`, the extension's `handle()` in
@@ -194,15 +194,20 @@ Also in `chrome.storage.local` (download ids are stable across browser sessions,
 so ownership can be kept):
 
 ```
-bridgeDownloads: { [downloadId]: { gen } }     // downloads started by the bridge
+bridgeDownloads:  { [downloadId]: { gen } }    // downloads started by the bridge
+pendingDownloads: [ { nonce, gen, url, startedAt } ]   // download dispatched, id not yet known
 ```
+
+Download records, including the pending ones, are in **local** storage so that a
+reload or browser restart between `downloads.download()` and the write of its id
+does not erase the only record that it was ours.
 
 And in `chrome.storage.session` (survives service-worker restarts, cleared by Chrome
 on browser restart, extension reload, update or disable):
 
 ```
-agentTabs:       { [tabId]: { gen, url } }     // tabs opened by newTab in this browser session
-pending:         [ { kind: "tab"|"download", nonce, gen, url, startedAt } ]   // creations dispatched, id not yet known
+agentTabs:    { [tabId]: { gen, url } }        // tabs opened by newTab in this browser session
+pendingTabs:  [ { nonce, gen, url, startedAt } ]   // tab dispatched, id not yet known
 ```
 
 They live in storage, not in worker globals, because the service worker is
@@ -218,20 +223,20 @@ scheduling the reload; and `chrome.runtime.onInstalled` (fired after any reload,
 update or install, including a manual reload from `chrome://extensions`) writes
 `access:{granted:false}` with a bumped gen and sets a popup notice "access was
 revoked because the extension was reloaded; tabs opened before the reload are no
-longer tracked". The grant survives a browser restart, not a reload. Downloads,
-being in local storage, are still cancelled by the next revoke after a manual
-reload. A tab id
-that exists after a browser restart proves nothing about who opened it, so a
-persisted numeric id must never authorise closing a tab. After a browser restart
-both maps are empty by construction (`chrome.runtime.onStartup`), and a tab opened
-before the restart is an ordinary user tab from then on; the guide says so.
+longer tracked". The grant survives a browser restart, not a reload. Download records are in local
+storage, so the next revoke after a manual reload or a browser restart still
+cancels them. A tab id that exists after a browser restart proves nothing about who
+opened it, so a persisted numeric id must never authorise closing a tab. After a
+browser restart `agentTabs` and `pendingTabs` are empty by construction
+(`chrome.runtime.onStartup`), `bridgeDownloads` is not, and a tab opened before the
+restart is an ordinary user tab from then on; the guide says so.
 
-A `newTab` or `download` appends a `pending` entry **before** calling Chrome and
+A `newTab` or `download` appends a pending entry **before** calling Chrome and
 moves it into the map when the id returns; a completion that arrives after a revoke
 (the gen no longer matches) closes the tab or cancels the download itself instead of
 returning it. On worker startup the maps are reconciled against `chrome.tabs.query` /
 `chrome.downloads.search` (entries whose tab or download no longer exists are
-dropped) and `pending` is resolved: a pending download is matched by
+dropped) and the pending lists are resolved: a pending download is matched by
 `chrome.downloads.search({ startedAfter: startedAt, orderBy: ["-startTime"] })`
 (`DownloadQuery` has no `byExtensionId` field) with the returned items filtered on
 `item.byExtensionId === chrome.runtime.id`, and adopted; a pending tab has no such marker (Chrome records no creator
@@ -288,14 +293,14 @@ restart with a stale value.
 2. Cancel every download in `bridgeDownloads` (every grant of this browser session,
    not only the current one: a renewed grant must not leave an older grant's
    download running) that is still `in_progress` (`chrome.downloads.cancel`), and
-   every `pending` download once its id resolves; finished downloads are left alone
+   every `pendingDownloads` entry once its id resolves; finished downloads are left alone
    and the guide says so.
 3. Detach: for every tab in `attached` **and** every in-flight promise in
    `attaching`, await the attach if pending, then `chrome.debugger.detach`; clear the
    frame and favicon badge. A late attach completion that finds `accessGen` moved
    detaches itself before returning.
 4. If `closeTabs`, close every tab in `agentTabs` (every grant of this browser
-   session) and every `pending` tab whose id resolves later.
+   session) and every `pendingTabs` entry whose id resolves later.
 5. Send `{type:"access", session, granted:false, until:null, gen}` if the socket is
    open.
 6. Badge grey, no text. Clear the `access-expiry-<gen>` alarm.
@@ -344,13 +349,17 @@ document it was validated for:
   document has been replaced (the call rejects; the worker reports `target
   changed`). One check, one document, one injection.
 - Debugger route, code execution: after attach the worker runs `Runtime.enable`
-  and records, from `Runtime.executionContextCreated`, the `uniqueId` of the main
-  world context of the validated frame (matched by `auxData.frameId` and
-  `auxData.isDefault`). Every `Runtime.evaluate` / `Runtime.callFunctionOn` is sent
-  with `uniqueContextId` set to it; CDP rejects the call if that context is gone
-  (navigation destroys it), so code never runs in a document that was not
-  validated. A new context for the frame is adopted only after a fresh
-  `assertTarget`/`assertAllowed` on the frame's current URL.
+  and selects, from `Runtime.executionContextCreated`, the main world context of
+  the frame (`auxData.frameId` and `auxData.isDefault`). The frame id alone does
+  not prove the context belongs to the document that was validated (a navigation
+  between validation and `Runtime.enable` yields a replacement context for the same
+  frame), so the context is accepted only if its own `origin` passes `assertTarget`
+  and `assertAllowed` and equals the origin of the validated URL; otherwise the
+  command fails `target changed`. Its `uniqueId` is then recorded, and every
+  `Runtime.evaluate` / `Runtime.callFunctionOn` is sent with `uniqueContextId` set
+  to it; CDP rejects the call if that context is gone (navigation destroys it), so
+  code never runs in a document that was not validated. A new context for the
+  frame is adopted only through the same origin check.
 - Debugger route, input and capture: `Input.*` and `Page.captureScreenshot` have no
   context parameter. `Page.enable` + `Page.frameNavigated` and the `loaderId`
   comparison immediately before each send narrow the window to one CDP round-trip;
@@ -506,7 +515,7 @@ browser restarts.
   `127.0.0.1`, assert the warning suffix; with the default, assert the bind in the
   startup line.
 - Extension, deterministic: the access logic (`assertAccess`, the transition,
-  `agentTabs`/`bridgeDownloads`/`pending` bookkeeping, `assertTarget`, document
+  `agentTabs`/`bridgeDownloads`/pending-list bookkeeping, `assertTarget`, document
   binding) is factored into `extension/access.js`, loaded by `background.js` via
   `importScripts` and loadable in Node with a stub `chrome` object
   (`test/extension.access.test.js`). The stub's storage and tab calls are
