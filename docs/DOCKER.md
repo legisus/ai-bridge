@@ -2,7 +2,8 @@
 
 **Status:** draft on the `docker-isolated` branch, 2026-11-21, revised the same day
 after five rounds of the Codex `gpt-6-astra` review (30 + 7 + 3 + 1 + 1 findings
-folded in; the review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
+folded in; approved as a draft design in round six, with the untested CLI pin pair
+left as an implementation gate; the review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
 machine it was written on, and the code changes it depends on (listed in
 [What has to change](#what-has-to-change-in-the-code)) are not implemented. The
 Dockerfile and compose file below are the target, not something that works today.

@@ -1,8 +1,9 @@
 # Docker-isolated agent with host-side access control — design
 
 **Status:** design, 2026-11-21, revised the same day after five rounds of the Codex
-`gpt-6-astra` review (30 + 7 + 3 + 1 + 1 findings folded in; the review text is not
-part of the repo). Ships as the
+`gpt-6-astra` review (30 + 7 + 3 + 1 + 1 findings folded in; approved as a draft
+design in round six, with the untested CLI pin pair left as an implementation gate;
+the review text is not part of the repo). Ships as the
 `docker-isolated` branch on top of the channels chain (`feat/channels-core` →
 `fix/intent-gate-expiry`). User-facing guide: `docs/DOCKER.md`. Builds on the relay
 protocol in `server/server.js`, the extension's `handle()` in
