@@ -19,12 +19,27 @@
 
   <div class="hint" id="ident"></div>
 
+  <label>Access to this Chrome session</label>
+  <div class="hint">After install the bridge is <b>revoked</b>: nothing runs until you grant it here or in the toolbar popup. A grant survives browser restarts; an extension reload revokes it. Revoking stops every running command.</div>
+  <div style="margin-top:6px">
+    <span id="accessState" style="font-weight:600">—</span>
+    <button id="grant" type="button" style="margin:0 0 0 12px;padding:4px 12px">Grant</button>
+    <button id="revoke" type="button" style="margin:0 0 0 6px;padding:4px 12px">Revoke</button>
+  </div>
+
+  <label>Browser session name</label>
+  <input id="session" type="text" maxlength="40" value="chrome">
+  <div class="hint">Shown by the relay and in <code>bridge ping</code>, e.g. <code>work-chrome</code>. 1–40 printable characters.</div>
+
   <label>Auth token</label>
   <input id="token" type="password" autocomplete="off">
   <div class="hint">Filled in automatically when the native host is registered (<code>npm run register-host</code>). Otherwise paste it from <code>~/.ai-browser-bridge/token</code>.</div>
 
   <label>Server port</label>
   <input id="port" type="number" value="8765">
+
+  <label style="margin-top:18px"><input id="manualMode" type="checkbox" style="width:auto;margin-right:6px;vertical-align:middle"> Manual mode</label>
+  <div class="hint">Never ask the native host for the token or port; use what is entered here. Turned on automatically when you paste a token. Changing the token or port revokes access and reconnects.</div>
 
   <label>Host allowlist (one domain per line, empty = allow all)</label>
   <textarea id="allowlist" rows="5" placeholder="example.com&#10;app.example.org"></textarea>

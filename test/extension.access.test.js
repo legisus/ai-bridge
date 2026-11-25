@@ -248,6 +248,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/TYPE_CHUNK = 20/.test(src), "direct type is chunked from the worker");
   assert(/access-expiry-/.test(src) && /BridgeAccess\.onAlarm\(/.test(src), "expiry alarms routed to BridgeAccess.onAlarm");
 
+  // ---- Task 5: popup and Options --------------------------------------------
+  const pop = fs.readFileSync(path.join(__dirname, "..", "extension", "popup.js"), "utf8");
+  const popHtml = fs.readFileSync(path.join(__dirname, "..", "extension", "popup.html"), "utf8");
+  for (const t of ["access-set", "access-get", "close-agent-tabs", "dismiss-notices"]) assert(pop.includes(`"${t}"`), `popup sends ${t}`);
+  assert(/3600e3|3600 \* 1000|60 \* 60 \* 1000/.test(pop), "popup has the 1-hour grant");
+  for (const label of ["Grant", "Grant for 1 h", "Revoke", "Revoke and close agent tabs", "Close agent tabs"]) assert(popHtml.includes(label), `popup button: ${label}`);
+  assert(/popup\.js/.test(popHtml) && !/<script>[^<]/.test(popHtml), "popup loads its script from a file (MV3 CSP)");
+  const optHtml = fs.readFileSync(path.join(__dirname, "..", "extension", "options.html"), "utf8");
+  const opt = fs.readFileSync(path.join(__dirname, "..", "extension", "options.js"), "utf8");
+  assert(/Browser session name/.test(optHtml) && /Manual mode/.test(optHtml) && /revoked/.test(optHtml) && /survives browser restarts/.test(optHtml), "Options: session name, manual mode, hint");
+  assert(/manualMode/.test(opt) && /session:/.test(opt) && /"access-set"/.test(opt), "Options saves session/manualMode and can grant/revoke");
+
   console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll extension access tests passed.");
   process.exit(failures ? 1 : 0);
 })();
