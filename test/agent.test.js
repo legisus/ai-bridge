@@ -6,6 +6,7 @@
 const fs = require("fs");
 const os = require("os");
 // Journal/trace files go to a temp state dir, never the real ~/.ai-browser-bridge.
+process.env.AI_BRIDGE_NO_ACCESS_GATE = "1"; // unit tests inject a mock runner; there is no relay to ping
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(require("path").join(os.tmpdir(), "ai-bridge-agent-"));
 const { runAgent, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL } =
   require("../server/agent.js");
