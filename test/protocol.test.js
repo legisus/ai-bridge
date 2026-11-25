@@ -64,6 +64,10 @@ const assert = (cond, name) => {
     const status = await run(["status"]);
     assert(status.version === "test" && Array.isArray(status.attachedTabs) && typeof status.idleDetachMs === "number", "cli status round-trip");
 
+    const statusEvents = await run(["status", "--events"]);
+    assert(statusEvents.echo === undefined ? statusEvents.params === undefined && statusEvents.version === "test" : true, "status --events reaches the extension");
+    assert(ext.received.some((m) => m.cmd === "status" && m.params && m.params.events === true), "bridge status --events forwards params.events = true");
+
     const detachedAll = await run(["detachAll"]);
     assert(detachedAll.ok === true && Array.isArray(detachedAll.detached), "cli detachAll round-trip");
 

@@ -297,6 +297,79 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await alarmP; await renew;
   assert((await B.readAccess()).granted === true, "an alarm racing a renewal cannot revoke the renewed grant");
 
+  // ---- Task 1 (target guard): pure target rules ----------------------------
+  for (const u of ["chrome://extensions", "chrome-extension://x/options.html", "about:blank", "javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "view-source:https://a", "devtools://x", "edge://x", "brave://x", "", undefined, "https://"]) {
+    let te = null; try { B.assertTarget(u); } catch (e) { te = e.message; }
+    assert(te === "privileged target refused", `assertTarget refuses ${JSON.stringify(u)}`);
+  }
+  for (const u of ["https://a.example/p?q=1", "http://localhost:8080/"]) { let te = null; try { B.assertTarget(u); } catch (e) { te = e.message; } assert(te === null && B.isHttpUrl(u), `assertTarget passes ${u}`); }
+  assert(B.hostAllowed("a.b.example", ["example"]) && B.hostAllowed("a.b.example", ["b.example"]) && !B.hostAllowed("a.b.example", ["c.example"]) && B.hostAllowed("x", []) && B.hostAllowed("x", ["*"]) && !B.hostAllowed("notexample.com", ["example.com"]), "hostAllowed: exact, subdomain, empty = all, *");
+  let te = null; try { B.assertAllowedUrl("chrome://x", ["*"]); } catch (e) { te = e.message; }
+  assert(te === "privileged target refused", "assertAllowedUrl: privileged first, even with *");
+  te = null; try { B.assertAllowedUrl("https://no.example/", ["ok.example"]); } catch (e) { te = e.message; }
+  assert(te === 'host "no.example" not in allowlist', "assertAllowedUrl: host outside the allowlist");
+  te = null; try { B.assertAllowedUrl("https://sub.ok.example/x", ["ok.example"]); } catch (e) { te = e.message; }
+  assert(te === null, "assertAllowedUrl: subdomain allowed");
+  const tabs = [{ id: 1, windowId: 1, active: true, url: "https://ok.example/x", title: "T" }, { id: 2, windowId: 1, active: false, url: "chrome://extensions", title: "E" }, { id: 3, windowId: 2, active: true, url: "https://no.example", title: "N" }];
+  let red = B.redactTabs(tabs, ["ok.example"], [3]);
+  assert(red[0].url === "https://ok.example/x" && red[0].title === "T" && red[0].windowId === 1, "redactTabs: allowed tab in full");
+  assert(red[1].url === "redacted" && !("title" in red[1]) && red[1].id === 2 && red[1].active === false, "redactTabs: privileged tab redacted, no title");
+  assert(red[2].url === "redacted" && !("title" in red[2]) && red[2].agent === true, "redactTabs: disallowed tab redacted, marked agent");
+  red = B.redactTabs(tabs, [], []);
+  assert(red[2].url === "https://no.example" && red[1].url === "redacted", "redactTabs: empty allowlist still redacts privileged tabs");
+  assert(B.blankUrl("about:blank") && B.blankUrl("chrome://newtab/") && B.blankUrl("") && B.blankUrl(undefined) && !B.blankUrl("chrome://extensions"), "blankUrl");
+  const man2 = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "extension", "manifest.json"), "utf8"));
+  assert(man2.permissions.includes("webNavigation"), "manifest: webNavigation permission");
+
+  // ---- Task 2 (target guard): event ring buffer and projection ----------
+  await B.clearEvents();
+  for (let i = 0; i < 205; i++) await B.logEvent({ kind: "attach", tabId: i, origin: "https://ok.example" });
+  let ev = await B.events();
+  assert(ev.length === 200 && ev[0].tabId === 5 && ev[199].tabId === 204 && typeof ev[0].t === "number", "logEvent keeps the last 200 entries, oldest dropped");
+  await B.clearEvents();
+  await B.logEvent({ kind: "refused", reqId: "abc", tabId: 5, origin: "https://secret.example/path?x=1", detail: { reason: "not_allowed", error: "host secret.example not in allowlist", gen: 3 } });
+  await B.logEvent({ kind: "tab_opened", reqId: "def", tabId: 6, origin: "https://ok.example" });
+  await B.logEvent({ kind: "revoke", detail: { source: "popup", gen: 4, reason: "free text reason" } });
+  ev = await B.events();
+  assert(ev[0].origin === "https://secret.example" && !("error" in ev[0].detail) && ev[0].detail.reason === "not_allowed" && ev[0].detail.gen === 3, "logEvent stores the origin only and keeps just the whitelisted detail keys");
+  assert(!("reason" in ev[2].detail) && ev[2].detail.source === "popup", "logEvent drops a detail.reason that is not a fixed code");
+  const projGranted = B.projectEvents(ev, { granted: true, allowlist: ["ok.example"] });
+  const pj = JSON.stringify(projGranted);
+  assert(!/secret/.test(pj) && !/host secret/.test(pj) && Array.isArray(projGranted.events) && projGranted.events[0].origin === "redacted" && !("tabId" in projGranted.events[0]) && projGranted.events[0].reqId === "abc" && projGranted.events[0].detail.reason === "not_allowed", "projection (granted): disallowed origin redacted, tabId dropped, reqId and reason kept, no host string anywhere");
+  assert(projGranted.events[1].origin === "https://ok.example" && projGranted.events[1].tabId === 6, "projection (granted): allowed origin and tabId kept");
+  const projRevoked = B.projectEvents(ev, { granted: false, allowlist: ["ok.example"] });
+  assert(!projRevoked.events && projRevoked.counts.refused === 1 && projRevoked.counts.tab_opened === 1 && projRevoked.counts.revoke === 1 && !/example/.test(JSON.stringify(projRevoked)), "projection (not granted): counts per kind only");
+  const projAll = B.projectEvents(ev, { granted: true, allowlist: [] });
+  assert(projAll.events[0].origin === "https://secret.example", "projection with an empty allowlist keeps http(s) origins");
+  await B.logEvent({ kind: "attach", tabId: 7, origin: "chrome://extensions" });
+  const projPriv = B.projectEvents(await B.events(), { granted: true, allowlist: [] });
+  assert(projPriv.events[3].origin === "redacted", "projection redacts privileged origins even with an empty allowlist");
+  await B.logEvent({ kind: "weird", detail: { reason: "not_allowed" } });
+  assert((await B.events()).length === 4, "logEvent ignores unknown kinds");
+  await B.clearEvents();
+  await B.setAccess({ granted: true, until: Date.now() + 3600e3 });
+  await B.setAccess({ granted: false, source: "options" });
+  ev = await B.events();
+  assert(ev.some((e) => e.kind === "grant" && e.detail.source === "popup" && typeof e.detail.until === "number" && typeof e.detail.gen === "number") && ev.some((e) => e.kind === "revoke" && e.detail.source === "options"), "setAccess logs grant/revoke events with source, gen and until");
+
+  // ---- Task 3 (target guard): worker wiring ---------------------------------
+  const src3 = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
+  const code3 = src3.replace(/^\s*\/\/.*$/gm, "");
+  assert(/async function validateTab\(tabId, gen, \{ allowlist/.test(code3) && /chrome\.webNavigation\.getFrame\(\{ tabId, frameId: 0 \}\)/.test(code3), "validateTab reads the tab fresh and binds to the main frame's documentId");
+  assert(!/assertAllowed\(/.test(code3), "the old tab-only assertAllowed is gone (every target goes through validateTab / assertAllowedUrl)");
+  assert((code3.match(/docTarget\(v\)/g) || []).length >= 3 && /documentIds: \[v\.documentId\]/.test(code3) && !/target: \{ tabId: v\.tabId \}/.test(code3), "direct injections carry documentIds and never fall back to a bare tab");
+  for (const re of [/uniqueContextId/, /"Runtime\.enable"/, /"Page\.enable"/, /Page\.frameNavigated/, /loaderId/, /Runtime\.executionContextCreated/, /chrome\.debugger\.onEvent\.addListener/]) assert(re.test(code3), `debugger route tracks ${re.source}`);
+  assert(/chrome\.tabs\.onActivated\.addListener/.test(code3) && /chrome\.tabs\.onUpdated\.addListener/.test(code3), "onActivated guard and onUpdated detach are wired");
+  assert(/"target changed"/.test(code3), "a document/context change fails with target changed");
+  assert(/redactTabs\(/.test(code3) && /projectEvents\(/.test(code3) && /p\.events === true/.test(code3), "listTabs redacts; status projects events on request");
+  for (const k of ["connect", "disconnect", "refused", "attach", "detach"]) assert(new RegExp(`kind: "${k}"`).test(code3), `worker logs ${k} events`);
+  assert(/"events-get"/.test(code3), "popup can fetch the full event list");
+  assert(/BridgeAccess\.assertAllowedUrl\(p\.url, allowlist\)/.test(code3), "destinations (newTab/navigate/download) are checked as URLs");
+  const pop3 = fs.readFileSync(path.join(__dirname, "..", "extension", "popup.js"), "utf8");
+  assert(/"events-get"/.test(pop3) && /Recent events/.test(fs.readFileSync(path.join(__dirname, "..", "extension", "popup.html"), "utf8")), "popup shows recent events");
+  const cli3 = fs.readFileSync(path.join(__dirname, "..", "server", "cli.js"), "utf8");
+  assert(/--events/.test(cli3) && /params\.events = true/.test(cli3), "CLI: bridge status --events");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
@@ -305,8 +378,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/rememberAgentTab\(|completeTab\(/.test(src) && /forgetAgentTab\(/.test(src), "background.js records opened/closed tabs");
   assert(/accessMessage\(/.test(src) && /msg\.type === "auth"/.test(src), "background.js sends the access message after auth");
   assert(/session: "chrome"/.test(src), "DEFAULTS has the session name");
-  const closeTabCase = /case "closeTab":([\s\S]*?)return \{ ok: true \};/.exec(src);
-  assert(closeTabCase && /assertAllowed\(p\.tabId\)/.test(closeTabCase[1]) && closeTabCase[1].indexOf("assertAllowed") < closeTabCase[1].indexOf("chrome.tabs.remove"), "closeTab checks the allowlist before removing a tab");
+  const closeTabCase = /case "closeTab": \{([\s\S]*?)return \{ ok: true \};/.exec(src);
+  assert(closeTabCase && /validateTab\(p\.tabId, gen, \{ allowlist \}\)/.test(closeTabCase[1]) && closeTabCase[1].indexOf("validateTab") < closeTabCase[1].indexOf("chrome.tabs.remove"), "closeTab validates a non-agent tab (privileged block + allowlist) before removing it");
 
   // ---- Task 4: worker wiring ------------------------------------------------
   const man = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "extension", "manifest.json"), "utf8"));
@@ -314,7 +387,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/BridgeAccess\.configure\(\{[\s\S]*?onRevoke[\s\S]*?send[\s\S]*?badge[\s\S]*?sessionName/.test(src), "worker configures the access hooks");
   assert(/await BridgeAccess\.init\(\)/.test(src), "worker runs init() at start");
   assert(/sock\.onmessage = async \(ev\) => \{\s*if \(ws !== sock\) return;/.test(src), "messages from a superseded socket are dropped");
-  assert(/const gen = BridgeAccess\.currentGen\(\)/.test(src) && /await BridgeAccess\.assertAccess\(gen\)/.test(src) && /handle\(msg\.cmd, msg\.params \|\| \{\}, gen\)/.test(src), "every command captures gen and is checked before handle()");
+  assert(/const gen = BridgeAccess\.currentGen\(\)/.test(src) && /await BridgeAccess\.assertAccess\(gen\)/.test(src) && /handle\(msg\.cmd, msg\.params \|\| \{\}, gen, String\(msg\.id\)\)/.test(src), "every command captures gen and is checked before handle()");
   assert(/PASS_ALWAYS = new Set\(\["ping", "status"\]\)/.test(src), "ping/status bypass present");
   assert((src.match(/BridgeAccess\.dispatch\(gen, /g) || []).length >= 15, `browser operations go through dispatch(gen, …) (${(src.match(/BridgeAccess\.dispatch\(gen, /g) || []).length})`);
   // Every browser operation line (comments and the indicator's own injection, which only adds/removes a frame, excluded) is a dispatch line.
@@ -331,7 +404,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/BridgeAccess\.beginTab\(/.test(src) && /BridgeAccess\.completeTab\(/.test(src) && /BridgeAccess\.beginDownload\(/.test(src) && /BridgeAccess\.completeDownload\(/.test(src), "newTab/download use pending entries");
   assert(/TYPE_CHUNK = 20/.test(src), "direct type is chunked from the worker");
   assert(/access-expiry-/.test(src) && /BridgeAccess\.onAlarm\(/.test(src), "expiry alarms routed to BridgeAccess.onAlarm");
-  assert(/async function dbg\(tabId, method, params, gen\) \{\s*await BridgeAccess\.assertAccess\(gen\);/.test(src), "every debugger command re-reads access before its synchronous dispatch");
+  assert(/async function dbg\(tabId, method, params, gen, v\) \{\s*await BridgeAccess\.assertAccess\(gen\);\s*return BridgeAccess\.dispatch\(gen, \(\) => \{ if \(v\) assertLoader\(tabId, v\);/.test(src), "every debugger command re-reads access, then checks the loader inside the synchronous dispatch step");
   assert(/case "closeTabs":[\s\S]*?closeOwnedTabs\(p\.tabIds, \{ gen \}\)/.test(src), "remote closeTabs passes its generation");
   assert(/parseAccessSet\(/.test(src), "access-set goes through parseAccessSet");
 

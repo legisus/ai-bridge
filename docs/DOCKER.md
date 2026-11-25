@@ -11,8 +11,10 @@ implements the server side of the access contract, `BRIDGE_BIND` (#1), the
 request-id correlation of #13 (without the extension event buffer) and the tab
 hygiene of #14; the `access-switch` branch on top of it implements the grant/revoke
 switch (#2), the agent's access gate and the restricted-env passthrough (#12); the
-privileged-origin block (#3), the allowlist on every target (#4) and the event
-buffer are not implemented yet. The
+`target-guard` branch on top of that implements the privileged-origin block with
+document binding (#3), the allowlist on every target (#4) and the event buffer of
+#13 (`bridge status --events`). The container files (#5–#11) are the remaining
+step. The
 Dockerfile and compose file below are the target, not something that works today.
 
 This branch stacks on the channels chain (`feat/channels-core` →
@@ -507,7 +509,7 @@ and is readable from the PC:
 ```
 docker compose -f deploy/docker/compose.yml logs -f bridge          # server log (also /data/bridge.log)
 docker compose -f deploy/docker/compose.yml exec bridge sh -c 'tail -50 /data/bridge.log'
-bridge status --events                                              # extension's last 200 events (grant, revoke, refused, closed tab…) — next slice
+bridge status --events                                              # extension's last 200 events (grant, revoke, refused, closed tab…), redacted
 bridge journal                                                      # agent runs, verdicts, cost
 bridge journal --trace <runId>                                      # every bridge command of one run
 bridge tabs                                                         # tabs the bridge opened, with age, owner and run id
@@ -541,9 +543,22 @@ Log line shapes, one `cmd` line and one terminal line per request:
 
 `bridge status --events` is a redacted view: while access is revoked it shows only
 how many events of each kind happened; while granted it hides the origin and tab
-of any event about a page outside the current allowlist. The full list, with
-origins, is in the popup and in the service worker's `console` at
-`chrome://extensions` → the bridge card → **service worker**, on the PC only.
+of any event about a page outside the current allowlist (or on a privileged
+scheme), and `detail` carries only fixed codes (`reason`, `source`, `gen`,
+`until`), never an error string. The full list, with origins, is in the popup
+("Recent events") and in the service worker's `console` at `chrome://extensions`
+→ the bridge card → **service worker**, on the PC only.
+
+Target binding, as implemented: every tab command re-reads the tab, refuses
+anything that is not `http(s)` (whatever the allowlist says), applies the
+allowlist, and records the main frame's `documentId`; direct-mode injections name
+that document (`documentIds`), so Chrome itself refuses to run in a replacement
+page and the command fails `target changed`. In debugger mode code runs only in
+the main-world context whose origin passed the same checks (`uniqueContextId`);
+input and capture compare the frame's `loaderId` right before each send, which
+leaves one CDP round-trip of residual window. A direct screenshot is discarded if
+the window's active tab changed or the document changed during the capture; when
+the picture is evidence, use `--debugger`.
 
 `bridge agent … --verbose` prints each rung's model, judge verdict and token spend
 while the run goes. A run stopped by a revoke ends with the structured reason

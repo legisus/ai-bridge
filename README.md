@@ -311,6 +311,13 @@ Full policy: [PRIVACY.md](PRIVACY.md). Read this before installing — the exten
 - Every command is **logged** to `~/.ai-browser-bridge/bridge.log` with its request
   id, the client label and the run id, and ends in exactly one `done` / `refused` /
   `cancelled` line.
+- **Only http(s) pages on allowed hosts are ever a target.** `chrome://`, the
+  extension's own pages, `file:`, `javascript:`, `data:` and `view-source:` are
+  refused whatever the allowlist says; `listTabs` lists such tabs by id only
+  (`url: "redacted"`); every command re-reads its tab and runs only in the
+  document it validated (a page that navigated underneath fails with
+  `target changed`). `bridge status --events` shows the extension's recent
+  events, redacted to the current allowlist.
 - **You grant and revoke the browser session** from the extension's popup (or
   Options). The service worker is the only writer of that state and checks it on
   every command and before every browser operation; a revoke stops in-flight work,

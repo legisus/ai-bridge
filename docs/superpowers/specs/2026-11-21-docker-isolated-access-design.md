@@ -1,13 +1,16 @@
 # Docker-isolated agent with host-side access control — design
 
-**Implementation status (2026-11-25):** the first slice (`tab-hygiene`, PR #12)
-and the second slice (`access-switch`, stacked on it) are implemented; the second
-adds the extension's grant/revoke switch (serialised transition, `assertAccess` /
+**Implementation status (2026-11-25):** three slices are implemented: `tab-hygiene`
+(PR #12), `access-switch` (PR #13, stacked on it) and `target-guard` (stacked on
+that: the privileged-origin block with document binding — `webNavigation`
+`documentId` for direct injections, `uniqueContextId` and `loaderId` for the
+debugger route, the `onActivated` guard for direct screenshots, detach on
+navigation to a bad URL — the allowlist on every target with `listTabs`
+redaction, and the 200-entry event buffer with `status {events:true}`). The
+second slice adds the extension's grant/revoke switch (serialised transition, `assertAccess` /
 `dispatch` on every command, expiry alarms, reload and startup reconciliation,
 pending tab/download ownership, popup, Options session name and manual mode) and
-the agent's access gate (`server/access-gate.js`). Still to come: the
-privileged-origin block and document binding, the allowlist on every target with
-`listTabs` redaction, the event buffer (`status {events:true}`), the channels
+the agent's access gate (`server/access-gate.js`). Still to come: the channels
 daemon's `/status` and revoked-task refusal, and the container files. The first
 slice: the server side of the wire contract (`access` normalisation, extension
 generation, identity triple, gate, `BRIDGE_BIND`), request-id correlation with

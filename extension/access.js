@@ -36,6 +36,12 @@
   const readMap = async (key) => { const v = (await chrome.storage.local.get(key))[key]; return v && typeof v === "object" ? { ...v } : {}; };
   let dlQueue = Promise.resolve();
   const withDownloads = (fn) => { const p = dlQueue.then(fn, fn); dlQueue = p.catch(() => {}); return p; };
+  let evQueue = Promise.resolve();
+  const withEvents = (fn) => { const p = evQueue.then(fn, fn); evQueue = p.catch(() => {}); return p; };
+  const EVENT_LIMIT = 200;
+  const EVENT_KINDS = new Set(["connect", "disconnect", "superseded", "grant", "revoke", "refused", "tab_opened", "tab_closed", "download_started", "download_cancelled", "attach", "detach"]);
+  const REASONS = new Set(["access_revoked", "access_not_granted", "privileged_target", "not_allowed", "target_changed", "extension_disconnected"]);
+  const SOURCES = new Set(["popup", "options", "alarm", "reload", "startup", "token-change"]);
 
   // ---- access record, generation, transition ------------------------------
   // The worker is the only writer of `access`. Every grant and revoke bumps
@@ -115,6 +121,7 @@
             await revokeSteps(record, closeTabs);
           }
           hooks.log(`access ${record.granted ? "granted" : "revoked"} (gen ${gen}, source ${source}${writeError ? ", storage write failed" : ""})`);
+          await BridgeAccess.logEvent({ kind: record.granted ? "grant" : "revoke", detail: { source, gen, until: record.until === null ? undefined : record.until } }).catch(() => {});
         } finally { release(); }
         return writeError ? { ...record, error: "storage write failed" } : record;
       };
@@ -157,6 +164,87 @@
     },
 
     ACCESS_REVOKED, ACCESS_NOT_GRANTED,
+
+    // ---- event log -------------------------------------------------------------
+    // The last 200 things the worker did or refused, in session storage, for the
+    // popup (in full) and for `status {events:true}` (projected: see below).
+    // Origins only, fixed detail codes, never an error string.
+    logEvent({ kind, reqId, tabId, origin, detail } = {}) {
+      if (!EVENT_KINDS.has(kind)) return Promise.resolve();
+      const e = { t: Date.now(), kind };
+      if (reqId !== undefined && reqId !== null) e.reqId = String(reqId);
+      if (Number.isInteger(tabId)) e.tabId = tabId;
+      if (origin) { try { e.origin = new URL(String(origin)).origin; } catch { e.origin = String(origin).split(/[/?#]/)[0]; } }
+      if (detail && typeof detail === "object") {
+        const d = {};
+        if (REASONS.has(detail.reason)) d.reason = detail.reason;
+        if (SOURCES.has(detail.source)) d.source = detail.source;
+        if (Number.isFinite(detail.gen)) d.gen = detail.gen;
+        if (Number.isFinite(detail.until)) d.until = detail.until;
+        if (Object.keys(d).length) e.detail = d;
+      }
+      try { hooks.log(`event ${kind}${e.reqId ? ` req ${e.reqId}` : ""}${e.origin ? ` ${e.origin}` : ""}${e.detail ? ` ${JSON.stringify(e.detail)}` : ""}`); } catch {}
+      return withEvents(async () => {
+        const { events } = await chrome.storage.session.get("events");
+        const list = Array.isArray(events) ? events : [];
+        list.push(e);
+        await chrome.storage.session.set({ events: list.slice(-EVENT_LIMIT) });
+      });
+    },
+    async events() { const { events } = await chrome.storage.session.get("events"); return Array.isArray(events) ? events : []; },
+    clearEvents() { return withEvents(() => chrome.storage.session.remove("events")); },
+    // What goes over the wire. Not granted: counts per kind. Granted: entries,
+    // with the origin redacted (and the tab id dropped) for anything privileged
+    // or outside the CURRENT allowlist; detail already holds only fixed codes.
+    projectEvents(entries, { granted, allowlist } = {}) {
+      const list = Array.isArray(entries) ? entries : [];
+      if (!granted) {
+        const counts = {};
+        for (const e of list) counts[e.kind] = (counts[e.kind] || 0) + 1;
+        return { counts };
+      }
+      return {
+        events: list.map((e) => {
+          const out = { t: e.t, kind: e.kind };
+          if (e.reqId) out.reqId = e.reqId;
+          const ok = e.origin && this.isHttpUrl(e.origin) && this.hostAllowed(new URL(e.origin).hostname, allowlist);
+          if (e.origin) out.origin = ok ? e.origin : "redacted";
+          if (ok && Number.isInteger(e.tabId)) out.tabId = e.tabId;
+          if (e.detail) out.detail = { ...e.detail };
+          return out;
+        }),
+      };
+    },
+
+    // ---- target rules ----------------------------------------------------------
+    // Only http(s) documents are ever a target: not Chrome's own pages, not this
+    // extension's pages, not file:, javascript:, data: or view-source:. The
+    // allowlist cannot override this (`*` means any http(s) host).
+    isHttpUrl(url) {
+      try { const u = new URL(String(url)); return (u.protocol === "http:" || u.protocol === "https:") && !!u.hostname; } catch { return false; }
+    },
+    assertTarget(url) { if (!this.isHttpUrl(url)) throw new Error("privileged target refused"); },
+    hostAllowed(host, allowlist) {
+      if (!Array.isArray(allowlist) || allowlist.length === 0) return true; // empty = allow all (see README)
+      return allowlist.some((pat) => pat === "*" || host === pat || host.endsWith("." + pat));
+    },
+    assertAllowedUrl(url, allowlist) {
+      this.assertTarget(url);
+      const host = new URL(String(url)).hostname;
+      if (!this.hostAllowed(host, allowlist)) throw new Error(`host "${host}" not in allowlist`);
+    },
+    // A tab the agent may not touch is listed with its id only.
+    redactTabs(tabs, allowlist, agentTabIds = []) {
+      return (tabs || []).map((t) => {
+        const ok = this.isHttpUrl(t.url) && this.hostAllowed(new URL(t.url).hostname, allowlist);
+        const base = { id: t.id, windowId: t.windowId, active: t.active };
+        if (agentTabIds.includes(t.id)) base.agent = true;
+        return ok ? { ...base, url: t.url, title: t.title } : { ...base, url: "redacted" };
+      });
+    },
+    // A fresh or empty tab: no document to protect, so a command that supplies
+    // its own destination (navigate) may use it.
+    blankUrl(url) { const u = String(url || ""); return u === "" || u === "about:blank" || /^chrome:\/\/newtab\/?$/.test(u) || /^chrome:\/\/new-tab-page\/?/.test(u); },
 
     // ---- alarms, reload, startup --------------------------------------------
     // `access-expiry-<gen>` fires the revoke on time; the gen in the name keeps
@@ -209,11 +297,11 @@
     // A pending entry is written BEFORE the browser call, so a worker restart
     // or a revoke between the call and the id coming back never loses the fact
     // that it was ours. A completion under a moved generation closes/cancels.
-    beginTab({ gen, origin }) {
+    beginTab({ gen, origin, reqId }) {
       const nonce = randomHex32();
       return withTabs(async () => {
         const list = await readPending("session", "pendingTabs");
-        await chrome.storage.session.set({ pendingTabs: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now() }] });
+        await chrome.storage.session.set({ pendingTabs: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now(), ...(reqId ? { reqId: String(reqId) } : {}) }] });
         return nonce;
       });
     },
@@ -228,17 +316,17 @@
       const liveNow = async () => { await transition; const a = await this.readAccess(); return gen === accessGen && a.granted && (a.until === null || Date.now() < a.until); };
       if (Number.isInteger(tabId) && (await liveNow())) {
         await this.rememberAgentTab(tabId);
-        if (gen === accessGen && lastRecord.granted) return true; // the write landed under the same generation
+        if (gen === accessGen && lastRecord.granted) { this.logEvent({ kind: "tab_opened", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; } // the write landed under the same generation
         await this.forgetAgentTab(tabId);
       }
-      if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); } catch {} }
+      if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); this.logEvent({ kind: "tab_closed", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {} }
       return false;
     },
-    beginDownload({ gen, origin }) {
+    beginDownload({ gen, origin, reqId }) {
       const nonce = randomHex32();
       return withDownloads(async () => {
         const list = await readPending("local", "pendingDownloads");
-        await chrome.storage.local.set({ pendingDownloads: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now() }] });
+        await chrome.storage.local.set({ pendingDownloads: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now(), ...(reqId ? { reqId: String(reqId) } : {}) }] });
         return nonce;
       });
     },
@@ -254,8 +342,8 @@
       if (Number.isInteger(downloadId)) {
         // Record ownership first (so a revoke's sweep can find it), then decide.
         await withDownloads(async () => { const m = await readMap("bridgeDownloads"); m[downloadId] = { gen }; await chrome.storage.local.set({ bridgeDownloads: m }); });
-        if ((await liveNow()) && gen === accessGen) return true;
-        try { await chrome.downloads.cancel(downloadId); } catch {}
+        if ((await liveNow()) && gen === accessGen) { this.logEvent({ kind: "download_started", origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; }
+        try { await chrome.downloads.cancel(downloadId); this.logEvent({ kind: "download_cancelled", origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {}
       }
       return false;
     },
@@ -269,7 +357,7 @@
           let item = null;
           try { [item] = await chrome.downloads.search({ id }); } catch {}
           if (!item) { delete m[id]; continue; }
-          if (item.state === "in_progress") { try { await chrome.downloads.cancel(id); cancelled.push(id); } catch {} }
+          if (item.state === "in_progress") { try { await chrome.downloads.cancel(id); cancelled.push(id); BridgeAccess.logEvent({ kind: "download_cancelled", detail: { reason: "access_revoked" } }).catch(() => {}); } catch {} }
         }
         await chrome.storage.local.set({ bridgeDownloads: m });
       });
