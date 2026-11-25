@@ -34,6 +34,7 @@ function readToken() {
 }
 
 const { SELF_CMD } = require("./runtime");
+const { isAccessError } = require("./access");
 
 function main(argv) {
 if (argv.length === 0) {
@@ -205,7 +206,9 @@ function send() {
     }
     if (msg.type === "response" && msg.id === id) {
       clearTimeout(timer);
-      if (!msg.ok) { console.error("ERROR:", msg.error); process.exit(1); }
+      // Exit 8 on the two access errors (the user has not granted, or has revoked,
+      // the browser session) so callers can tell them from command failures.
+      if (!msg.ok) { console.error("ERROR:", msg.error); process.exit(isAccessError(msg.error) ? 8 : 1); }
       // Binary results (pdf/screenshot) can be written straight to a file.
       let out;
       if (flags.out && msg.result && msg.result.base64) {

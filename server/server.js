@@ -6,11 +6,20 @@
 //
 // Security model: binds 127.0.0.1 only; every client must present the token
 // from ~/.ai-browser-bridge/token (created on first start, chmod 600).
+//
+// Access: the extension reports whether the user has granted it the browser
+// session (`access` message, server/access.js). While access is not granted,
+// every command except ping/status is refused here without forwarding; the
+// extension enforces the same rule on its side. Each extension socket gets a
+// generation number; `ping`/`status` results carry (serverId, extGen,
+// accessGen) so a run can notice a different server, extension or grant.
 
 const { WebSocketServer } = require("ws");
 const fs = require("fs");
 const { TOKEN_FILE, LOG_FILE, ensureToken } = require("./token");
+const crypto = require("crypto");
 const { appendTrace } = require("./journal");
+const { normalizeAccess, stateOf, ACCESS_REVOKED, ACCESS_NOT_GRANTED } = require("./access");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
 // Listen address. 127.0.0.1 unless the relay runs in a container, where the
@@ -28,8 +37,34 @@ function start({ port = PORT, bind = BIND } = {}) {
 const { token: TOKEN, created } = ensureToken();
 if (created) console.log(`[bridge] token generated at ${TOKEN_FILE} — the extension picks it up via the native host (npm run register-host), or paste it into Options`);
 
-let extension = null;                 // the single extension socket
-const pending = new Map();            // request id -> { sock, cmd, params, meta, t0 }
+const serverId = crypto.randomBytes(16).toString("hex"); // identity of this server process
+let ext = null;                       // { sock, gen, access } — the single extension socket
+let extGen = 0;                       // bumped on every extension authentication
+const pending = new Map();            // request id -> { id, sock, cmd, params, meta, t0, gen }
+const PASS_ALWAYS = new Set(["ping", "status"]); // touch no tab: forwarded whatever the access state
+
+const accessState = () => (ext ? stateOf(ext.access) : "not_granted");
+const sessionName = () => (ext && ext.access ? ext.access.session : "chrome");
+const extUp = () => !!(ext && ext.sock.readyState === 1);
+
+function answer(req, msg) {
+  pending.delete(req.id);
+  if (req.sock && req.sock.readyState === 1) req.sock.send(JSON.stringify(msg));
+}
+// Answer every pending request of one extension generation that `filter` selects.
+function cancelPending(gen, filter, error) {
+  for (const r of [...pending.values()]) {
+    if (r.gen === gen && filter(r)) answer(r, { type: "response", id: r.id, ok: false, error });
+  }
+}
+function dropExtension(reason) {
+  if (!ext) return;
+  const { sock: oldSock, gen } = ext;
+  ext = null;
+  log(reason);
+  try { oldSock.close(); } catch {}
+  cancelPending(gen, () => true, "extension disconnected");
+}
 
 const wss = new WebSocketServer({ host: bind, port, maxPayload: 64 * 1024 * 1024 });
 wss.on("listening", () => {
@@ -51,31 +86,55 @@ wss.on("connection", (sock) => {
       }
       role = msg.role === "extension" ? "extension" : "cli";
       if (role === "extension") {
-        if (extension) try { extension.close(); } catch {}
-        extension = sock;
-        log("extension connected");
+        if (ext) dropExtension(`extension superseded (gen ${ext.gen} → ${extGen + 1})`);
+        extGen++;
+        ext = { sock, gen: extGen, access: null }; // not_granted until its first access message
+        log(`extension connected (gen ${extGen})`);
       }
       sock.send(JSON.stringify({ type: "auth", ok: true }));
       return;
     }
 
     if (role === "cli" && msg.type === "request") {
-      if (!extension || extension.readyState !== 1) {
-        return sock.send(JSON.stringify({ type: "response", id: msg.id, ok: false, error: "extension not connected" }));
-      }
-      // meta.runId/job come from `bridge agent` via the CLI (AI_BRIDGE_RUN_ID);
-      // every command of that run is traced to traces/<runId>.jsonl.
       const meta = msg.meta && typeof msg.meta === "object" ? msg.meta : null;
-      pending.set(msg.id, { sock, cmd: msg.cmd, params: msg.params, meta, t0: Date.now() });
+      const req = { id: msg.id, sock, cmd: msg.cmd, params: msg.params, meta, t0: Date.now(), gen: ext ? ext.gen : 0 };
+      pending.set(req.id, req);
       log(`cmd ${msg.cmd} ${JSON.stringify(msg.params || {}).slice(0, 200)}${meta && meta.runId ? ` run=${meta.runId}` : ""}`);
-      extension.send(JSON.stringify({ type: "command", id: msg.id, cmd: msg.cmd, params: msg.params }));
+      if (!extUp()) return answer(req, { type: "response", id: req.id, ok: false, error: "extension not connected" });
+      if (!PASS_ALWAYS.has(msg.cmd) && accessState() !== "granted") {
+        const error = ext.access == null ? ACCESS_NOT_GRANTED(sessionName()) : ACCESS_REVOKED(sessionName());
+        return answer(req, { type: "response", id: req.id, ok: false, error });
+      }
+      ext.sock.send(JSON.stringify({ type: "command", id: msg.id, cmd: msg.cmd, params: msg.params }));
+      return;
+    }
+
+    if (role === "extension" && msg.type === "access") {
+      if (!ext || sock !== ext.sock) return; // a superseded socket has no say
+      const prev = stateOf(ext.access);
+      const a = normalizeAccess(msg);
+      ext.access = a;
+      if (a.reason === "bad_until" || a.reason === "bad_browser_session") log(`access message rejected: ${a.reason} (treated as revoked)`);
+      const next = stateOf(a);
+      if (next !== prev) {
+        log(next === "granted"
+          ? `access granted (session "${a.session}", until ${a.until === null ? "never" : new Date(a.until).toISOString()})`
+          : `access revoked (session "${a.session}")`);
+      }
+      // The extension will refuse them anyway; do not make the CLI wait for that.
+      if (next !== "granted") cancelPending(ext.gen, (r) => !PASS_ALWAYS.has(r.cmd), ACCESS_REVOKED(a.session));
       return;
     }
 
     if (role === "extension" && msg.type === "response") {
+      if (!ext || sock !== ext.sock) return; // late answer from a superseded socket
       const req = pending.get(msg.id);
-      pending.delete(msg.id);
       if (!req) return;
+      if (msg.ok && PASS_ALWAYS.has(req.cmd)) {
+        const base = msg.result && typeof msg.result === "object" ? msg.result : { value: msg.result };
+        msg.result = { ...base, session: sessionName(), access: accessState(), until: ext.access ? ext.access.until : null,
+          accessGen: ext.access ? ext.access.gen : 0, extGen: ext.gen, serverId };
+      }
       if (req.meta && req.meta.runId) {
         const as = req.meta.as && typeof req.meta.as === "object" ? req.meta.as : null; // e.g. snapshot sent as eval
         appendTrace(req.meta.runId, {
@@ -85,13 +144,13 @@ wss.on("connection", (sock) => {
           ms: Date.now() - req.t0, result: msg.ok ? msg.result : undefined,
         });
       }
-      if (req.sock.readyState === 1) req.sock.send(JSON.stringify(msg));
+      answer(req, msg);
       return;
     }
   });
 
   sock.on("close", () => {
-    if (sock === extension) { extension = null; log("extension disconnected"); }
+    if (ext && sock === ext.sock) dropExtension("extension disconnected");
     for (const [id, r] of pending) if (r.sock === sock) pending.delete(id);
   });
 });
