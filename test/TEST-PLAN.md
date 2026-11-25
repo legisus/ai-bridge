@@ -59,6 +59,15 @@ Two layers:
 - **Allowlist enforcement**: set a host allowlist in Options, then `eval` on a
   non-listed domain must return `host "..." not in allowlist`.
 
+## Tab hygiene — manual rows (need a real Chrome)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| T1 | reload the extension with agent tabs open | `bridge newTab`, then `bridge reloadExtension`, then `bridge tabs` | the tab is listed under "from an earlier Chrome session"; `bridge closeTabs --mine` does not touch it |
+| T2 | a run killed with Ctrl-C closes its tabs | `bridge agent "open example.com and wait"`, Ctrl-C while it runs | within ~5 s the run's tabs are gone; `bridge journal` shows `tabsClosed` for the run |
+| T3 | a user tab in the agent's window survives | run opens a tab with `newWindow:true`; drag one of your tabs into that window; end the run | your tab stays, the agent's tab closes, the window stays open |
+| T4 | restart the relay mid-session | `bridge newTab`, restart `server.js`, `bridge tabs` | the tab is still listed as live (registry reloaded, reconciled against the extension) |
+
 ## Last run
 
 `integration.sh` — **15/15 PASS** (2026-07-07, extension v0.1.0, Chrome on macOS).
