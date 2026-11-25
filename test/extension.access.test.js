@@ -352,6 +352,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   ev = await B.events();
   assert(ev.some((e) => e.kind === "grant" && e.detail.source === "popup" && typeof e.detail.until === "number" && typeof e.detail.gen === "number") && ev.some((e) => e.kind === "revoke" && e.detail.source === "options"), "setAccess logs grant/revoke events with source, gen and until");
 
+  // ---- Task 3 (target guard): worker wiring ---------------------------------
+  const src3 = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
+  const code3 = src3.replace(/^\s*\/\/.*$/gm, "");
+  assert(/async function validateTab\(tabId, gen, \{ allowlist/.test(code3) && /chrome\.webNavigation\.getFrame\(\{ tabId, frameId: 0 \}\)/.test(code3), "validateTab reads the tab fresh and binds to the main frame's documentId");
+  assert(!/assertAllowed\(/.test(code3), "the old tab-only assertAllowed is gone (every target goes through validateTab / assertAllowedUrl)");
+  assert((code3.match(/documentIds: \[/g) || []).length >= 3, "direct injections carry documentIds");
+  for (const re of [/uniqueContextId/, /"Runtime\.enable"/, /"Page\.enable"/, /Page\.frameNavigated/, /loaderId/, /Runtime\.executionContextCreated/, /chrome\.debugger\.onEvent\.addListener/]) assert(re.test(code3), `debugger route tracks ${re.source}`);
+  assert(/chrome\.tabs\.onActivated\.addListener/.test(code3) && /chrome\.tabs\.onUpdated\.addListener/.test(code3), "onActivated guard and onUpdated detach are wired");
+  assert(/"target changed"/.test(code3), "a document/context change fails with target changed");
+  assert(/redactTabs\(/.test(code3) && /projectEvents\(/.test(code3) && /p\.events === true/.test(code3), "listTabs redacts; status projects events on request");
+  for (const k of ["connect", "disconnect", "refused", "attach", "detach"]) assert(new RegExp(`kind: "${k}"`).test(code3), `worker logs ${k} events`);
+  assert(/"events-get"/.test(code3), "popup can fetch the full event list");
+  assert(/BridgeAccess\.assertAllowedUrl\(p\.url, allowlist\)/.test(code3), "destinations (newTab/navigate/download) are checked as URLs");
+  const pop3 = fs.readFileSync(path.join(__dirname, "..", "extension", "popup.js"), "utf8");
+  assert(/"events-get"/.test(pop3) && /Recent events/.test(fs.readFileSync(path.join(__dirname, "..", "extension", "popup.html"), "utf8")), "popup shows recent events");
+  const cli3 = fs.readFileSync(path.join(__dirname, "..", "server", "cli.js"), "utf8");
+  assert(/--events/.test(cli3) && /params\.events = true/.test(cli3), "CLI: bridge status --events");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
@@ -360,8 +378,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/rememberAgentTab\(|completeTab\(/.test(src) && /forgetAgentTab\(/.test(src), "background.js records opened/closed tabs");
   assert(/accessMessage\(/.test(src) && /msg\.type === "auth"/.test(src), "background.js sends the access message after auth");
   assert(/session: "chrome"/.test(src), "DEFAULTS has the session name");
-  const closeTabCase = /case "closeTab":([\s\S]*?)return \{ ok: true \};/.exec(src);
-  assert(closeTabCase && /assertAllowed\(p\.tabId\)/.test(closeTabCase[1]) && closeTabCase[1].indexOf("assertAllowed") < closeTabCase[1].indexOf("chrome.tabs.remove"), "closeTab checks the allowlist before removing a tab");
+  const closeTabCase = /case "closeTab": \{([\s\S]*?)return \{ ok: true \};/.exec(src);
+  assert(closeTabCase && /validateTab\(p\.tabId, gen, \{ allowlist \}\)/.test(closeTabCase[1]) && closeTabCase[1].indexOf("validateTab") < closeTabCase[1].indexOf("chrome.tabs.remove"), "closeTab validates a non-agent tab (privileged block + allowlist) before removing it");
 
   // ---- Task 4: worker wiring ------------------------------------------------
   const man = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "extension", "manifest.json"), "utf8"));
