@@ -76,6 +76,17 @@ Two layers:
 | A11 | "revoke and close" after a worker restart | `bridge newTab`, stop the worker (A5), **Revoke and close agent tabs** | the tab closes (agentTabs lives in session storage, not in the worker) |
 | A12 | extension reload revokes with a notice | **Grant**, `bridge reloadExtension` | the popup shows revoked and the "reloaded" notice; `bridge tabs` lists the old tabs as from an earlier session |
 
+## Target guard — manual rows (need a real Chrome)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| G1 | privileged destinations refused | `bridge newTab '{"url":"chrome://extensions"}'`, same for `chrome-extension://<id>/options.html` with the allowlist empty and with `*` | `privileged target refused` |
+| G2 | listTabs redaction | open chrome://settings and a site outside the allowlist, `bridge listTabs` | both appear as `{id, url:"redacted"}` with no title |
+| G3 | redirect out of the allowlist stops waitFor | allowlist `ok.example`; tab on it; `bridge waitFor '{"tabId":N,"selector":"#never","timeoutMs":60000}'`; navigate the tab by hand to another host | the command fails `host "…" not in allowlist` within one tick |
+| G4 | attached tab redirected to chrome:// detaches | `bridge eval … --debugger` on a tab, then type `chrome://version` in its address bar | the banner disappears; `bridge status` shows the tab is no longer attached; the event list has `detach … target_changed` |
+| G5 | document changed under a direct eval | `bridge eval` with code that navigates the page, then a second `bridge eval` racing it | the second fails `target changed` or runs in the new document only after re-validation; never in the old one |
+| G6 | status --events redaction | revoke, `bridge status --events` → counts only; grant, refuse a command on a disallowed host, `bridge status --events` | the refused event shows `origin: "redacted"` and `reason: not_allowed`; the popup's "Recent events" shows the real origin |
+
 ## Tab hygiene — manual rows (need a real Chrome)
 
 | # | behaviour | how | expected |
