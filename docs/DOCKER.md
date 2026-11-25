@@ -4,8 +4,9 @@
 after nine rounds of the Codex `gpt-6-astra` review (53 findings folded in; the
 base design approved in round six, the observability and tab-hygiene additions in
 round nine, with the untested CLI pin pair left as an implementation gate; the
-review text is not part of the repo). Nothing Docker-related in this guide has been run: there is no Docker on the
-machine it was written on. Of the code changes it depends on (listed in
+review text is not part of the repo). Docker is now available on the authoring Mac (Colima + the Homebrew Docker CLI),
+and the smoke job below has been run there; the full round trip is scripted and
+waits for a run on the PC. Of the code changes it depends on (listed in
 [What has to change](#what-has-to-change-in-the-code)), the `tab-hygiene` branch
 implements the server side of the access contract, `BRIDGE_BIND` (#1), the
 request-id correlation of #13 (without the extension event buffer) and the tab
@@ -13,8 +14,14 @@ hygiene of #14; the `access-switch` branch on top of it implements the grant/rev
 switch (#2), the agent's access gate and the restricted-env passthrough (#12); the
 `target-guard` branch on top of that implements the privileged-origin block with
 document binding (#3), the allowlist on every target (#4) and the event buffer of
-#13 (`bridge status --events`). The container files (#5–#11) are the remaining
-step. The
+#13 (`bridge status --events`). The `docker-container` branch on top of that adds the container files (#5–#11)
+exactly as written below, plus `test/docker-smoke.sh` (the smoke job) and
+`test/docker-roundtrip.sh` (the real-Chrome round trip). The smoke job was run
+on the authoring Mac with Colima (arm64): image builds, listening line,
+healthcheck, token mode, `/work` write, read-only root, both pinned CLIs
+(`claude` 2.1.317, `codex` 0.171.0) and a `codex exec` one-shot under the compose
+restrictions all pass; the pin pair is therefore confirmed on arm64, and the PC
+(x86_64) builds the same files. The
 Dockerfile and compose file below are the target, not something that works today.
 
 This branch stacks on the channels chain (`feat/channels-core` →
@@ -623,10 +630,35 @@ the `access` message: after updating the server, reload the extension too, then
 command except `ping`/`status` is refused with `access_not_granted` /
 `access_revoked`.
 
+## Smoke test and round trip
+
+`bash test/docker-smoke.sh` builds the image, starts the relay in a throwaway
+compose project (`ai-bridge-smoke`) on a free loopback port and checks the list
+from the design's Tests section: the listening line with the loopback warning,
+the healthcheck turning healthy with no extension and no token, `/data/token`
+mode 600 owned by uid 1000, `/data` 700, the CLI inside the container (`ping` →
+`extension not connected`, `bridge tabs` → empty registry), the published port
+reachable from the host loopback, a `/work` write visible on the host, the
+read-only root, the two pinned CLIs, and, when `~/.codex/auth.json` exists on the
+machine, a `codex exec` one-shot that runs a shell command inside the hardened
+container (`--sandbox danger-full-access`: the container is the sandbox). It
+ends with `docker compose down -v`. Nothing of the machine's own bridge state is
+touched.
+
+`bash test/docker-roundtrip.sh` is the round trip with the real extension: it
+stops the host relay, publishes the container on `127.0.0.1:8765` with the host's
+existing token copied into `/data/token` (so the extension reconnects by itself
+within its 24-s alarm), reads the access handshake from the container log and
+`bridge ping` on both sides, then stops the container and restores the host
+relay. Run it yourself: it interrupts the host bridge for about a minute.
+
 ## Troubleshooting
 
 | Symptom | Meaning | Fix |
 |---|---|---|
+| `/work` is empty inside the container, or writes there are refused (Colima, Docker Desktop on macOS) | The bind-mounted folder lives outside the paths the Docker VM shares with macOS (Colima shares `$HOME` and `/tmp/colima`; macOS's `/var/folders` temp dirs are not). | Keep `BRIDGE_WORK_DIR` under your home directory (the default `./work` next to the compose file is). |
+| `codex exec` inside the container prints `Reading additional input from stdin...` and never finishes | Codex reads its prompt from stdin when stdin is not a TTY. | Redirect stdin from `/dev/null` in scripts (`codex exec … < /dev/null`); the agent's own spawns already do. |
+| `docker compose up` fails with "volume … already exists but was not created by Docker Compose" | A volume with the project's name was created by `docker run -v` before Compose made it. | Let `docker compose up`/`create` make the volumes first; copy files in with `docker run -v <project>_data:/data …` afterwards. |
 | `connect failed` from the CLI inside the container | The server is not up. | `docker compose -f deploy/docker/compose.yml logs bridge`. |
 | Options show "not provisioned" / `extension not connected` | Token not pasted, or the server still binds `127.0.0.1` inside the container so the published port is dead. | Check the log says `listening on ws://0.0.0.0:8765`; re-paste the token; reload the extension. |
 | Token in Options changes by itself | A native host from an old source install re-provisioned the extension. | Tick **Manual mode** in Options; unregister the host (prerequisites). |
