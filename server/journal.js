@@ -10,6 +10,7 @@
 const fs = require("fs");
 const path = require("path");
 const { DIR } = require("./token");
+const { atomicWrite, withLock } = require("./atomic");
 
 const JOURNAL_FILE = path.join(DIR, "journal.jsonl");
 const TRACES_DIR = path.join(DIR, "traces");
@@ -90,6 +91,23 @@ function appendJournal(record) {
   ensureDir(DIR);
   fs.appendFileSync(JOURNAL_FILE, JSON.stringify(record) + "\n");
   return JOURNAL_FILE;
+}
+
+// Update the last record of `runId` in place (the server patches tab counters
+// when a creation is closed after the run ended). False when there is none.
+function patchRun(runId, patch) {
+  return withLock(JOURNAL_FILE, () => {
+    let lines;
+    try { lines = fs.readFileSync(JOURNAL_FILE, "utf8").split("\n").filter(Boolean); } catch { return false; }
+    let idx = -1;
+    for (let i = lines.length - 1; i >= 0 && idx < 0; i--) {
+      try { if (JSON.parse(lines[i]).runId === runId) idx = i; } catch {}
+    }
+    if (idx < 0) return false;
+    lines[idx] = JSON.stringify({ ...JSON.parse(lines[idx]), ...patch });
+    atomicWrite(JOURNAL_FILE, lines.join("\n") + "\n");
+    return true;
+  });
 }
 
 function readJournal({ days } = {}) {
@@ -192,5 +210,5 @@ function main(argv) {
 module.exports = {
   JOURNAL_FILE, TRACES_DIR, CANDIDATE_MIN_PASSES, traceFile, safeRunId,
   appendTrace, readTrace, domainsFromTrace, normalizeTask, signatureOf,
-  appendJournal, readJournal, summarize, formatReport, main,
+  appendJournal, patchRun, readJournal, summarize, formatReport, main,
 };

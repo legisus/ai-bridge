@@ -59,5 +59,13 @@ const report = J.formatReport(rows, { days: 30 });
 assert(report.includes("* = economy-mode candidate") && /\*\s+4\s+75%/.test(report), "formatReport: marks candidate row");
 assert(J.formatReport([], { days: 7 }).includes("no agent runs"), "formatReport: empty");
 
+// patchRun: the server updates a run's record in place (late tab closures)
+J.appendJournal(rec({ runId: "patchme", job: "p" }));
+assert(J.patchRun("patchme", { tabsClosed: 2, late: true }) === true, "patchRun returns true");
+const got = J.readJournal().find((r) => r.runId === "patchme");
+assert(got.tabsClosed === 2 && got.late === true && got.job === "p", "patchRun merges into the record in place");
+assert(J.patchRun("nope", { x: 1 }) === false, "patchRun unknown run → false");
+assert(J.readJournal().filter((r) => r.runId === "patchme").length === 1, "patchRun does not duplicate the record");
+
 console.log(failures === 0 ? "\nAll journal tests passed." : `\n${failures} test(s) FAILED.`);
 process.exit(failures ? 1 : 0);

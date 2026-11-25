@@ -18,8 +18,9 @@ const { WebSocketServer } = require("ws");
 const fs = require("fs");
 const { TOKEN_FILE, LOG_FILE, TABS_FILE, ensureToken } = require("./token");
 const { openRegistry } = require("./tabs");
+const { createRunManager } = require("./runs");
 const crypto = require("crypto");
-const { appendTrace, safeRunId } = require("./journal");
+const { appendTrace, safeRunId, patchRun } = require("./journal");
 const { normalizeAccess, stateOf, ACCESS_REVOKED, ACCESS_NOT_GRANTED } = require("./access");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
@@ -45,6 +46,9 @@ const pending = new Map();            // request id -> { id, sock, cmd, params, 
 const PASS_ALWAYS = new Set(["ping", "status"]); // touch no tab: forwarded whatever the access state
 const registry = openRegistry(TABS_FILE, { log });  // tabs the bridge opened (server/tabs.js)
 let internalSeq = 0;
+// BRIDGE_DRAIN_MS shortens the 5-s drain after a run ends; for the tests only.
+const runs = createRunManager({ registry, sendCommand: (cmd, params) => sendInternal(cmd, params), accessState: () => accessState(), log,
+  patchJournal: patchRun, drainMs: Number(process.env.BRIDGE_DRAIN_MS) || 5000 });
 
 const accessState = () => (ext ? stateOf(ext.access) : "not_granted");
 const sessionName = () => (ext && ext.access ? ext.access.session : "chrome");
@@ -97,8 +101,14 @@ function finish(req, outcome) {
 function noteOutcome(req, ok, result) {
   const p = req.params && typeof req.params === "object" ? req.params : {};
   if (req.cmd === "newTab") {
-    if (ok && result && Number.isInteger(result.id)) registry.completePending(req.id, result.id);
-    else registry.dropPending(req.id);
+    if (ok && result && Number.isInteger(result.id)) {
+      const row = registry.completePending(req.id, result.id);
+      if (row && row.runId) {
+        runs.noteOpened(row.runId);
+        const run = runs.get(row.runId);
+        if (run && run.state === "ended") runs.lateCreation(row.runId, row.tabId);
+      }
+    } else registry.dropPending(req.id);
     return;
   }
   if (!ok) return;
@@ -183,6 +193,21 @@ wss.on("connection", (sock) => {
       return;
     }
 
+    // Run leases from a supervisor (bridge agent): register, end, or die.
+    if (role === "cli" && msg.type === "run") {
+      const runId = safeRunId(msg.runId);
+      const r = runId ? runs.register({ runId, client: sanitizeClient(msg.client), keepTabs: !!msg.keepTabs, sock }) : { ok: false, error: "bad runId" };
+      sock.send(JSON.stringify({ type: "run", runId: msg.runId, ok: r.ok, ...(r.ok ? {} : { error: r.error }) }));
+      return;
+    }
+    if (role === "cli" && msg.type === "runEnd") {
+      const runId = safeRunId(msg.runId);
+      const reply = (obj) => { if (sock.readyState === 1) sock.send(JSON.stringify({ type: "runEnd", runId: msg.runId, ...obj })); };
+      if (!runId || !runs.get(runId)) return reply({ ok: false, error: "unknown run" });
+      runs.end(runId, { reason: "runEnd" }).then((tabs) => reply({ ok: true, tabs }));
+      return;
+    }
+
     if (role === "extension" && msg.type === "access") {
       if (!ext || sock !== ext.sock) return; // a superseded socket has no say
       const prev = stateOf(ext.access);
@@ -222,6 +247,7 @@ wss.on("connection", (sock) => {
 
   sock.on("close", () => {
     if (ext && sock === ext.sock) dropExtension("extension disconnected");
+    runs.onSocketClose(sock); // a lease socket closing without runEnd = the supervisor is gone
     // A CLI that went away only loses its answer; the request itself still
     // finishes (and is logged, traced and, for newTab, recorded) when the
     // extension responds.

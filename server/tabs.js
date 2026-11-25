@@ -89,6 +89,7 @@ function openRegistry(file, { log = console.error } = {}) {
       if (n) save();
       return n;
     },
+    markRetainedTab(tabId) { const row = liveRow(tabId); if (row && row.status === "live") { row.status = "retained"; save(); } },
     markLate(tabId) { const row = liveRow(tabId); if (row) { row.late = true; save(); } },
     rowsForRun(runId) { return current().filter((t) => t.runId === runId && t.status === "live"); },
 
