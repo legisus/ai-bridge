@@ -620,27 +620,33 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
       state = jobs.transition(state, { kind: "repaired", version: repaired.version });
       pushStage({ stage: `repair:${RECIPE_MODEL}`, ...(repaired._usage || { input: 0, output: 0 }) });
     } catch (e) {
-      if (verbose) console.error(`[agent] recipe repair failed: ${e.message}`);
-      repaired = { error: e.message };
+      if (e && e.name === "AccessError") { blocker = "access_revoked"; finalVerdict = { verdict: "fail", feedback: e.message }; repaired = null; }
+      else {
+        if (verbose) console.error(`[agent] recipe repair failed: ${e.message}`);
+        repaired = { error: e.message };
+      }
     }
   }
 
   const journalMode = mismatch ? "regular" : mode === "regular" ? "regular" : fellBack ? `${mode}-fallback` : mode;
-  if (blocker) finalVerdict.blocker = blocker;
 
   // ---- learn: enough passing model runs of the same task → propose a recipe ----
   // (and repair a flagged recipe from a plain regular pass). The bridge decides
   // on its own; nobody has to tag jobs or run `recipe propose`.
   let learned = null;
-  if (auto && !restricted && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
+  if (!blocker && auto && !restricted && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
     try {
       learned = await autoLearn({ job, state, task, runId, startedAt, stages, D, run: guarded, timeoutMs, verbose });
       if (learned && learned.recipe) {
         job = learned.job; state = learned.state;
         pushStage({ stage: `learn:${RECIPE_MODEL}`, ...(learned.recipe._usage || { input: 0, output: 0 }) });
       }
-    } catch (e) { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
+    } catch (e) {
+      if (e && e.name === "AccessError") { blocker = "access_revoked"; finalVerdict = { verdict: "fail", feedback: e.message }; learned = null; }
+      else { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
+    }
   }
+  if (blocker) finalVerdict.blocker = blocker;
 
   if (state && blocker !== "cancelled" && blocker !== "declined" && blocker !== "access_revoked") {
     try {

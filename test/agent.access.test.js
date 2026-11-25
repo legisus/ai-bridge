@@ -139,6 +139,32 @@ function mockRun(judgeVerdicts) {
     assert(t.text === "x", "runTurn: granted → the turn runs");
   }
 
+  // ---- review fixes ----------------------------------------------------------
+  // (7) an outstanding poll is settled before withAccess returns; a failure latches on the gate
+  {
+    let n = 0;
+    const slowPing = () => { n++; if (n <= 1) return Promise.resolve(granted()); return new Promise((res) => setTimeout(() => res(granted({ access: "revoked" })), 40)); };
+    const g = createAccessGate({ ping: slowPing, intervalMs: 5, timeoutMs: 100 }); await g.preflight();
+    let e = null; try { await withAccess(g, () => new Promise((res) => setTimeout(() => res("done"), 12)), {}); } catch (x) { e = x; }
+    assert(e instanceof AccessError, "withAccess waits for the outstanding poll and surfaces its failure instead of returning the child's result");
+    const before = n; e = null; try { await g.check(); } catch (x) { e = x; }
+    assert(e instanceof AccessError && n === before, "a failed gate stays failed: later checks throw without pinging");
+  }
+  // (8) an access error inside repair or learning is terminal, not swallowed
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    const g = createAccessGate({ ping: mockPing([granted()]), intervalMs: 1000 });
+    const puts = [];
+    const r = await runAgent("learn me", { job: "learnjob" }, m.run, {
+      accessGate: g, openLease: noLease,
+      readTrace: () => [{ cmd: "newTab", params: { url: "https://x.example/" }, ok: true }],
+      readJournal: () => [{ runId: "p1", job: "learnjob", verdict: "pass", mode: "regular" }, { runId: "p2", job: "learnjob", verdict: "pass", mode: "regular" }],
+      loadRecipe: () => null, getJob: () => ({ job: "learnjob", mode: "regular", task: "learn me" }), putJob: (st) => puts.push(st), loadJobs: () => ({}),
+      propose: async () => { throw new AccessError('access revoked by user (session "chrome")'); },
+    });
+    assert(r.verdict.verdict === "fail" && r.blocker === "access_revoked" && puts.length === 0 && !(r.learned && r.learned.error), "an AccessError during learning fails the run with access_revoked and advances no job history");
+  }
+
   console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll agent access tests passed.");
   process.exit(failures ? 1 : 0);
 })();

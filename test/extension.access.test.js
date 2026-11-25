@@ -46,7 +46,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   B.configure({ sessionName: async () => "work-chrome" });
   let a = await B.readAccess();
   assert(a.granted === false && a.exists === false, "absent record → revoked, exists:false");
-  for (const bad of [{ granted: true, until: "soon" }, { granted: true, until: 0 }, { granted: true, until: Date.now() - 1 }, { granted: "true", until: null }, { granted: true }, "junk", 7, { granted: true, until: NaN }]) {
+  for (const bad of [{ granted: true, until: "soon" }, { granted: true, until: 0 }, { granted: true, until: Date.now() - 1 }, { granted: "true", until: null }, { granted: true }, "junk", 7]) {
     await S.chrome.storage.local.set({ access: bad });
     assert((await B.readAccess()).granted === false, `malformed record ${JSON.stringify(bad)} → revoked`);
   }
@@ -213,6 +213,90 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(rr.unidentifiedTabs === 1 && (await S.chrome.storage.session.get("pendingTabs")).pendingTabs.length === 0 && /1 tab\(s\) the agent may have opened could not be identified/.test((await B.notices()).join()), "reconcile: pending tab dropped and counted, never guessed");
   await B.dismissNotices();
 
+  // ---- review fixes (Astra on access-switch) --------------------------------
+  B.configure({ onRevoke: async () => { calls.push("detach"); }, send: () => {}, badge: () => {}, sessionName: async () => "chrome" });
+  // (1) remote closeTabs is generation-aware: a revoke during its ownership read stops it
+  await B.setAccess({ granted: true }); let g7 = B.currentGen();
+  await S.chrome.storage.session.set({ agentTabs: [400] });
+  S.mem.pauseNext("session", "get");
+  const closing = B.closeOwnedTabs([400], { gen: g7 });
+  await sleep(5);
+  await B.setAccess({ granted: false });
+  S.mem.resume();
+  err = await closing.then(() => null, (e) => e.message);
+  assert(/^access_revoked:/.test(err) && !S.removed.includes(400), "remote closeTabs: revoke during the ownership read → access_revoked, tab untouched");
+  assert(JSON.stringify((await B.closeOwnedTabs([400])).closed) === "[400]", "trusted closeTabs (popup/revoke path, no gen) still closes");
+  // (2) completeTab / completeDownload re-check the generation after their storage read
+  await B.setAccess({ granted: true }); g7 = B.currentGen();
+  let nonce = await B.beginTab({ gen: g7, origin: "https://a.example" });
+  S.mem.pauseNext("local", "get"); // the completion's access read is in flight: its reply (granted) is delivered after the revoke completed
+  const completing = B.completeTab(nonce, 401);
+  await sleep(5);
+  await B.setAccess({ granted: false });
+  S.mem.resume();
+  assert((await completing) === false && S.removed.includes(401) && !(await B.agentTabIds()).includes(401), "completeTab: a revoke completing during its access read → tab closed, not adopted");
+  await B.setAccess({ granted: true }); g7 = B.currentGen();
+  nonce = await B.beginDownload({ gen: g7, origin: "https://d.example" });
+  S.downloads.items.push({ id: 30, state: "in_progress", byExtensionId: "ext-id", startTime: new Date().toISOString() });
+  S.mem.pauseNext("local", "get", { skip: 2 }); // pending read, ownership read pass; the access read parks
+  const completingD = B.completeDownload(nonce, 30);
+  await sleep(5);
+  await B.setAccess({ granted: false });
+  S.mem.resume();
+  assert((await completingD) === false && S.downloads.cancelled.includes(30), "completeDownload: a revoke completing during its access read → not adopted, download cancelled");
+  // (3) a failed revoke write still denies
+  await B.setAccess({ granted: true }); g7 = B.currentGen();
+  calls.length = 0;
+  S.mem.failNext("local");
+  const failedRevoke = await B.setAccess({ granted: false }).then(() => "ok", (e) => `threw: ${e.message}`);
+  const g8 = B.currentGen();
+  err = await B.assertAccess(g8).then(() => null, (e) => e.message);
+  assert(/^access_revoked:/.test(err), `failed revoke write: the new generation is still denied (${failedRevoke})`);
+  err = await B.dispatch(g8, () => "ran").then((v) => v, (e) => e.message);
+  assert(/^access_revoked:/.test(err), "failed revoke write: dispatch refuses");
+  assert(calls.includes("detach"), "failed revoke write: cleanup (detach) still ran");
+  err = await B.assertAccess(g7).then(() => null, (e) => e.message);
+  assert(/^access_revoked:/.test(err), "failed revoke write: the old generation is denied too");
+  // (3b) a record whose gen does not match the in-memory generation is revoked
+  await B.setAccess({ granted: true }); g7 = B.currentGen();
+  await S.chrome.storage.local.set({ access: { granted: true, until: null, gen: g7 - 1 } });
+  err = await B.assertAccess(g7).then(() => null, (e) => e.message);
+  assert(/^access_revoked:/.test(err), "a stored record with a stale gen reads as revoked");
+  // (4) access-set parsing: JSON transport turns NaN into null; a timed request must not become indefinite
+  assert(B.parseAccessSet({ granted: true, until: null }).until === null && B.parseAccessSet({ granted: true, until: null }).granted === true, "parseAccessSet: indefinite grant");
+  const rt = JSON.parse(JSON.stringify({ granted: true, until: NaN, timed: true }));
+  assert(B.parseAccessSet(rt).error && !B.parseAccessSet(rt).granted, "parseAccessSet: timed request with until lost in transport → error, no grant");
+  assert(B.parseAccessSet({ granted: true, until: Date.now() + 1000, timed: true }).granted === true, "parseAccessSet: timed grant");
+  assert(B.parseAccessSet({ granted: true, until: 5, timed: true }).error, "parseAccessSet: timed grant in the past → error");
+  assert(B.parseAccessSet({ granted: false, until: null }).granted === false && !B.parseAccessSet({ granted: false }).error, "parseAccessSet: revoke");
+  assert(B.parseAccessSet({ granted: true, until: null, timed: true }).error, "parseAccessSet: timed:true with null until → error");
+  // (5) startup: pending downloads are reconciled before the revoke sweep, and an already-revoked start cancels in-progress bridge downloads
+  const st5 = Date.now() - 500;
+  await S.chrome.storage.local.set({ access: { granted: true, until: Date.now() - 1, gen: 60 }, pendingDownloads: [{ nonce: "q", gen: 60, origin: "o", startedAt: st5 }], bridgeDownloads: {} });
+  S.downloads.items.push({ id: 20, state: "in_progress", byExtensionId: "ext-id", startTime: new Date(st5 + 5).toISOString() });
+  await B.init();
+  assert((await B.readAccess()).granted === false && S.downloads.cancelled.includes(20), "init: a pending download recovered at an expired-grant startup is cancelled");
+  await S.chrome.storage.local.set({ access: { granted: false, until: null, gen: 61 }, bridgeDownloads: { 21: { gen: 60 } }, pendingDownloads: [] });
+  S.downloads.items.push({ id: 21, state: "in_progress", byExtensionId: "ext-id", startTime: new Date().toISOString() });
+  await B.init();
+  assert(S.downloads.cancelled.includes(21), "init: an already-revoked start still cancels in-progress bridge downloads");
+  // (6) a failed access read invalidates the cached authorisation
+  await B.setAccess({ granted: true }); g7 = B.currentGen(); await B.assertAccess(g7);
+  S.mem.failNext("local");
+  await B.readAccess();
+  err = await B.dispatch(g7, () => "ran").then((v) => v, (e) => e.message);
+  assert(/^access_revoked:/.test(err), "dispatch refuses after a failed access read");
+  // (9) a stale expiry alarm whose read overlaps a renewal never revokes the renewed grant
+  await B.setAccess({ granted: true, until: Date.now() + 3600e3 }); const gA = B.currentGen();
+  S.mem.pauseNext("local", "get");
+  const alarmP = B.onAlarm(`access-expiry-${gA}`);
+  await sleep(5);
+  const renew = B.setAccess({ granted: true });
+  await sleep(5);
+  S.mem.resume();
+  await alarmP; await renew;
+  assert((await B.readAccess()).granted === true, "an alarm racing a renewal cannot revoke the renewed grant");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
@@ -247,6 +331,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/BridgeAccess\.beginTab\(/.test(src) && /BridgeAccess\.completeTab\(/.test(src) && /BridgeAccess\.beginDownload\(/.test(src) && /BridgeAccess\.completeDownload\(/.test(src), "newTab/download use pending entries");
   assert(/TYPE_CHUNK = 20/.test(src), "direct type is chunked from the worker");
   assert(/access-expiry-/.test(src) && /BridgeAccess\.onAlarm\(/.test(src), "expiry alarms routed to BridgeAccess.onAlarm");
+  assert(/async function dbg\(tabId, method, params, gen\) \{\s*await BridgeAccess\.assertAccess\(gen\);/.test(src), "every debugger command re-reads access before its synchronous dispatch");
+  assert(/case "closeTabs":[\s\S]*?closeOwnedTabs\(p\.tabIds, \{ gen \}\)/.test(src), "remote closeTabs passes its generation");
+  assert(/parseAccessSet\(/.test(src), "access-set goes through parseAccessSet");
 
   // ---- Task 5: popup and Options --------------------------------------------
   const pop = fs.readFileSync(path.join(__dirname, "..", "extension", "popup.js"), "utf8");

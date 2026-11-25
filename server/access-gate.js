@@ -73,20 +73,27 @@ function createAccessGate({ ping = defaultPing, intervalMs = 10000, timeoutMs = 
     return reply;
   }
 
+  let failed = null; // terminal: once access is lost, every later check fails without pinging
+  const latch = async (fn) => { if (failed) throw failed; try { return await fn(); } catch (e) { if (e instanceof AccessError) failed = e; throw e; } };
   const gate = {
     get identity() { return identity; },
-    async preflight() {
-      const r = await probe();
-      if (!r) throw new AccessError("ping timed out");
-      identity = { serverId: r.serverId, extGen: r.extGen, accessGen: r.accessGen, session: typeof r.session === "string" ? r.session : "chrome" };
-      return { ...identity };
+    get failed() { return failed; },
+    preflight() {
+      return latch(async () => {
+        const r = await probe();
+        if (!r) throw new AccessError("ping timed out");
+        identity = { serverId: r.serverId, extGen: r.extGen, accessGen: r.accessGen, session: typeof r.session === "string" ? r.session : "chrome" };
+        return { ...identity };
+      });
     },
-    async check() {
-      if (!identity) return gate.preflight().then(() => undefined);
-      const r = await probe();
-      if (!r) return; // one tolerated timeout
-      const changed = ["serverId", "extGen", "accessGen"].filter((k) => r[k] !== identity[k]);
-      if (changed.length) throw new AccessError(`identity changed (${changed.join(", ")})`);
+    check() {
+      return latch(async () => {
+        if (!identity) { await gate.preflight(); return; }
+        const r = await probe();
+        if (!r) return; // one tolerated timeout
+        const changed = ["serverId", "extGen", "accessGen"].filter((k) => r[k] !== identity[k]);
+        if (changed.length) throw new AccessError(`identity changed (${changed.join(", ")})`);
+      });
     },
     intervalMs,
   };
@@ -104,21 +111,21 @@ async function withAccess(gate, run, opts = {}) {
     else opts.signal.addEventListener("abort", () => controller.abort(), { once: true });
   }
   let failure = null;
-  let checking = false;
+  let inflight = null; // the poll in progress, settled before withAccess returns
   const timer = setInterval(() => {
-    if (checking || failure) return;
-    checking = true;
-    gate.check().catch((e) => { failure = e instanceof AccessError ? e : new AccessError(String(e && e.message || e)); controller.abort(); }).finally(() => { checking = false; });
+    if (inflight || failure) return;
+    inflight = gate.check()
+      .catch((e) => { failure = e instanceof AccessError ? e : new AccessError(String(e && e.message || e)); controller.abort(); })
+      .finally(() => { inflight = null; });
   }, gate.intervalMs);
-  try {
-    return await run({ ...opts, signal: controller.signal });
-  } catch (e) {
-    if (failure) throw failure;
-    throw e;
-  } finally {
-    clearInterval(timer);
-    if (failure) throw failure;
-  }
+  let result, error = null, threw = false;
+  try { result = await run({ ...opts, signal: controller.signal }); }
+  catch (e) { threw = true; error = e; }
+  clearInterval(timer);
+  if (inflight) await inflight; // a poll that started before the child finished still counts
+  if (failure) throw failure;
+  if (threw) throw error;
+  return result;
 }
 
 // Tests only: AI_BRIDGE_NO_ACCESS_GATE=1 makes the default gate a pass-through

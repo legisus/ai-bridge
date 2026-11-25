@@ -204,8 +204,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg && msg.type) {
       case "access-set": {
-        const rec = await BridgeAccess.setAccess({ granted: msg.granted === true, until: msg.until == null ? null : msg.until, closeTabs: msg.closeTabs === true, source: msg.source || "popup" });
-        return { ok: true, access: rec };
+        const req = BridgeAccess.parseAccessSet(msg);
+        if (req.error) return { ok: false, error: req.error };
+        const rec = await BridgeAccess.setAccess({ ...req, source: msg.source || "popup" });
+        return { ok: !rec.error, access: rec, ...(rec.error ? { error: rec.error } : {}) };
       }
       case "access-get": {
         const st = await BridgeAccess.status();
@@ -255,7 +257,10 @@ async function dbgAttach(tabId, gen) {
 chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); lastActivity.delete(src.tabId); setIndicator(src.tabId, false); } });
 chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); lastActivity.delete(tabId); BridgeAccess.forgetAgentTab(tabId); });
 
-function dbg(tabId, method, params, gen) {
+// Every debugger command: a fresh access read (an await has always preceded
+// it) immediately followed by the synchronous dispatch check and the call.
+async function dbg(tabId, method, params, gen) {
+  await BridgeAccess.assertAccess(gen);
   return BridgeAccess.dispatch(gen, () => chrome.debugger.sendCommand({ tabId }, method, params || {}));
 }
 
@@ -668,7 +673,7 @@ async function handle(cmd, p, gen) {
       // Run cleanup / `bridge closeTabs`: closes only tabs this extension
       // opened (agentTabs); every other id comes back as skipped. No window
       // removal — a window that becomes empty is closed by Chrome itself.
-      return await BridgeAccess.closeOwnedTabs(p.tabIds);
+      return await BridgeAccess.closeOwnedTabs(p.tabIds, { gen });
 
     case "eval": {
       // Direct mode: chrome.userScripts.execute in the MAIN world (no CDP).

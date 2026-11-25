@@ -68,33 +68,72 @@
     async readAccess() {
       let raw;
       try { raw = (await chrome.storage.local.get("access")).access; }
-      catch (e) { hooks.log(`access read failed: ${e && e.message}`); return { granted: false, until: null, gen: accessGen, exists: true, error: true }; }
-      lastRecord = normalizeRecord(raw);
-      return lastRecord;
+      catch (e) {
+        hooks.log(`access read failed: ${e && e.message}`);
+        lastRecord = { granted: false, until: null, gen: accessGen, exists: true, error: true }; // a failed read never leaves a cached grant behind
+        return lastRecord;
+      }
+      const rec = normalizeRecord(raw);
+      // A record from an earlier generation (a write that never landed, a stale
+      // snapshot) is not this generation's grant.
+      if (rec.exists && accessGen !== 0 && rec.gen !== accessGen) { rec.granted = false; rec.until = null; rec.stale = true; }
+      lastRecord = rec;
+      return rec;
     },
 
     // The transition. A grant whose `until` is not null or a finite future
     // number is treated as a revoke: nothing malformed ever grants.
-    setAccess({ granted, until = null, closeTabs = false, source = "popup" } = {}) {
+    // `ifGen`: only transition if the stored record still has that generation
+    // and is granted (the expiry alarm); otherwise return the current record
+    // untouched with `skipped: true`. The condition is evaluated inside the
+    // serialised queue, so a renewal that landed first wins.
+    setAccess({ granted, until = null, closeTabs = false, source = "popup", ifGen } = {}) {
       const now = Date.now();
       const ok = granted === true && (until === null || (typeof until === "number" && Number.isFinite(until) && until > now));
       const run = async () => {
+        if (ifGen !== undefined) {
+          let raw; try { raw = (await chrome.storage.local.get("access")).access; } catch { raw = null; }
+          if (!raw || typeof raw !== "object" || raw.gen !== ifGen || raw.granted !== true || ifGen !== accessGen) return { ...lastRecord, skipped: true };
+        }
         const gen = ++accessGen;
         let release;
         transition = new Promise((r) => { release = r; });
         const record = { granted: ok, until: ok ? until : null, gen };
+        // Deny in memory before the write: a command racing this transition
+        // sees the new generation whatever happens to storage.
+        lastRecord = { ...record, exists: true };
+        let writeError = null;
         try {
-          await chrome.storage.local.set({ access: record });
-          lastRecord = { ...record, exists: true };
-          if (ok) await grantSteps(record);
-          else await revokeSteps(record, closeTabs);
-          hooks.log(`access ${ok ? "granted" : "revoked"} (gen ${gen}, source ${source})`);
+          try { await chrome.storage.local.set({ access: record }); }
+          catch (e) { writeError = e; hooks.log(`access write failed: ${e && e.message}`); }
+          if (ok && !writeError) await grantSteps(record);
+          else {
+            // A revoke whose write failed still revokes (the memory latch and the
+            // gen mismatch deny every command); a grant whose write failed is
+            // not a grant.
+            if (ok && writeError) { record.granted = false; record.until = null; lastRecord = { ...record, exists: true }; }
+            await revokeSteps(record, closeTabs);
+          }
+          hooks.log(`access ${record.granted ? "granted" : "revoked"} (gen ${gen}, source ${source}${writeError ? ", storage write failed" : ""})`);
         } finally { release(); }
-        return record;
+        return writeError ? { ...record, error: "storage write failed" } : record;
       };
       const p = transitionQueue.then(run, run);
       transitionQueue = p.catch(() => {});
       return p;
+    },
+
+    // The popup/Options request, after JSON transport (NaN → null): a timed
+    // request must say so, or a lost `until` would become an indefinite grant.
+    parseAccessSet(msg) {
+      if (!msg || typeof msg !== "object") return { error: "bad request" };
+      if (msg.granted !== true) return { granted: false, until: null, closeTabs: msg.closeTabs === true };
+      if (msg.timed === true) {
+        if (typeof msg.until !== "number" || !Number.isFinite(msg.until) || msg.until <= Date.now()) return { error: "invalid until for a timed grant" };
+        return { granted: true, until: msg.until, closeTabs: false };
+      }
+      if (msg.until !== null && msg.until !== undefined) return { error: "a timed grant must set timed:true" };
+      return { granted: true, until: null, closeTabs: false };
     },
 
     // gen check → await transition → read storage → gen check again.
@@ -125,11 +164,8 @@
     async onAlarm(name) {
       const m = /^access-expiry-(\d+)$/.exec(String(name || ""));
       if (!m) return false;
-      const gen = Number(m[1]);
-      let raw; try { raw = (await chrome.storage.local.get("access")).access; } catch { return false; }
-      if (!raw || typeof raw !== "object" || raw.gen !== gen || raw.granted !== true) return false;
-      await this.setAccess({ granted: false, source: "alarm" });
-      return true;
+      const rec = await this.setAccess({ granted: false, source: "alarm", ifGen: Number(m[1]) });
+      return !rec.skipped;
     },
     // After any reload, update or install: revoked, and the user is told why.
     async onInstalled() {
@@ -144,13 +180,17 @@
       if (storedGen > accessGen) accessGen = storedGen;
       const a = normalizeRecord(raw);
       lastRecord = a;
+      // Ownership first, so a download recovered from a pending entry is known
+      // to the revoke/sweep that follows.
+      if (typeof this.reconcileOwnership === "function") await this.reconcileOwnership();
       if (raw && typeof raw === "object" && raw.granted === true && !a.granted) {
         await this.setAccess({ granted: false, source: "startup" }); // expired while the worker was away
-      } else if (a.granted && a.until !== null) {
+      } else if (!a.granted) {
+        if (typeof this.cancelBridgeDownloads === "function") await this.cancelBridgeDownloads(); // revoked start: nothing of ours may keep running
+      } else if (a.until !== null) {
         const have = (await chrome.alarms.getAll().catch(() => [])).some((x) => x.name === `access-expiry-${a.gen}`);
         if (!have) await chrome.alarms.create(`access-expiry-${a.gen}`, { when: a.until }).catch((e) => hooks.log(`alarm recreate failed: ${e && e.message}`));
       }
-      if (typeof this.reconcileOwnership === "function") await this.reconcileOwnership();
     },
 
     // ---- notices (popup) ----------------------------------------------------
@@ -185,8 +225,12 @@
         return e;
       });
       const gen = entry ? entry.gen : -1;
-      const live = gen === accessGen && (await this.readAccess()).granted;
-      if (live && Number.isInteger(tabId)) { await this.rememberAgentTab(tabId); return true; }
+      const liveNow = async () => { await transition; const a = await this.readAccess(); return gen === accessGen && a.granted && (a.until === null || Date.now() < a.until); };
+      if (Number.isInteger(tabId) && (await liveNow())) {
+        await this.rememberAgentTab(tabId);
+        if (gen === accessGen && lastRecord.granted) return true; // the write landed under the same generation
+        await this.forgetAgentTab(tabId);
+      }
       if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); } catch {} }
       return false;
     },
@@ -206,12 +250,13 @@
         return e;
       });
       const gen = entry ? entry.gen : -1;
-      const live = gen === accessGen && (await this.readAccess()).granted;
-      if (live && Number.isInteger(downloadId)) {
+      const liveNow = async () => { await transition; const a = await this.readAccess(); return gen === accessGen && a.granted && (a.until === null || Date.now() < a.until); };
+      if (Number.isInteger(downloadId)) {
+        // Record ownership first (so a revoke's sweep can find it), then decide.
         await withDownloads(async () => { const m = await readMap("bridgeDownloads"); m[downloadId] = { gen }; await chrome.storage.local.set({ bridgeDownloads: m }); });
-        return true;
+        if ((await liveNow()) && gen === accessGen) return true;
+        try { await chrome.downloads.cancel(downloadId); } catch {}
       }
-      if (Number.isInteger(downloadId)) { try { await chrome.downloads.cancel(downloadId); } catch {} }
       return false;
     },
     // Every bridge download of this browser session (all grants) still running
@@ -302,14 +347,26 @@
     // Close the intersection of `tabIds` with agentTabs, one tab at a time;
     // everything else is reported as skipped. An id whose removal fails (the
     // user closed it already) is skipped too and forgotten.
-    async closeOwnedTabs(tabIds) {
+    // With `gen` (the remote closeTabs command) every removal is a dispatched
+    // browser operation: checked against the generation and the deadline right
+    // before the call. Without it (popup, revoke) the caller is trusted.
+    async closeOwnedTabs(tabIds, { gen } = {}) {
       const closed = [], skipped = [];
       if (!Array.isArray(tabIds)) return { closed, skipped };
+      const guard = async () => { if (gen === undefined) return; await this.assertAccess(gen); };
+      await guard();
       const own = await this.agentTabIds();
+      await guard();
       for (const id of tabIds) {
         if (!Number.isInteger(id) || !own.includes(id)) { skipped.push(id); continue; }
-        try { await chrome.tabs.remove(id); closed.push(id); }
-        catch { skipped.push(id); }
+        try {
+          if (gen === undefined) await chrome.tabs.remove(id);
+          else await this.dispatch(gen, () => chrome.tabs.remove(id));
+          closed.push(id);
+        } catch (e) {
+          if (gen !== undefined && /^access_/.test(String(e && e.message))) throw e;
+          skipped.push(id);
+        }
         await this.forgetAgentTab(id);
       }
       return { closed, skipped };

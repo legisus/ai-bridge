@@ -46,7 +46,7 @@ async function act(msg, done) {
 }
 
 $("grant").addEventListener("click", () => act({ type: "access-set", granted: true, until: null }, () => "access granted"));
-$("grant1h").addEventListener("click", () => act({ type: "access-set", granted: true, until: Date.now() + 3600e3 }, () => "access granted for 1 hour"));
+$("grant1h").addEventListener("click", () => act({ type: "access-set", granted: true, until: Date.now() + 3600e3, timed: true }, () => "access granted for 1 hour"));
 $("revoke").addEventListener("click", () => act({ type: "access-set", granted: false }, () => "access revoked"));
 $("revokeClose").addEventListener("click", () => act({ type: "access-set", granted: false, closeTabs: true }, () => "access revoked, agent tabs closed"));
 $("closeTabs").addEventListener("click", () => act({ type: "close-agent-tabs" }, (r) => `closed ${(r.closed || []).length} tab(s)`));

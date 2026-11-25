@@ -8,27 +8,39 @@ function stubChrome() {
   const pauses = {}; // `${area}:${op}` -> { promise, resolve }
   const fails = new Set();
   const tick = () => new Promise((r) => setImmediate(r));
-  const gate = async (area, op) => {
+  // pre: the call reaches the storage backend (may fail); post: the reply is
+  // delivered (may be delayed). A paused `get` therefore returns the value as
+  // it was when the call was processed — like Chrome, where a revoke landing
+  // while a read is in flight does not change what that read returns.
+  const pre = async (area) => {
     await tick();
     if (fails.has(area)) { fails.delete(area); throw new Error(`storage ${area} unavailable`); }
-    const key = `${area}:${op}`;
-    if (pauses[key]) { const p = pauses[key].promise; delete pauses[key]; await p; }
   };
+  const post = async (area, op) => {
+    const key = `${area}:${op}`;
+    const entry = pauses[key];
+    if (!entry) return;
+    if (entry.skip > 0) { entry.skip--; return; } // let the first N matching calls through
+    delete pauses[key];
+    await entry.promise;
+  };
+  const gate = async (area, op) => { await pre(area); await post(area, op); };
   const area = (name) => ({
     get: async (q) => {
-      await gate(name, "get");
+      await pre(name);
       const out = {};
       const keys = typeof q === "string" ? [q] : Array.isArray(q) ? q : Object.keys(q || {});
-      for (const k of keys) out[k] = k in mem[name] ? mem[name][k] : (q && typeof q === "object" && !Array.isArray(q) ? q[k] : undefined);
+      for (const k of keys) out[k] = k in mem[name] ? JSON.parse(JSON.stringify(mem[name][k])) : (q && typeof q === "object" && !Array.isArray(q) ? q[k] : undefined);
+      await post(name, "get");
       return out;
     },
     set: async (o) => { await gate(name, "set"); Object.assign(mem[name], o); },
     remove: async (k) => { await gate(name, "remove"); for (const key of Array.isArray(k) ? k : [k]) delete mem[name][key]; },
     clear: async () => { await gate(name, "clear"); mem[name] = {}; },
   });
-  mem.pauseNext = (areaName, op = "get") => {
+  mem.pauseNext = (areaName, op = "get", { skip = 0 } = {}) => {
     let resolve; const promise = new Promise((r) => { resolve = r; });
-    pauses[`${areaName}:${op}`] = { promise, resolve };
+    pauses[`${areaName}:${op}`] = { promise, resolve, skip };
     mem._resume = resolve;
   };
   mem.resume = () => { if (mem._resume) mem._resume(); mem._resume = null; };
