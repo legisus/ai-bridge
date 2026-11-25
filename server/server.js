@@ -136,6 +136,10 @@ function dispatch(req) {
   if (!PASS_ALWAYS.has(req.cmd) && accessState() !== "granted") {
     return finish(req, { kind: "refused", error: ext.access == null ? ACCESS_NOT_GRANTED(sessionName()) : ACCESS_REVOKED(sessionName()) });
   }
+  if (req.cmd === "closeTabs") {
+    const ids = req.params && req.params.tabIds;
+    if (!Array.isArray(ids) || !ids.every(Number.isInteger)) return finish(req, { kind: "refused", error: "closeTabs: tabIds must be an array of integers" });
+  }
   if (req.cmd === "newTab") {
     const p = req.params && typeof req.params === "object" ? req.params : {};
     registry.addPending({ reqId: req.id, runId: req.runId, client: req.client, origin: registry.originOf(p.url), createdAt: req.t0, browserSession: ext.access.browserSession });

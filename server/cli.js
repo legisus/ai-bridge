@@ -21,7 +21,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
-const { TOKEN_FILE } = require("./token");
+const { TOKEN_FILE, TABS_FILE } = require("./token");
 
 // Read lazily so usage/help work before the server ever ran, and a missing
 // token is a one-line explanation instead of a stack trace.
@@ -42,6 +42,7 @@ if (argv.length === 0) {
   console.error('       bridge agent "task description" [--timeout ms] [--verbose] [--job name]');
   console.error("       bridge snapshot '{\"tabId\":N}' [--debugger]   # DOM digest: text + interactive elements with selectors");
   console.error("       bridge journal [--days N] [--job name] [--json] | --trace <runId>");
+  console.error("       bridge tabs [--json] | bridge closeTabs --mine | --run <id> | --older-than <minutes>   # tabs the bridge opened");
   console.error("       bridge recipe propose|run|show <job> | validate|import <file>   # economy mode recipes");
   console.error("       bridge jobs [set <job> --mode regular|audit|economy --risk read|write] | reset <job>");
   console.error("       bridge claude-md [--project] [--print]   # teach Claude Code the bridge (writes CLAUDE.md)");
@@ -64,7 +65,7 @@ if (argv.length === 0) {
 // refused here, at the process boundary, and --out/--file are confined to the
 // run's outbox. Claude Code's tool allowlist is the first fence; this is the second.
 const RESTRICTED = process.env.AI_BRIDGE_RESTRICTED === "1";
-const RESTRICTED_DENY = new Set(["agent", "jobs", "recipe", "journal", "pairing", "channels", "claude-md", "download", "activateTab", "detachAll", "reloadExtension"]);
+const RESTRICTED_DENY = new Set(["agent", "jobs", "recipe", "journal", "pairing", "channels", "claude-md", "download", "activateTab", "detachAll", "reloadExtension", "tabs", "closeTabs"]);
 if (RESTRICTED && RESTRICTED_DENY.has(argv[0])) {
   console.error(`ERROR: restricted run: "${argv[0]}" is not available from a messenger task`);
   process.exit(7);
@@ -88,6 +89,27 @@ if (argv[0] === "agent") {
 
 // `bridge journal` — runs grouped by job signature; `--trace <runId>` dumps one run's commands.
 if (argv[0] === "journal") { require("./journal").main(argv.slice(1)); return; }
+
+// `bridge tabs` — the tabs the bridge opened, from the server-maintained
+// registry (AI_BRIDGE_HOME/tabs.json): current Chrome session first, then rows
+// left from an earlier session (dead: never acted on).
+if (argv[0] === "tabs") {
+  const { current, dead } = require("./tabs").openRegistry(TABS_FILE).list();
+  if (argv.includes("--json")) { process.stdout.write(JSON.stringify({ current, dead }) + "\n"); return; }
+  if (!current.length && !dead.length) { console.log("no bridge-opened tabs recorded"); return; }
+  const age = (t) => { const m = Math.max(0, Math.round((Date.now() - t) / 60000)); return m < 60 ? `${m}m` : m < 1440 ? `${Math.round(m / 60)}h` : `${Math.round(m / 1440)}d`; };
+  const table = (rows, withAge) => {
+    const head = withAge ? ["tabId", "age", "client", "run", "origin", "status"] : ["tabId", "client", "run", "origin"];
+    const lines = rows.map((r) => withAge ? [String(r.tabId), age(r.lastCmdAt), r.client, r.runId || "-", r.origin, r.status]
+      : [String(r.tabId), r.client, r.runId || "-", r.origin]);
+    const w = head.map((h, i) => Math.max(h.length, ...lines.map((l) => l[i].length)));
+    return [head, ...lines].map((l) => l.map((c, i) => (i === l.length - 1 ? c : c.padEnd(w[i]))).join("  ")).join("\n");
+  };
+  if (current.length) console.log(table(current, true));
+  else console.log("no bridge-opened tabs in the current Chrome session");
+  if (dead.length) console.log(`\nfrom an earlier Chrome session (not acted on, pruned on the next reconciliation):\n${table(dead, false)}`);
+  return;
+}
 // `bridge recipe …` / `bridge jobs …` — economy mode: deterministic replays + per-job state.
 if (argv[0] === "recipe") {
   require("./recipe-cli").main(argv.slice(1)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
@@ -98,6 +120,28 @@ if (argv[0] === "jobs") { require("./jobs").main(argv.slice(1)); return; }
 let cmd = argv[0];
 let params = {};
 const flags = {};
+// `bridge closeTabs --mine | --run <id> | --older-than <minutes>`: select ids
+// from the registry here, then send the ordinary closeTabs command (the
+// extension closes only what it owns). A JSON {"tabIds":[…]} argument takes
+// the generic path below.
+if (cmd === "closeTabs" && !argv.slice(1).some((a) => a.startsWith("{"))) {
+  const sel = {};
+  let n = 0;
+  const rest = [];
+  for (let i = 1; i < argv.length; i++) {
+    if (argv[i] === "--mine") { sel.client = clientLabel(); n++; }
+    else if (argv[i] === "--run") { sel.runId = String(argv[++i] || ""); n++; }
+    else if (argv[i] === "--older-than") { sel.olderThanMs = Number(argv[++i]) * 60000; n++; }
+    else rest.push(argv[i]);
+  }
+  if (n !== 1 || (sel.olderThanMs !== undefined && !Number.isFinite(sel.olderThanMs)) || (sel.runId !== undefined && !sel.runId)) {
+    console.error("usage: bridge closeTabs --mine | --run <runId> | --older-than <minutes> [--json] [--timeout ms]");
+    process.exit(2);
+  }
+  const tabIds = require("./tabs").openRegistry(TABS_FILE).select(sel);
+  if (!tabIds.length) { process.stdout.write(JSON.stringify({ closed: [], skipped: [] }) + "\n"); return; }
+  argv = [cmd, JSON.stringify({ tabIds }), ...rest.filter((a) => a !== "--json")];
+}
 for (let i = 1; i < argv.length; i++) {
   if (argv[i] === "--file") flags.file = argv[++i];
   else if (argv[i] === "--out") flags.out = argv[++i];

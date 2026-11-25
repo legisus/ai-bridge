@@ -169,6 +169,41 @@ const readReg = (relay) => JSON.parse(fs.readFileSync(path.join(relay.home, "tab
       console.log("SKIP  SIGKILL supervisor case (server/lease.js not yet present)");
     }
 
+    // ---- bridge tabs / bridge closeTabs (Task 8) --------------------------
+    ext = stale;
+    await cli(relay, ["newTab", '{"url":"https://mine.example/"}', "--timeout", "3000"], { env: { AI_BRIDGE_CLIENT: "me" } });
+    await cli(relay, ["newTab", '{"url":"https://other.example/"}', "--timeout", "3000"], { env: { AI_BRIDGE_CLIENT: "other" } });
+    let r = await cli(relay, ["tabs"]);
+    assert(r.code === 0 && /mine\.example/.test(r.stdout) && /other\.example/.test(r.stdout) && /\bme\b/.test(r.stdout) && /live/.test(r.stdout), "bridge tabs lists current rows with client and status");
+    r = await cli(relay, ["tabs", "--json"]);
+    assert(Array.isArray(r.json.current) && r.json.current.length === 2 && Array.isArray(r.json.dead), "bridge tabs --json");
+    r = await cli(relay, ["closeTabs", "--mine", "--timeout", "3000"], { env: { AI_BRIDGE_CLIENT: "me" } });
+    assert(r.code === 0 && r.json.closed.length === 1, "closeTabs --mine closes one tab");
+    r = await cli(relay, ["tabs"]);
+    assert(!r.stdout.includes("mine.example") && r.stdout.includes("other.example"), "closeTabs --mine closed only my tab");
+    r = await cli(relay, ["closeTabs", "--older-than", "1", "--timeout", "3000"]);
+    assert(r.code === 0 && r.json.closed.length === 0 && r.json.skipped.length === 0, "nothing older than a minute → empty result, no request");
+    r = await cli(relay, ["closeTabs", "--older-than", "0", "--timeout", "3000"]);
+    assert(r.code === 0 && r.json.closed.length === 1, "--older-than 0 selects the remaining tab");
+    await cli(relay, ["newTab", '{"url":"https://run.example/"}', "--timeout", "3000"], runEnv("runQ00000001"));
+    r = await cli(relay, ["closeTabs", "--run", "runQ00000001", "--timeout", "3000"]);
+    assert(r.code === 0 && r.json.closed.length === 1 && (await cli(relay, ["tabs", "--json"])).json.current.length === 0, "closeTabs --run closes the run's tab");
+    r = await cli(relay, ["closeTabs"]);
+    assert(r.code === 2 && /usage/.test(r.stderr), "closeTabs without a selector → usage");
+    r = await cli(relay, ["closeTabs", "--mine", "--run", "x"]);
+    assert(r.code === 2, "two selectors → usage");
+    r = await cli(relay, ["closeTabs", '{"tabIds":"nope"}', "--timeout", "3000"]);
+    assert(r.code === 1 && /tabIds must be an array of integers/.test(r.stderr), "server refuses malformed tabIds");
+    r = await cli(relay, ["closeTabs", '{"tabIds":[1, "2"]}', "--timeout", "3000"]);
+    assert(r.code === 1 && /tabIds must be an array of integers/.test(r.stderr), "server refuses a non-integer id");
+    await cli(relay, ["newTab", '{"url":"https://z.example/"}', "--timeout", "3000"], { env: { AI_BRIDGE_CLIENT: "me" } });
+    ext.sendAccess({ granted: false, until: null, gen: 22 }); await sleep(100);
+    r = await cli(relay, ["closeTabs", "--mine", "--timeout", "3000"], { env: { AI_BRIDGE_CLIENT: "me" } });
+    assert(r.code === 8, "closeTabs while revoked → exit 8 (gate unchanged)");
+    r = await cli(relay, ["tabs"]);
+    assert(r.code === 0 && /z\.example/.test(r.stdout), "bridge tabs works while revoked (reads the registry)");
+    ext.sendAccess({ granted: true, until: null, gen: 23 }); await sleep(100);
+
     console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll tab-hygiene tests passed.");
   } catch (e) {
     assert(false, `threw: ${e.stack}`);
