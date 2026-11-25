@@ -18,7 +18,7 @@ const { WebSocketServer } = require("ws");
 const fs = require("fs");
 const { TOKEN_FILE, LOG_FILE, ensureToken } = require("./token");
 const crypto = require("crypto");
-const { appendTrace } = require("./journal");
+const { appendTrace, safeRunId } = require("./journal");
 const { normalizeAccess, stateOf, ACCESS_REVOKED, ACCESS_NOT_GRANTED } = require("./access");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
@@ -47,15 +47,50 @@ const accessState = () => (ext ? stateOf(ext.access) : "not_granted");
 const sessionName = () => (ext && ext.access ? ext.access.session : "chrome");
 const extUp = () => !!(ext && ext.sock.readyState === 1);
 
-function answer(req, msg) {
-  pending.delete(req.id);
-  if (req.sock && req.sock.readyState === 1) req.sock.send(JSON.stringify(msg));
+// A client label for the log: AI_BRIDGE_CLIENT from the CLI (or its parent
+// process name), printable, at most 40 characters.
+function sanitizeClient(v) {
+  const c = String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 40);
+  return c || "cli";
 }
-// Answer every pending request of one extension generation that `filter` selects.
-function cancelPending(gen, filter, error) {
-  for (const r of [...pending.values()]) {
-    if (r.gen === gen && filter(r)) answer(r, { type: "response", id: r.id, ok: false, error });
+
+// The one place a request ends. Logs the terminal line, traces it when the
+// request belongs to a run, answers the CLI socket (if still open) or the
+// internal caller — exactly once per request, whatever the outcome:
+//   { kind: "done", ok, result?, error? }     forwarded result from the extension
+//   { kind: "refused", error }                local refusal (access, not connected)
+//   { kind: "cancelled", reason }             extension gone, superseded, revoked
+function finish(req, outcome) {
+  if (!pending.delete(req.id)) return; // already finished
+  const ms = Date.now() - req.t0;
+  const who = `${req.id} ${req.client} ${req.runId || "-"}`;
+  let ok = false, error, result;
+  if (outcome.kind === "done") {
+    ok = !!outcome.ok; result = ok ? outcome.result : undefined; error = ok ? undefined : String(outcome.error);
+    log(`${who} done ${ok ? "ok" : "fail"} ${ms}ms${ok ? "" : ` ${error.slice(0, 200)}`}`);
+  } else if (outcome.kind === "refused") {
+    error = outcome.error;
+    log(`${who} refused ${error.split(":")[0]}`);
+  } else {
+    error = outcome.reason;
+    log(`${who} cancelled ${error}`);
   }
+  if (req.runId) {
+    const as = req.meta && req.meta.as && typeof req.meta.as === "object" ? req.meta.as : null; // e.g. snapshot sent as eval
+    appendTrace(req.runId, {
+      ts: new Date(req.t0).toISOString(), reqId: req.id, client: req.client, outcome: outcome.kind,
+      job: req.meta && req.meta.job ? String(req.meta.job) : undefined,
+      cmd: as && as.cmd ? String(as.cmd) : req.cmd, params: as ? as.params : req.params,
+      ok, error, ms, result,
+    });
+  }
+  const msg = { type: "response", id: req.id, ok, ...(ok ? { result } : { error }) };
+  if (req.sock && req.sock.readyState === 1) req.sock.send(JSON.stringify(msg));
+  if (req.resolve) req.resolve({ ok, result, error });
+}
+// Cancel every pending request of one extension generation that `filter` selects.
+function cancelPending(gen, filter, reason) {
+  for (const r of [...pending.values()]) if (r.gen === gen && filter(r)) finish(r, { kind: "cancelled", reason });
 }
 function dropExtension(reason) {
   if (!ext) return;
@@ -96,14 +131,15 @@ wss.on("connection", (sock) => {
     }
 
     if (role === "cli" && msg.type === "request") {
+      // meta: { client, runId?, job?, as? } from the CLI (AI_BRIDGE_CLIENT, AI_BRIDGE_RUN_ID…).
       const meta = msg.meta && typeof msg.meta === "object" ? msg.meta : null;
-      const req = { id: msg.id, sock, cmd: msg.cmd, params: msg.params, meta, t0: Date.now(), gen: ext ? ext.gen : 0 };
+      const req = { id: String(msg.id), sock, cmd: msg.cmd, params: msg.params, meta, t0: Date.now(), gen: ext ? ext.gen : 0,
+        client: sanitizeClient(meta && meta.client), runId: meta ? safeRunId(meta.runId) : null };
       pending.set(req.id, req);
-      log(`cmd ${msg.cmd} ${JSON.stringify(msg.params || {}).slice(0, 200)}${meta && meta.runId ? ` run=${meta.runId}` : ""}`);
-      if (!extUp()) return answer(req, { type: "response", id: req.id, ok: false, error: "extension not connected" });
+      log(`${req.id} ${req.client} ${req.runId || "-"} cmd ${msg.cmd} ${JSON.stringify(msg.params || {}).slice(0, 200)}`);
+      if (!extUp()) return finish(req, { kind: "refused", error: "extension not connected" });
       if (!PASS_ALWAYS.has(msg.cmd) && accessState() !== "granted") {
-        const error = ext.access == null ? ACCESS_NOT_GRANTED(sessionName()) : ACCESS_REVOKED(sessionName());
-        return answer(req, { type: "response", id: req.id, ok: false, error });
+        return finish(req, { kind: "refused", error: ext.access == null ? ACCESS_NOT_GRANTED(sessionName()) : ACCESS_REVOKED(sessionName()) });
       }
       ext.sock.send(JSON.stringify({ type: "command", id: msg.id, cmd: msg.cmd, params: msg.params }));
       return;
@@ -128,30 +164,25 @@ wss.on("connection", (sock) => {
 
     if (role === "extension" && msg.type === "response") {
       if (!ext || sock !== ext.sock) return; // late answer from a superseded socket
-      const req = pending.get(msg.id);
+      const req = pending.get(String(msg.id));
       if (!req) return;
+      let result = msg.result;
       if (msg.ok && PASS_ALWAYS.has(req.cmd)) {
-        const base = msg.result && typeof msg.result === "object" ? msg.result : { value: msg.result };
-        msg.result = { ...base, session: sessionName(), access: accessState(), until: ext.access ? ext.access.until : null,
+        const base = result && typeof result === "object" ? result : { value: result };
+        result = { ...base, session: sessionName(), access: accessState(), until: ext.access ? ext.access.until : null,
           accessGen: ext.access ? ext.access.gen : 0, extGen: ext.gen, serverId };
       }
-      if (req.meta && req.meta.runId) {
-        const as = req.meta.as && typeof req.meta.as === "object" ? req.meta.as : null; // e.g. snapshot sent as eval
-        appendTrace(req.meta.runId, {
-          ts: new Date(req.t0).toISOString(), job: req.meta.job || undefined,
-          cmd: as && as.cmd ? String(as.cmd) : req.cmd, params: as ? as.params : req.params,
-          ok: !!msg.ok, error: msg.ok ? undefined : msg.error,
-          ms: Date.now() - req.t0, result: msg.ok ? msg.result : undefined,
-        });
-      }
-      answer(req, msg);
+      finish(req, { kind: "done", ok: !!msg.ok, result, error: msg.error });
       return;
     }
   });
 
   sock.on("close", () => {
     if (ext && sock === ext.sock) dropExtension("extension disconnected");
-    for (const [id, r] of pending) if (r.sock === sock) pending.delete(id);
+    // A CLI that went away only loses its answer; the request itself still
+    // finishes (and is logged, traced and, for newTab, recorded) when the
+    // extension responds.
+    for (const r of pending.values()) if (r.sock === sock) r.sock = null;
   });
 });
 

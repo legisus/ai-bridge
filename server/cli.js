@@ -154,6 +154,18 @@ if (cmd === "snapshot") {
 // command of the run to ~/.ai-browser-bridge/traces/<runId>.jsonl.
 if (process.env.AI_BRIDGE_RUN_ID) meta.runId = process.env.AI_BRIDGE_RUN_ID;
 if (process.env.AI_BRIDGE_JOB) meta.job = process.env.AI_BRIDGE_JOB;
+// Who is asking, for the server log and the tab registry: AI_BRIDGE_CLIENT, or
+// the parent process name (a launchd job and an interactive shell differ).
+meta.client = clientLabel();
+
+function clientLabel() {
+  if (process.env.AI_BRIDGE_CLIENT) return process.env.AI_BRIDGE_CLIENT;
+  if (process.platform === "win32") return "cli";
+  try {
+    const name = require("child_process").execFileSync("ps", ["-o", "comm=", "-p", String(process.ppid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return name ? path.basename(name) : "cli";
+  } catch { return "cli"; }
+}
 
 // Commands with no direct-mode equivalent — Page.printToPDF is CDP-only, so pdf
 // always needs the debugger (and thus approval).
@@ -201,14 +213,20 @@ function send() {
   ws.on("message", (data) => {
     const msg = JSON.parse(data);
     if (msg.type === "auth" && msg.ok) {
-      ws.send(JSON.stringify({ type: "request", id, cmd, params, ...(meta.runId ? { meta } : {}) }));
+      ws.send(JSON.stringify({ type: "request", id, cmd, params, meta }));
       return;
     }
     if (msg.type === "response" && msg.id === id) {
       clearTimeout(timer);
       // Exit 8 on the two access errors (the user has not granted, or has revoked,
       // the browser session) so callers can tell them from command failures.
-      if (!msg.ok) { console.error("ERROR:", msg.error); process.exit(isAccessError(msg.error) ? 8 : 1); }
+      // The request id is the correlation key: the server log and the run trace
+      // carry it, so "(req <id>)" is enough to find what happened on the other side.
+      if (!msg.ok) {
+        console.error(`ERROR: ${msg.error} (req ${id})`);
+        process.stdout.write(JSON.stringify({ error: msg.error, reqId: id }) + "\n", () => process.exit(isAccessError(msg.error) ? 8 : 1));
+        return;
+      }
       // Binary results (pdf/screenshot) can be written straight to a file.
       let out;
       if (flags.out && msg.result && msg.result.base64) {
