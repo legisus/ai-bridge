@@ -58,6 +58,10 @@ assert(J.summarize(withSessions).length === rows.length && J.summarize(withSessi
 const report = J.formatReport(rows, { days: 30 });
 assert(report.includes("* = economy-mode candidate") && /\*\s+4\s+75%/.test(report), "formatReport: marks candidate row");
 assert(J.formatReport([], { days: 7 }).includes("no agent runs"), "formatReport: empty");
+const leaky = J.summarize([rec({ job: "a", tabsRetained: 1 }), rec({ job: "a", tabsRetained: 0 }), rec({ job: "b", signature: "job:b" })]);
+assert(leaky.find((r) => r.signature === "job:a").tabsRetained === 1 && leaky.find((r) => r.signature === "job:b").tabsRetained === 0, "summarize: tabsRetained summed per job");
+const leakReport = J.formatReport(leaky, { days: 30 });
+assert(/tabs left/.test(leakReport) && /job:a/.test(leakReport.split("\n").find((l) => /\b1\s+job:a$/.test(l)) || ""), "formatReport: tabs left column shows retained tabs per job");
 
 // patchRun: the server updates a run's record in place (late tab closures)
 J.appendJournal(rec({ runId: "patchme", job: "p" }));

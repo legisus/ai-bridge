@@ -132,7 +132,7 @@ function summarize(records, { minPasses = CANDIDATE_MIN_PASSES } = {}) {
     const key = r.signature || signatureOf(r);
     if (!groups.has(key)) {
       groups.set(key, { signature: key, job: r.job || null, runs: 0, passes: 0, costUsd: 0,
-        inputTokens: 0, outputTokens: 0, lastRun: null, lastVerdict: null, modes: {}, example: r.task });
+        inputTokens: 0, outputTokens: 0, tabsRetained: 0, lastRun: null, lastVerdict: null, modes: {}, example: r.task });
     }
     const g = groups.get(key);
     g.runs++;
@@ -140,6 +140,7 @@ function summarize(records, { minPasses = CANDIDATE_MIN_PASSES } = {}) {
     g.costUsd += Number(r.costUsd) || 0;
     g.inputTokens += Number(r.inputTokens) || 0;
     g.outputTokens += Number(r.outputTokens) || 0;
+    g.tabsRetained += Number(r.tabsRetained) || 0;  // tabs a run left behind (bridge tabs)
     g.modes[r.mode || "regular"] = (g.modes[r.mode || "regular"] || 0) + 1;
     const t = r.endedAt || r.startedAt;
     if (!g.lastRun || Date.parse(t) > Date.parse(g.lastRun)) { g.lastRun = t; g.lastVerdict = r.verdict; }
@@ -158,7 +159,7 @@ function summarize(records, { minPasses = CANDIDATE_MIN_PASSES } = {}) {
 
 function formatReport(rows, { days }) {
   if (!rows.length) return `journal: no agent runs in the last ${days} days (${JOURNAL_FILE}).`;
-  const head = ["", "runs", "pass", "total $", "avg $", "avg tok", "last run", "signature"];
+  const head = ["", "runs", "pass", "total $", "avg $", "avg tok", "last run", "tabs left", "signature"];
   const lines = rows.map((r) => [
     r.candidate ? "*" : " ",
     String(r.runs),
@@ -167,6 +168,7 @@ function formatReport(rows, { days }) {
     r.avgCostUsd.toFixed(3),
     String(r.avgTokens),
     (r.lastRun || "").slice(0, 16).replace("T", " "),
+    String(r.tabsRetained || 0),
     r.signature.length > 70 ? r.signature.slice(0, 67) + "…" : r.signature,
   ]);
   const widths = head.map((h, i) => Math.max(h.length, ...lines.map((l) => l[i].length)));
