@@ -204,6 +204,72 @@ const readReg = (relay) => JSON.parse(fs.readFileSync(path.join(relay.home, "tab
     assert(r.code === 0 && /z\.example/.test(r.stdout), "bridge tabs works while revoked (reads the registry)");
     ext.sendAccess({ granted: true, until: null, gen: 23 }); await sleep(100);
 
+    // ---- review fixes --------------------------------------------------------
+    // (9) lastCmdAt is refreshed when a tab command is forwarded, not only when it succeeds
+    ext.close();
+    ext = await fakeExtension(relay, { browserSession: bs, hold: (cmd, p) => (cmd === "eval" && /hold/.test(String(p.code))) || (cmd === "closeTabs" && Array.isArray(p.tabIds) && p.tabIds.includes(1500)) });
+    await sleep(150);
+    const t9 = (await cli(relay, ["newTab", '{"url":"https://nine.example/"}', "--timeout", "3000"], { env: { AI_BRIDGE_CLIENT: "nine" } })).json.id;
+    const created9 = readReg(relay).tabs.find((x) => x.tabId === t9).lastCmdAt;
+    await sleep(30);
+    const heldEval = cli(relay, ["eval", JSON.stringify({ tabId: t9, code: "hold" }), "--timeout", "500"]);
+    await ext.waitFor("eval");
+    assert(readReg(relay).tabs.find((x) => x.tabId === t9).lastCmdAt > created9, "a pending command already refreshes lastCmdAt");
+    await heldEval;
+    await sleep(30);
+    const beforeFail = readReg(relay).tabs.find((x) => x.tabId === t9).lastCmdAt;
+    await cli(relay, ["newTab", '{"url":"https://fail.example/"}', "--timeout", "3000"]);
+    ext.close();
+    ext = await fakeExtension(relay, { browserSession: bs, agentTabs: [t9], handler: (cmd, p) => (cmd === "eval" ? { __error: "boom" } : cmd === "closeTabs" ? { closed: p.tabIds, skipped: [] } : cmd === "status" ? { agentTabs: [t9, 1500] } : cmd === "newTab" ? { id: 1500, windowId: 1 } : { pong: true }) });
+    await sleep(150);
+    await cli(relay, ["eval", JSON.stringify({ tabId: t9, code: "x" }), "--timeout", "3000"]);
+    assert(readReg(relay).tabs.find((x) => x.tabId === t9).lastCmdAt > beforeFail, "a failed command refreshes lastCmdAt too");
+
+    // (6) retained tabs can be closed explicitly once access is back
+    lease = await leaseSocket(relay, { runId: "runT00000001" });
+    await cli(relay, ["newTab", '{"url":"https://t.example/"}', "--timeout", "3000"], runEnv("runT00000001"));
+    ext.sendAccess({ granted: false, until: null, gen: 30 }); await sleep(100);
+    await lease.end();
+    assert(readReg(relay).tabs.find((x) => x.runId === "runT00000001").status === "retained", "run ended while revoked → retained");
+    ext.sendAccess({ granted: true, until: null, gen: 31 }); await sleep(150);
+    r = await cli(relay, ["closeTabs", "--run", "runT00000001", "--timeout", "3000"]);
+    assert(r.code === 0 && r.json.closed.length === 1 && !readReg(relay).tabs.some((x) => x.runId === "runT00000001"), "closeTabs --run closes a retained tab after re-grant");
+
+    // (3) a creation that completes while closeTabs is in flight is still cleaned up
+    ext.close();
+    let heldClose = null;
+    ext = await fakeExtension(relay, { browserSession: bs, hold: (cmd, p) => (cmd === "newTab" && /slow/.test(String(p.url))) || (cmd === "closeTabs" && !heldClose && (heldClose = true)) });
+    await sleep(150);
+    lease = await leaseSocket(relay, { runId: "runC00000001" });
+    const c1 = (await cli(relay, ["newTab", '{"url":"https://c.example/1"}', "--timeout", "3000"], runEnv("runC00000001"))).json.id;
+    const slowC = cli(relay, ["newTab", '{"url":"https://slow.example/c"}', "--timeout", "5000"], runEnv("runC00000001"));
+    const slowCCmd = await ext.waitFor("newTab");
+    const endP = lease.end(); // drain expires (300 ms) with the creation pending, then closeTabs [c1] goes out and is held
+    const firstClose = await ext.waitFor("closeTabs", { timeoutMs: 2000 });
+    assert(JSON.stringify(firstClose.params.tabIds) === JSON.stringify([c1]), "cleanup sends closeTabs for the tabs known at the deadline");
+    const secondCloseP = ext.waitFor("closeTabs", { timeoutMs: 2000 });
+    ext.respond(slowCCmd.id, { ok: true, result: { id: 905, windowId: 1 } }); ext.agentTabs.push(905);
+    await slowC;
+    ext.respond(firstClose.id, { ok: true, result: { closed: [c1], skipped: [] } });
+    const secondClose = await secondCloseP;
+    assert(JSON.stringify(secondClose.params.tabIds) === "[905]", "a creation completed during cleanup gets its own closeTabs before the run ends");
+    const ackC = await endP;
+    assert(ackC.tabs.opened === 2 && ackC.tabs.closed === 2 && !readReg(relay).tabs.some((x) => x.runId === "runC00000001"), "counts include the creation that completed during cleanup");
+
+    // (4) a late creation whose journal record does not exist yet is patched once the supervisor writes it
+    lease = await leaseSocket(relay, { runId: "runP00000001" });
+    const lateP = cli(relay, ["newTab", '{"url":"https://slow.example/p"}', "--timeout", "5000"], runEnv("runP00000001"));
+    const latePCmd = await ext.waitFor("newTab");
+    await lease.end();
+    const closeP = ext.waitFor("closeTabs", { timeoutMs: 2000 });
+    ext.respond(latePCmd.id, { ok: true, result: { id: 906, windowId: 1 } }); ext.agentTabs.push(906);
+    await lateP; await closeP; await sleep(100);
+    assert(!fs.existsSync(journalFile) || !fs.readFileSync(journalFile, "utf8").includes("runP00000001"), "no journal record yet for the late run");
+    fs.appendFileSync(journalFile, JSON.stringify({ runId: "runP00000001", startedAt: new Date().toISOString(), verdict: "pass", tabsOpened: 0, tabsClosed: 0 }) + "\n");
+    let patched = null;
+    for (let i = 0; i < 40 && !patched; i++) { await sleep(100); const rec = fs.readFileSync(journalFile, "utf8").trim().split("\n").map(JSON.parse).find((x) => x.runId === "runP00000001"); if (rec && rec.late) patched = rec; }
+    assert(patched && patched.tabsOpened === 1 && patched.tabsClosed === 1, "late patch is retried until the supervisor's record exists");
+
     console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll tab-hygiene tests passed.");
   } catch (e) {
     assert(false, `threw: ${e.stack}`);

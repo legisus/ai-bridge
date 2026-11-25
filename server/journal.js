@@ -87,9 +87,11 @@ function signatureOf({ job, task, domains }) {
   return `auto:${(domains || []).join(",")}|${normalizeTask(task)}`;
 }
 
+// Every journal writer takes the same lock: patchRun rewrites the file, so an
+// unlocked append could land between its read and its rename and be lost.
 function appendJournal(record) {
   ensureDir(DIR);
-  fs.appendFileSync(JOURNAL_FILE, JSON.stringify(record) + "\n");
+  withLock(JOURNAL_FILE, () => { fs.appendFileSync(JOURNAL_FILE, JSON.stringify(record) + "\n"); });
   return JOURNAL_FILE;
 }
 
@@ -200,7 +202,7 @@ function main(argv) {
     const t = readTrace(opts.trace);
     if (!t.length) { console.error(`no trace for run ${opts.trace} (${traceFile(opts.trace)})`); process.exit(1); }
     process.stdout.write(opts.json ? JSON.stringify(t, null, 2) + "\n"
-      : t.map((e) => `${e.ts || ""} ${e.reqId || "-"} ${String(e.ms || 0).padStart(5)}ms ${e.ok ? "ok  " : e.outcome === "refused" ? "REF " : e.outcome === "cancelled" ? "CAN " : "FAIL"} ${e.cmd} ${JSON.stringify(e.params || {}).slice(0, 140)}${e.error ? `  -> ${e.error}` : ""}`).join("\n") + "\n");
+      : t.map((e) => `${e.ts || ""} ${e.reqId || "-"} ${String(e.ms || 0).padStart(5)}ms ${e.ok ? "ok  " : e.outcome === "refused" ? "REF " : e.outcome === "cancelled" ? "CAN " : "FAIL"} ${e.cmd} ${JSON.stringify(e.params || {}).slice(0, 140)}${e.error ? `  -> ${String(e.error).replace(/\s*\r?\n\s*/g, " | ")}` : ""}`).join("\n") + "\n");
     return;
   }
   let records = readJournal({ days: opts.days });

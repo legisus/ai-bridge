@@ -58,6 +58,21 @@ function stubChrome() {
   assert(r.closed.length === 0 && JSON.stringify(r.skipped) === "[11]" && (await B.agentTabIds()).length === 0, "remove rejection → skipped and forgotten");
   await B.rememberAgentTab(12); await B.forgetAgentTab(12);
   assert((await B.agentTabIds()).length === 0, "forgetAgentTab");
+  // concurrent ownership updates must not lose tabs (read-modify-write race)
+  await S.chrome.storage.session.set({ agentTabs: [] });
+  await Promise.all([B.rememberAgentTab(20), B.rememberAgentTab(21), B.rememberAgentTab(22)]);
+  assert(JSON.stringify(await B.agentTabIds()) === "[20,21,22]", "concurrent rememberAgentTab keeps every tab");
+  await Promise.all([B.forgetAgentTab(21), B.rememberAgentTab(23)]);
+  assert(JSON.stringify(await B.agentTabIds()) === "[20,22,23]", "concurrent forget + remember: removed tab stays removed, new tab kept");
+  // malformed stored grants fail closed; only an absent record gets the slice-1 default
+  for (const bad of [{ granted: true, until: "broken" }, { granted: true }, { granted: "true", until: null }, { granted: true, until: NaN }, "junk", 7]) {
+    await S.chrome.storage.local.set({ access: bad });
+    assert((await B.accessMessage("c")).granted === false, `malformed stored access ${JSON.stringify(bad)} → not granted`);
+  }
+  await S.chrome.storage.local.set({ access: { granted: true, until: Date.now() + 60000, gen: 2 } });
+  assert((await B.accessMessage("c")).granted === true, "well-formed timed grant stays granted");
+  await S.chrome.storage.local.remove("access");
+  assert((await B.accessMessage("c")).granted === true, "absent record → slice-1 default (granted)");
   r = await B.closeOwnedTabs("nope");
   assert(r.closed.length === 0 && r.skipped.length === 0, "closeTabs with a non-array closes nothing");
 
@@ -68,6 +83,8 @@ function stubChrome() {
   assert(/rememberAgentTab\(/.test(src) && /forgetAgentTab\(/.test(src), "background.js records opened/closed tabs");
   assert(/accessMessage\(/.test(src) && /msg\.type === "auth"/.test(src), "background.js sends the access message after auth");
   assert(/session: "chrome"/.test(src), "DEFAULTS has the session name");
+  const closeTabCase = /case "closeTab":([\s\S]*?)return \{ ok: true \};/.exec(src);
+  assert(closeTabCase && /await assertAllowed\(p\.tabId\)/.test(closeTabCase[1]) && closeTabCase[1].indexOf("assertAllowed") < closeTabCase[1].indexOf("chrome.tabs.remove"), "closeTab checks the allowlist before removing a tab");
 
   console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll extension access tests passed.");
   process.exit(failures ? 1 : 0);

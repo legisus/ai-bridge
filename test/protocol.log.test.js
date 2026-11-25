@@ -61,9 +61,15 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
     await cli(relay, ["newTab", '{"url":"https://fail.example/"}', "--timeout", "3000"], { env });
     assert(/ unit test logrun0001 done fail \d+ms could not create$/m.test(fs.readFileSync(relay.logFile, "utf8")), "forwarded failure logs done fail <ms> <error>");
 
+    // a forwarded failure's text is not copied into bridge.log verbatim: no URL query, no second line
+    const ext3 = await fakeExtension(relay, { handler: (cmd) => (cmd === "eval" ? { __error: "ReferenceError: boom at https://x.example/p?token=SECRET\nPage text line with PRIVATE words" } : { pong: true }) });
+    void ext3;
+    r = await cli(relay, ["eval", '{"tabId":1,"code":"1"}', "--timeout", "3000"], { env });
+    const logAll = fs.readFileSync(relay.logFile, "utf8");
+    assert(r.code === 1 && /SECRET/.test(r.stderr) && /done fail \d+ms ReferenceError: boom at https:\/\/x\.example/.test(logAll) && !/SECRET|PRIVATE/.test(logAll), "failure log keeps the error class and origin, drops query strings and extra lines; CLI still gets the full error");
     const dump = (await cli(relay, ["journal", "--trace", "logrun0001"])).stdout;
     const dl = dump.split("\n").filter(Boolean);
-    assert(dl.length === 5 && dump.includes(reqId) && /REF  newTab/.test(dump) && /CAN  eval/.test(dump) && /FAIL newTab/.test(dump), "bridge journal --trace prints reqId and outcome");
+    assert(dl.length === 6 && dump.includes(reqId) && /REF  newTab/.test(dump) && /CAN  eval/.test(dump) && /FAIL newTab/.test(dump), "bridge journal --trace prints reqId and outcome");
   } catch (e) {
     assert(false, `threw: ${e.stack}`);
   } finally {

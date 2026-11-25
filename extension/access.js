@@ -24,6 +24,16 @@
   const isHex32 = (v) => typeof v === "string" && /^[0-9a-f]{32}$/.test(v);
   const DEFAULT_ACCESS = { granted: true, until: null, gen: 1 };
 
+  // agentTabs is a read-modify-write of one storage key; concurrent newTab /
+  // closeTab / onRemoved handlers would lose updates, so every mutation runs
+  // through one queue.
+  let tabsQueue = Promise.resolve();
+  const withTabs = (fn) => { const p = tabsQueue.then(fn, fn); tabsQueue = p.catch(() => {}); return p; };
+  const readTabs = async () => {
+    const { agentTabs } = await chrome.storage.session.get("agentTabs");
+    return Array.isArray(agentTabs) ? agentTabs.filter(Number.isInteger) : [];
+  };
+
   const BridgeAccess = {
     async ensureBrowserSession() {
       const { browserSession } = await chrome.storage.session.get("browserSession");
@@ -33,10 +43,16 @@
       return fresh;
     },
 
+    // Only an absent record gets the default; a present record is taken as
+    // stored and fails closed when any field has the wrong shape.
     async accessState() {
-      const { access } = await chrome.storage.local.get({ access: DEFAULT_ACCESS });
-      const a = access && typeof access === "object" ? access : DEFAULT_ACCESS;
-      return { granted: a.granted === true, until: typeof a.until === "number" ? a.until : null, gen: Number.isInteger(a.gen) ? a.gen : 0 };
+      const { access } = await chrome.storage.local.get("access");
+      const a = access === undefined ? DEFAULT_ACCESS : access;
+      const gen = a && Number.isInteger(a.gen) ? a.gen : 0;
+      if (!a || typeof a !== "object" || a.granted !== true) return { granted: false, until: null, gen };
+      if (a.until === null) return { granted: true, until: null, gen };
+      if (typeof a.until === "number" && Number.isFinite(a.until)) return { granted: true, until: a.until, gen };
+      return { granted: false, until: null, gen };
     },
 
     async accessMessage(session) {
@@ -44,18 +60,19 @@
       return { type: "access", session: session || "chrome", granted: a.granted, until: a.until, gen: a.gen, browserSession };
     },
 
-    async agentTabIds() {
-      const { agentTabs } = await chrome.storage.session.get("agentTabs");
-      return Array.isArray(agentTabs) ? agentTabs.filter(Number.isInteger) : [];
+    agentTabIds() { return withTabs(readTabs); },
+    rememberAgentTab(tabId) {
+      if (!Number.isInteger(tabId)) return Promise.resolve();
+      return withTabs(async () => {
+        const ids = await readTabs();
+        if (!ids.includes(tabId)) await chrome.storage.session.set({ agentTabs: [...ids, tabId] });
+      });
     },
-    async rememberAgentTab(tabId) {
-      if (!Number.isInteger(tabId)) return;
-      const ids = await this.agentTabIds();
-      if (!ids.includes(tabId)) await chrome.storage.session.set({ agentTabs: [...ids, tabId] });
-    },
-    async forgetAgentTab(tabId) {
-      const ids = await this.agentTabIds();
-      if (ids.includes(tabId)) await chrome.storage.session.set({ agentTabs: ids.filter((id) => id !== tabId) });
+    forgetAgentTab(tabId) {
+      return withTabs(async () => {
+        const ids = await readTabs();
+        if (ids.includes(tabId)) await chrome.storage.session.set({ agentTabs: ids.filter((id) => id !== tabId) });
+      });
     },
 
     // Close the intersection of `tabIds` with agentTabs, one tab at a time;

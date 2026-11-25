@@ -91,6 +91,11 @@ details such as titles, values, file paths>
 Screenshots: <paths, or "none">
 Blockers: <what stopped you, or "none">`;
 
+// Overrides the playbook's "close your window's tabs when finished" rule when
+// the user asked to keep them (--keep-tabs or the task's own wording).
+const KEEP_TABS_ADDENDUM = `KEEP TABS OPEN: the user asked to keep the tabs you open. Do NOT close any tab
+or window when you finish; leave them exactly as they are.`;
+
 function judgePrompt(task, evidence) {
   return `You are a strict verifier. A browser-operations agent was given this task:
 
@@ -523,7 +528,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     // --only: stay on the start rung (no escalation to pricier models on a fail)
     let rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
     if (restricted && !opts.codex) rungs = rungs.filter((r) => r.engine !== "codex");
-    const playbookExtra = restricted ? restrictedRun.PLAYBOOK_ADDENDUM : "";
+    const playbookExtra = [restricted ? restrictedRun.PLAYBOOK_ADDENDUM : "", keepTabs ? KEEP_TABS_ADDENDUM : ""].filter(Boolean).join("\n\n");
     const opsTools = restricted ? restrictedRun.allowedTools(SELF_CMD) : [`Bash(${SELF_CMD}:*)`];
     for (const rung of rungs) {
       const opsPrompt = [

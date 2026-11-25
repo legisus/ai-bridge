@@ -138,8 +138,12 @@ function mockRun(judgeVerdicts) {
     const m = mockRun(['{"verdict":"pass","feedback":"ok"}']); const L = mockLease();
     await runAgent("open the page and leave the tab open for me", {}, m.run, { openLease: L.open });
     assert(L.calls[0].open.keepTabs === true, "lease: 'leave the tab open' in the task → keepTabs");
-    const L2 = mockLease(); await runAgent("t", { keepTabs: true }, m.run, { openLease: L2.open });
+    const L2 = mockLease(); const m2 = mockRun(['{"verdict":"fail","feedback":"x"}', '{"verdict":"pass","feedback":"ok"}']);
+    await runAgent("t", { keepTabs: true }, m2.run, { openLease: L2.open });
     assert(L2.calls[0].open.keepTabs === true, "lease: --keep-tabs → keepTabs");
+    const ops = m2.calls.filter((c) => !c.prompt.includes("strict verifier"));
+    assert(ops.length === 2 && ops.every((c) => /KEEP TABS OPEN/.test(c.prompt)), "lease: --keep-tabs tells every ops rung to leave its tabs open");
+    assert(!m.calls.some((c) => /KEEP TABS OPEN/.test(c.prompt) && !/leave the tab open/.test(c.prompt)), "lease: without keepTabs the prompt keeps the close-your-tabs rule");
   }
   {
     const m = mockRun(['{"verdict":"pass","feedback":"ok"}']);

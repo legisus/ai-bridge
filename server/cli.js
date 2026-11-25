@@ -138,7 +138,7 @@ if (cmd === "closeTabs" && !argv.slice(1).some((a) => a.startsWith("{"))) {
     console.error("usage: bridge closeTabs --mine | --run <runId> | --older-than <minutes> [--json] [--timeout ms]");
     process.exit(2);
   }
-  const tabIds = require("./tabs").openRegistry(TABS_FILE).select(sel);
+  const tabIds = require("./tabs").openRegistry(TABS_FILE).select({ ...sel, includeRetained: true });
   if (!tabIds.length) { process.stdout.write(JSON.stringify({ closed: [], skipped: [] }) + "\n"); return; }
   argv = [cmd, JSON.stringify({ tabIds }), ...rest.filter((a) => a !== "--json")];
 }

@@ -13,7 +13,7 @@
 // its socket is the signal that does not depend on it.
 "use strict";
 
-function createRunManager({ registry, sendCommand, accessState, log, patchJournal, drainMs = 5000 }) {
+function createRunManager({ registry, sendCommand, accessState, log, patchJournal, drainMs = 5000, patchRetryMs = 500, patchRetries = 120 }) {
   const runs = new Map(); // runId -> { runId, client, keepTabs, sock, state, counts, ending }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const countsOf = (run) => ({ ...run.counts });
@@ -61,11 +61,16 @@ function createRunManager({ registry, sendCommand, accessState, log, patchJourna
       run.ending = (async () => {
         const deadline = Date.now() + drainMs;
         while (registry.pendingForRun(runId) > 0 && Date.now() < deadline) await sleep(50);
-        const ids = registry.rowsForRun(runId).map((r) => r.tabId);
-        if (run.keepTabs) run.counts.kept = ids.length;
-        else {
+        // A creation can complete while closeTabs is in flight: loop until no
+        // live row of the run is left, so nothing slips between the snapshot
+        // and the response.
+        for (let round = 0; round < 10; round++) {
+          const ids = registry.rowsForRun(runId).map((r) => r.tabId);
+          if (!ids.length) break;
+          if (run.keepTabs) { run.counts.kept = ids.length; break; }
           const r = await closeOrRetain(run, ids);
           run.counts.closed += r.closed; run.counts.retained += r.retained;
+          if (!r.closed) break; // nothing closable (not granted, or all skipped): stop here
         }
         run.state = "ended";
         const c = run.counts;
@@ -87,9 +92,15 @@ function createRunManager({ registry, sendCommand, accessState, log, patchJourna
         run.counts.closed += r.closed; run.counts.retained += r.retained;
         what = r.closed ? "closed" : "retained";
       }
-      const c = run.counts;
       log(`run ${runId} late tab ${tabId} ${what}`);
-      patchJournal(runId, { tabsOpened: c.opened, tabsClosed: c.closed, tabsRetained: c.retained, keptTabs: c.kept, late: true });
+      // The supervisor writes its record right after runEnd is acknowledged; a
+      // late creation can beat it, so keep trying for a while.
+      const c = run.counts;
+      for (let i = 0; i <= patchRetries; i++) {
+        if (patchJournal(runId, { tabsOpened: c.opened, tabsClosed: c.closed, tabsRetained: c.retained, keptTabs: c.kept, late: true })) return;
+        await sleep(patchRetryMs);
+      }
+      log(`run ${runId} late tab counters not journaled (no record for the run)`);
     },
 
     onSocketClose(sock) {

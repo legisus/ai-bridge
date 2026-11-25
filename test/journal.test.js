@@ -70,6 +70,12 @@ const got = J.readJournal().find((r) => r.runId === "patchme");
 assert(got.tabsClosed === 2 && got.late === true && got.job === "p", "patchRun merges into the record in place");
 assert(J.patchRun("nope", { x: 1 }) === false, "patchRun unknown run → false");
 assert(J.readJournal().filter((r) => r.runId === "patchme").length === 1, "patchRun does not duplicate the record");
+// every journal writer takes the same lock: with the lock held, appendJournal waits and gives up instead of writing
+fs.writeFileSync(J.JOURNAL_FILE + ".lock", String(process.pid));
+let appendBlocked = false;
+try { J.appendJournal(rec({ runId: "locked" })); } catch (e) { appendBlocked = /busy/.test(e.message); }
+fs.unlinkSync(J.JOURNAL_FILE + ".lock");
+assert(appendBlocked && !J.readJournal().some((r) => r.runId === "locked"), "appendJournal takes the journal lock");
 
 console.log(failures === 0 ? "\nAll journal tests passed." : `\n${failures} test(s) FAILED.`);
 process.exit(failures ? 1 : 0);

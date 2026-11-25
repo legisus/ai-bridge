@@ -38,7 +38,8 @@ assert(R.reconcile([]).dropped === 1 && R.list().current.length === 0, "reconcil
 R.addPending({ reqId: "r4", runId: "run3", client: "c", origin: "o", createdAt: 1, browserSession: bs2 });
 R.completePending("r4", 8);
 assert(R.markRetained("run3") === 1 && R.rowsForRun("run3").length === 0 && R.list().current[0].status === "retained", "markRetained");
-assert(R.select({ runId: "run3" }).length === 0, "retained rows are not selected for cleanup");
+assert(R.select({ runId: "run3" }).length === 0, "retained rows are not selected for automatic cleanup");
+assert(JSON.stringify(R.select({ runId: "run3", includeRetained: true })) === "[8]" && JSON.stringify(R.select({ client: "c", includeRetained: true })) === "[8]", "explicit selection can include retained rows");
 R.touch(8, 99);
 assert(R.list().current[0].lastCmdAt === 99, "touch works on retained rows");
 assert(R.remove([8, 9999]) === 1 && R.list().current.length === 0, "remove returns the count removed");

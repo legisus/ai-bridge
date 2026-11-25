@@ -74,7 +74,7 @@ function finish(req, outcome) {
   let ok = false, error, result;
   if (outcome.kind === "done") {
     ok = !!outcome.ok; result = ok ? outcome.result : undefined; error = ok ? undefined : String(outcome.error);
-    log(`${who} done ${ok ? "ok" : "fail"} ${ms}ms${ok ? "" : ` ${error.slice(0, 200)}`}`);
+    log(`${who} done ${ok ? "ok" : "fail"} ${ms}ms${ok ? "" : ` ${errorSummary(error)}`}`);
   } else if (outcome.kind === "refused") {
     error = outcome.error;
     log(`${who} refused ${error.split(":")[0]}`);
@@ -96,6 +96,14 @@ function finish(req, outcome) {
   if (req.sock && req.sock.readyState === 1) req.sock.send(JSON.stringify(msg));
   if (req.resolve) req.resolve({ ok, result, error });
 }
+// What of an extension error goes into bridge.log: the first line only, URLs cut
+// to their origin, 160 characters at most. The CLI and the run trace still get
+// the full string; the log is the durable record and must not collect page
+// text or query strings from an eval that threw.
+function errorSummary(error) {
+  return String(error).split(/\r?\n/)[0].replace(/\b(https?:\/\/[^\s/?#]+)[^\s]*/g, "$1").slice(0, 160);
+}
+
 // Registry bookkeeping on a request's terminal outcome. Creation records are
 // completed here whether or not the CLI that asked is still connected.
 function noteOutcome(req, ok, result) {
@@ -112,7 +120,6 @@ function noteOutcome(req, ok, result) {
     return;
   }
   if (!ok) return;
-  if (Number.isInteger(p.tabId)) registry.touch(p.tabId, Date.now());
   if (req.cmd === "closeTab" && Number.isInteger(p.tabId)) registry.remove([p.tabId]);
   else if (req.cmd === "closeTabs" && result && Array.isArray(result.closed)) registry.remove(result.closed);
   else if (req.cmd === "status" && result && Array.isArray(result.agentTabs)) registry.reconcile(result.agentTabs);
@@ -140,8 +147,9 @@ function dispatch(req) {
     const ids = req.params && req.params.tabIds;
     if (!Array.isArray(ids) || !ids.every(Number.isInteger)) return finish(req, { kind: "refused", error: "closeTabs: tabIds must be an array of integers" });
   }
+  const p = req.params && typeof req.params === "object" ? req.params : {};
+  if (Number.isInteger(p.tabId)) registry.touch(p.tabId, req.t0); // activity = a command was sent, whatever its outcome
   if (req.cmd === "newTab") {
-    const p = req.params && typeof req.params === "object" ? req.params : {};
     registry.addPending({ reqId: req.id, runId: req.runId, client: req.client, origin: registry.originOf(p.url), createdAt: req.t0, browserSession: ext.access.browserSession });
   }
   ext.sock.send(JSON.stringify({ type: "command", id: req.id, cmd: req.cmd, params: req.params }));

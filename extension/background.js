@@ -538,6 +538,9 @@ async function handle(cmd, p) {
     }
 
     case "closeTab":
+      // A user tab is subject to the allowlist like every other target; the
+      // bridge's own tabs were opened on allowed hosts anyway.
+      await assertAllowed(p.tabId);
       await chrome.tabs.remove(p.tabId);
       await BridgeAccess.forgetAgentTab(p.tabId);
       return { ok: true };

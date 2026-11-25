@@ -94,9 +94,11 @@ function openRegistry(file, { log = console.error } = {}) {
     rowsForRun(runId) { return current().filter((t) => t.runId === runId && t.status === "live"); },
 
     // ---- queries -----------------------------------------------------------
-    select({ client, runId, olderThanMs, now = Date.now() } = {}) {
+    // Automatic cleanup selects live rows only; an explicit `bridge closeTabs`
+    // (includeRetained) may also pick up tabs retained after a revoke.
+    select({ client, runId, olderThanMs, includeRetained = false, now = Date.now() } = {}) {
       if (client === undefined && runId === undefined && olderThanMs === undefined) return [];
-      return current().filter((t) => t.status === "live"
+      return current().filter((t) => (t.status === "live" || (includeRetained && t.status === "retained"))
         && (client === undefined || t.client === client)
         && (runId === undefined || t.runId === runId)
         && (olderThanMs === undefined || now - t.lastCmdAt > olderThanMs)).map((t) => t.tabId);
