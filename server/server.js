@@ -13,6 +13,10 @@ const { TOKEN_FILE, LOG_FILE, ensureToken } = require("./token");
 const { appendTrace } = require("./journal");
 
 const PORT = Number(process.env.BRIDGE_PORT || 8765);
+// Listen address. 127.0.0.1 unless the relay runs in a container, where the
+// compose file publishes the port on the host's loopback (docs/DOCKER.md).
+const BIND = process.env.BRIDGE_BIND || "127.0.0.1";
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
 
 function log(line) {
   const entry = `${new Date().toISOString()} ${line}\n`;
@@ -20,14 +24,17 @@ function log(line) {
   console.log(`[bridge] ${line}`);
 }
 
-function start() {
+function start({ port = PORT, bind = BIND } = {}) {
 const { token: TOKEN, created } = ensureToken();
 if (created) console.log(`[bridge] token generated at ${TOKEN_FILE} — the extension picks it up via the native host (npm run register-host), or paste it into Options`);
 
 let extension = null;                 // the single extension socket
 const pending = new Map();            // request id -> { sock, cmd, params, meta, t0 }
 
-const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT, maxPayload: 64 * 1024 * 1024 });
+const wss = new WebSocketServer({ host: bind, port, maxPayload: 64 * 1024 * 1024 });
+wss.on("listening", () => {
+  log(`listening on ws://${bind}:${wss.address().port}${LOOPBACK.has(bind) ? "" : " — make sure only the host's loopback can reach this port"}`);
+});
 
 wss.on("connection", (sock) => {
   let role = null;
@@ -89,7 +96,7 @@ wss.on("connection", (sock) => {
   });
 });
 
-log(`listening on ws://127.0.0.1:${PORT}`);
+return wss;
 }
 
 if (require.main === module) start();
