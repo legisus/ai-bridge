@@ -224,6 +224,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const closeTabCase = /case "closeTab":([\s\S]*?)return \{ ok: true \};/.exec(src);
   assert(closeTabCase && /assertAllowed\(p\.tabId\)/.test(closeTabCase[1]) && closeTabCase[1].indexOf("assertAllowed") < closeTabCase[1].indexOf("chrome.tabs.remove"), "closeTab checks the allowlist before removing a tab");
 
+  // ---- Task 4: worker wiring ------------------------------------------------
+  const man = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "extension", "manifest.json"), "utf8"));
+  assert(man.action && man.action.default_popup === "popup.html" && man.version === "0.1.11", "manifest: popup registered, version 0.1.11");
+  assert(/BridgeAccess\.configure\(\{[\s\S]*?onRevoke[\s\S]*?send[\s\S]*?badge[\s\S]*?sessionName/.test(src), "worker configures the access hooks");
+  assert(/await BridgeAccess\.init\(\)/.test(src), "worker runs init() at start");
+  assert(/sock\.onmessage = async \(ev\) => \{\s*if \(ws !== sock\) return;/.test(src), "messages from a superseded socket are dropped");
+  assert(/const gen = BridgeAccess\.currentGen\(\)/.test(src) && /await BridgeAccess\.assertAccess\(gen\)/.test(src) && /handle\(msg\.cmd, msg\.params \|\| \{\}, gen\)/.test(src), "every command captures gen and is checked before handle()");
+  assert(/PASS_ALWAYS = new Set\(\["ping", "status"\]\)/.test(src), "ping/status bypass present");
+  assert((src.match(/BridgeAccess\.dispatch\(gen, /g) || []).length >= 15, `browser operations go through dispatch(gen, …) (${(src.match(/BridgeAccess\.dispatch\(gen, /g) || []).length})`);
+  // Every browser operation line (comments and the indicator's own injection, which only adds/removes a frame, excluded) is a dispatch line.
+  const code = src.replace(/^\s*\/\/.*$/gm, "").replace(/async function setIndicator[\s\S]*?\n}\n/, "");
+  for (const re of [/chrome\.tabs\.create\(/, /chrome\.tabs\.update\(/, /chrome\.tabs\.remove\(/, /chrome\.debugger\.attach\(/, /chrome\.debugger\.sendCommand\(/, /chrome\.scripting\.executeScript\(/, /chrome\.userScripts\.execute\(/, /chrome\.downloads\.download\(/, /chrome\.tabs\.captureVisibleTab\(/, /chrome\.windows\.create\(/]) {
+    const lines = code.split("\n").filter((l) => re.test(l) && !/BridgeAccess\.dispatch/.test(l));
+    assert(lines.length === 0, `no bare ${re.source} outside dispatch (${lines.length} found)`);
+  }
+  assert(/case "reloadExtension":[\s\S]*?await BridgeAccess\.setAccess\(\{ granted: false, closeTabs: true, source: "reload" \}\)[\s\S]*?chrome\.runtime\.reload\(\)/.test(src), "reloadExtension revokes and closes agent tabs before reloading");
+  assert(/chrome\.runtime\.onInstalled\.addListener\([\s\S]*?BridgeAccess\.onInstalled\(\)/.test(src), "onInstalled → revoked");
+  assert(/chrome\.runtime\.onMessage\.addListener/.test(src) && /sender\.id === chrome\.runtime\.id/.test(src) && /startsWith\("chrome-extension:\/\/"\)/.test(src) && /unauthorised sender/.test(src), "runtime.onMessage validates the sender");
+  for (const t of ["access-set", "access-get", "close-agent-tabs", "dismiss-notices"]) assert(src.includes(`"${t}"`), `onMessage handles ${t}`);
+  assert(/manualMode/.test(src) && /chrome\.storage\.onChanged\.addListener/.test(src) && /source: "token-change"/.test(src), "manual mode and token-change revoke wired");
+  assert(/BridgeAccess\.beginTab\(/.test(src) && /BridgeAccess\.completeTab\(/.test(src) && /BridgeAccess\.beginDownload\(/.test(src) && /BridgeAccess\.completeDownload\(/.test(src), "newTab/download use pending entries");
+  assert(/TYPE_CHUNK = 20/.test(src), "direct type is chunked from the worker");
+  assert(/access-expiry-/.test(src) && /BridgeAccess\.onAlarm\(/.test(src), "expiry alarms routed to BridgeAccess.onAlarm");
+
   console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll extension access tests passed.");
   process.exit(failures ? 1 : 0);
 })();
