@@ -357,7 +357,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const code3 = src3.replace(/^\s*\/\/.*$/gm, "");
   assert(/async function validateTab\(tabId, gen, \{ allowlist/.test(code3) && /chrome\.webNavigation\.getFrame\(\{ tabId, frameId: 0 \}\)/.test(code3), "validateTab reads the tab fresh and binds to the main frame's documentId");
   assert(!/assertAllowed\(/.test(code3), "the old tab-only assertAllowed is gone (every target goes through validateTab / assertAllowedUrl)");
-  assert((code3.match(/documentIds: \[/g) || []).length >= 3, "direct injections carry documentIds");
+  assert((code3.match(/docTarget\(v\)/g) || []).length >= 3 && /documentIds: \[v\.documentId\]/.test(code3) && !/target: \{ tabId: v\.tabId \}/.test(code3), "direct injections carry documentIds and never fall back to a bare tab");
   for (const re of [/uniqueContextId/, /"Runtime\.enable"/, /"Page\.enable"/, /Page\.frameNavigated/, /loaderId/, /Runtime\.executionContextCreated/, /chrome\.debugger\.onEvent\.addListener/]) assert(re.test(code3), `debugger route tracks ${re.source}`);
   assert(/chrome\.tabs\.onActivated\.addListener/.test(code3) && /chrome\.tabs\.onUpdated\.addListener/.test(code3), "onActivated guard and onUpdated detach are wired");
   assert(/"target changed"/.test(code3), "a document/context change fails with target changed");
@@ -387,7 +387,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/BridgeAccess\.configure\(\{[\s\S]*?onRevoke[\s\S]*?send[\s\S]*?badge[\s\S]*?sessionName/.test(src), "worker configures the access hooks");
   assert(/await BridgeAccess\.init\(\)/.test(src), "worker runs init() at start");
   assert(/sock\.onmessage = async \(ev\) => \{\s*if \(ws !== sock\) return;/.test(src), "messages from a superseded socket are dropped");
-  assert(/const gen = BridgeAccess\.currentGen\(\)/.test(src) && /await BridgeAccess\.assertAccess\(gen\)/.test(src) && /handle\(msg\.cmd, msg\.params \|\| \{\}, gen\)/.test(src), "every command captures gen and is checked before handle()");
+  assert(/const gen = BridgeAccess\.currentGen\(\)/.test(src) && /await BridgeAccess\.assertAccess\(gen\)/.test(src) && /handle\(msg\.cmd, msg\.params \|\| \{\}, gen, String\(msg\.id\)\)/.test(src), "every command captures gen and is checked before handle()");
   assert(/PASS_ALWAYS = new Set\(\["ping", "status"\]\)/.test(src), "ping/status bypass present");
   assert((src.match(/BridgeAccess\.dispatch\(gen, /g) || []).length >= 15, `browser operations go through dispatch(gen, …) (${(src.match(/BridgeAccess\.dispatch\(gen, /g) || []).length})`);
   // Every browser operation line (comments and the indicator's own injection, which only adds/removes a frame, excluded) is a dispatch line.
@@ -404,7 +404,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/BridgeAccess\.beginTab\(/.test(src) && /BridgeAccess\.completeTab\(/.test(src) && /BridgeAccess\.beginDownload\(/.test(src) && /BridgeAccess\.completeDownload\(/.test(src), "newTab/download use pending entries");
   assert(/TYPE_CHUNK = 20/.test(src), "direct type is chunked from the worker");
   assert(/access-expiry-/.test(src) && /BridgeAccess\.onAlarm\(/.test(src), "expiry alarms routed to BridgeAccess.onAlarm");
-  assert(/async function dbg\(tabId, method, params, gen\) \{\s*await BridgeAccess\.assertAccess\(gen\);/.test(src), "every debugger command re-reads access before its synchronous dispatch");
+  assert(/async function dbg\(tabId, method, params, gen, v\) \{\s*await BridgeAccess\.assertAccess\(gen\);\s*return BridgeAccess\.dispatch\(gen, \(\) => \{ if \(v\) assertLoader\(tabId, v\);/.test(src), "every debugger command re-reads access, then checks the loader inside the synchronous dispatch step");
   assert(/case "closeTabs":[\s\S]*?closeOwnedTabs\(p\.tabIds, \{ gen \}\)/.test(src), "remote closeTabs passes its generation");
   assert(/parseAccessSet\(/.test(src), "access-set goes through parseAccessSet");
 

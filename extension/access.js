@@ -297,11 +297,11 @@
     // A pending entry is written BEFORE the browser call, so a worker restart
     // or a revoke between the call and the id coming back never loses the fact
     // that it was ours. A completion under a moved generation closes/cancels.
-    beginTab({ gen, origin }) {
+    beginTab({ gen, origin, reqId }) {
       const nonce = randomHex32();
       return withTabs(async () => {
         const list = await readPending("session", "pendingTabs");
-        await chrome.storage.session.set({ pendingTabs: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now() }] });
+        await chrome.storage.session.set({ pendingTabs: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now(), ...(reqId ? { reqId: String(reqId) } : {}) }] });
         return nonce;
       });
     },
@@ -316,17 +316,17 @@
       const liveNow = async () => { await transition; const a = await this.readAccess(); return gen === accessGen && a.granted && (a.until === null || Date.now() < a.until); };
       if (Number.isInteger(tabId) && (await liveNow())) {
         await this.rememberAgentTab(tabId);
-        if (gen === accessGen && lastRecord.granted) { this.logEvent({ kind: "tab_opened", tabId, origin: entry && entry.origin }).catch(() => {}); return true; } // the write landed under the same generation
+        if (gen === accessGen && lastRecord.granted) { this.logEvent({ kind: "tab_opened", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; } // the write landed under the same generation
         await this.forgetAgentTab(tabId);
       }
-      if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); this.logEvent({ kind: "tab_closed", tabId, origin: entry && entry.origin, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {} }
+      if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); this.logEvent({ kind: "tab_closed", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {} }
       return false;
     },
-    beginDownload({ gen, origin }) {
+    beginDownload({ gen, origin, reqId }) {
       const nonce = randomHex32();
       return withDownloads(async () => {
         const list = await readPending("local", "pendingDownloads");
-        await chrome.storage.local.set({ pendingDownloads: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now() }] });
+        await chrome.storage.local.set({ pendingDownloads: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now(), ...(reqId ? { reqId: String(reqId) } : {}) }] });
         return nonce;
       });
     },
@@ -342,8 +342,8 @@
       if (Number.isInteger(downloadId)) {
         // Record ownership first (so a revoke's sweep can find it), then decide.
         await withDownloads(async () => { const m = await readMap("bridgeDownloads"); m[downloadId] = { gen }; await chrome.storage.local.set({ bridgeDownloads: m }); });
-        if ((await liveNow()) && gen === accessGen) { this.logEvent({ kind: "download_started", origin: entry && entry.origin }).catch(() => {}); return true; }
-        try { await chrome.downloads.cancel(downloadId); this.logEvent({ kind: "download_cancelled", origin: entry && entry.origin, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {}
+        if ((await liveNow()) && gen === accessGen) { this.logEvent({ kind: "download_started", origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; }
+        try { await chrome.downloads.cancel(downloadId); this.logEvent({ kind: "download_cancelled", origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {}
       }
       return false;
     },
