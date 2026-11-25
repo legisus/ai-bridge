@@ -9,7 +9,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export COMPOSE_PROJECT_NAME=ai-bridge-smoke
-export BRIDGE_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ai-bridge-smoke-work.XXXXXX")"
+# The work dir is a bind mount: it must live under a path the Docker VM shares
+# with the host (Colima/Docker Desktop share $HOME; macOS's /var/folders is not
+# shared), so it goes under the repo, where deploy/docker/work*/ is git-ignored.
+export BRIDGE_WORK_DIR="$(mktemp -d "$PWD/deploy/docker/work-smoke.XXXXXX")"
 export BRIDGE_PUBLISH_PORT="$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
 COMPOSE=(docker compose -f deploy/docker/compose.yml)
 failures=0
@@ -19,6 +22,7 @@ check() { if eval "$2" > /dev/null 2>&1; then pass "$1"; else fail "$1"; fi; }
 cleanup() {
   if [ "${KEEP:-0}" = "1" ]; then echo "KEEP=1: project ai-bridge-smoke left running on 127.0.0.1:${BRIDGE_PUBLISH_PORT}"; return; fi
   "${COMPOSE[@]}" down -v --remove-orphans > /dev/null 2>&1 || true
+  docker volume ls -q --filter name=ai-bridge-smoke_ | xargs -r docker volume rm > /dev/null 2>&1 || true # anything a manual `docker run -v` left
   rm -rf "$BRIDGE_WORK_DIR"
 }
 trap cleanup EXIT
@@ -27,15 +31,8 @@ echo "smoke: port ${BRIDGE_PUBLISH_PORT}, work dir ${BRIDGE_WORK_DIR}"
 # 1) build
 if "${COMPOSE[@]}" build > "${BRIDGE_WORK_DIR}/build.log" 2>&1; then pass "image builds"; else fail "image builds (see ${BRIDGE_WORK_DIR}/build.log)"; tail -20 "${BRIDGE_WORK_DIR}/build.log"; exit 1; fi
 
-# 2) optional: a Codex login for the model step (never logged, never committed)
-if [ -f "$HOME/.codex/auth.json" ]; then
-  docker run --rm -v ai-bridge-smoke_home:/home/node -v "$HOME/.codex:/src:ro" --user 1000:1000 ai-bridge:local \
-    sh -c 'mkdir -p /home/node/.codex && cp /src/auth.json /home/node/.codex/auth.json && chmod 600 /home/node/.codex/auth.json' > /dev/null 2>&1 \
-    && CODEX_AUTH=1 || CODEX_AUTH=0
-else CODEX_AUTH=0; fi
-
 # 3) up + listening line
-"${COMPOSE[@]}" up -d bridge > /dev/null 2>&1 || { fail "compose up"; exit 1; }
+"${COMPOSE[@]}" up -d bridge > "${BRIDGE_WORK_DIR}/up.log" 2>&1 || { fail "compose up"; tail -5 "${BRIDGE_WORK_DIR}/up.log"; exit 1; }
 for i in $(seq 1 30); do
   if "${COMPOSE[@]}" logs bridge 2>/dev/null | grep -q 'listening on ws://0.0.0.0:8765'; then break; fi; sleep 1
 done
@@ -75,10 +72,19 @@ XV="$("${COMPOSE[@]}" exec -T bridge codex --version 2>&1 | head -1)"
 grep -q '2\.1\.317' <<< "$CV" && pass "claude pinned: $CV" || fail "claude version ($CV)"
 grep -q '0\.171\.0' <<< "$XV" && pass "codex pinned: $XV" || fail "codex version ($XV)"
 
-# 9) codex one-shot under the compose restrictions (needs a login)
-if [ "$CODEX_AUTH" = 1 ]; then
-  OUT="$("${COMPOSE[@]}" exec -T -e AI_BRIDGE_CODEX_SANDBOX=container bridge sh -c 'cd /work && timeout 180 codex exec --skip-git-repo-check --ephemeral --sandbox danger-full-access -m gpt-6-astra -o /tmp/codex-out.txt "Run the shell command: echo smoke-ok. Reply with only its output." > /tmp/codex.log 2>&1; cat /tmp/codex-out.txt' 2>&1)"
-  grep -q 'smoke-ok' <<< "$OUT" && pass "codex exec runs a shell command inside the hardened container" || fail "codex exec inside ($(echo "$OUT" | tail -3))"
+# 9) codex one-shot under the compose restrictions (needs a login). The login
+#    is copied into the `home` volume AFTER compose created it (compose refuses
+#    a volume it did not create); never logged, never committed. The proof is
+#    an artifact only a shell can make (a timestamp file in /work, visible on
+#    the host) plus codex's own exit status — not the model's reply.
+if [ -f "$HOME/.codex/auth.json" ]; then
+  if docker run --rm -v "${COMPOSE_PROJECT_NAME}_home:/home/node" -v "$HOME/.codex:/src:ro" --user 1000:1000 ai-bridge:local \
+       sh -c 'mkdir -p /home/node/.codex && cp /src/auth.json /home/node/.codex/auth.json && chmod 600 /home/node/.codex/auth.json' > /dev/null 2>&1; then
+    OUT="$("${COMPOSE[@]}" exec -T -e AI_BRIDGE_CODEX_SANDBOX=container bridge sh -c 'cd /work && rm -f /work/codex-proof.txt; timeout 180 codex exec --skip-git-repo-check --ephemeral --sandbox danger-full-access -m gpt-6-astra -o /tmp/codex-out.txt "Run exactly this shell command and nothing else: date +%s > /work/codex-proof.txt. Then reply with the single word done." < /dev/null > /tmp/codex.log 2>&1; echo "CODEX_EXIT=$?"' 2>&1)"
+    PROOF="$(cat "${BRIDGE_WORK_DIR}/codex-proof.txt" 2>/dev/null)"
+    if grep -q 'CODEX_EXIT=0' <<< "$OUT" && [[ "$PROOF" =~ ^[0-9]{10}$ ]]; then pass "codex exec ran a shell command inside the hardened container (exit 0; /work/codex-proof.txt = $PROOF)"
+    else fail "codex exec inside ($OUT; proof file: '${PROOF:-missing}')"; "${COMPOSE[@]}" exec -T bridge sh -c 'tail -15 /tmp/codex.log' 2>&1 | sed 's/^/      /'; fi
+  else fail "copying the existing ~/.codex/auth.json into the home volume"; fi
 else
   echo "SKIP  codex exec inside (no ~/.codex/auth.json on this machine)"
 fi

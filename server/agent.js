@@ -215,6 +215,20 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env, signa
 // ladder treats both engines alike. The sandbox allows network so the bridge
 // CLI can reach the localhost relay; cwd stays the caller's so screenshots land
 // where Claude ops sessions put them.
+// The codex argv. On the host Codex keeps its own sandbox (workspace-write with
+// network, so the bridge CLI is reachable). Inside the Docker container
+// (AI_BRIDGE_CODEX_SANDBOX=container, docs/DOCKER.md) the container is the
+// sandbox: Codex's own one needs kernel features the hardened container drops.
+function codexArgs({ model, effort, prompt, cwd, outPath }, env = process.env) {
+  const sandbox = env && env.AI_BRIDGE_CODEX_SANDBOX === "container"
+    ? ["--sandbox", "danger-full-access"]
+    : ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
+  return ["exec", "--skip-git-repo-check", "--ephemeral",
+    "-m", model, "-c", `model_reasoning_effort="${effort || "medium"}"`,
+    ...sandbox,
+    "-C", cwd || process.cwd(), "-o", outPath, prompt];
+}
+
 function runCodex({ model, effort, prompt, timeoutMs, verbose, env, signal, cwd, baseEnv }) {
   const fs = require("fs");
   const os = require("os");
@@ -222,10 +236,7 @@ function runCodex({ model, effort, prompt, timeoutMs, verbose, env, signal, cwd,
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-codex-"));
     const outPath = path.join(tmp, "last.txt");
     const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
-    const args = ["exec", "--skip-git-repo-check", "--ephemeral",
-      "-m", model, "-c", `model_reasoning_effort="${effort || "medium"}"`,
-      "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
-      "-C", cwd || process.cwd(), "-o", outPath, prompt];
+    const args = codexArgs({ model, effort, prompt, cwd, outPath }, { ...(baseEnv || process.env), ...(env || {}) });
     let child;
     try { child = spawnTracked("codex", args, { signal, cwd, baseEnv, env, detach: true, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (e) { cleanup(); return reject(e); }
@@ -854,4 +865,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { AccessError, main, runAgent, proposeRecipe, autoLearn, runModel, runTurn, turnNote, lastNeedsApprovalLine, runLoginCmd, spawnTracked, journalRecord, parseVerdict, extractEvidence, needsApprovalLine, OPS_LADDER, OPS_PLAYBOOK, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };
+module.exports = { AccessError, codexArgs, main, runAgent, proposeRecipe, autoLearn, runModel, runTurn, turnNote, lastNeedsApprovalLine, runLoginCmd, spawnTracked, journalRecord, parseVerdict, extractEvidence, needsApprovalLine, OPS_LADDER, OPS_PLAYBOOK, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };
