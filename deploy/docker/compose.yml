@@ -1,0 +1,53 @@
+services:
+  bridge:
+    build: ../..
+    image: ai-bridge:local
+    ports:
+      - "127.0.0.1:${BRIDGE_PUBLISH_PORT:-8765}:8765"   # host loopback only — never 0.0.0.0
+    volumes:
+      - data:/data                                     # token, log, journal, traces, channels.json, sessions
+      - home:/home/node                                # claude + codex config and logins
+      - ${BRIDGE_WORK_DIR:-./work}:/work               # cwd: scripts for --file, --out files
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN                        # from .env or the host environment
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 2g
+    restart: unless-stopped
+
+  channels:                                            # Telegram daemon; only with --profile channels
+    profiles: ["channels"]
+    image: ai-bridge:local
+    command: ["node", "/app/server/channels/main.js", "start"]
+    network_mode: "service:bridge"                     # shares the relay's loopback; CLI's 127.0.0.1 works
+    volumes:
+      - data:/data
+      - home:/home/node
+      - ${BRIDGE_WORK_DIR:-./work}:/work
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 2g
+    healthcheck:
+      disable: true                                    # the inherited check tests the relay's port, not this daemon
+    depends_on:
+      bridge:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  data:
+  home:
