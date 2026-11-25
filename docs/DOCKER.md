@@ -112,8 +112,19 @@ definition of that contract.
 - **Google Chrome** (or Edge/Brave/Chromium) with the extension loaded unpacked from
   the `extension/` folder of the clone. The folder must stay put; Chrome loads it on
   every start.
-- **Allow User Scripts** turned on for the extension (Chrome 138+), as in the normal
-  install, otherwise `eval` and JS `waitFor` need `--debugger`.
+- **Developer mode on `chrome://extensions`, and it stays on.** The extension is not
+  in the Chrome Web Store, so "Load unpacked" is the only way to install it, and
+  Chrome only offers that with Developer mode on; turning it off afterwards
+  disables unpacked extensions. Consequences: Chrome may show its "Disable
+  developer mode extensions" notice at start, and a Chrome managed by an
+  organisation can forbid Developer mode by policy
+  (`ExtensionDeveloperModeSettings` / `DeveloperToolsAvailability`), in which case
+  this layout cannot be installed on that profile. A Web Store listing (unlisted
+  is enough) would remove the requirement; it is on the "Later" list.
+- **Allow User Scripts** turned on for the extension (Chrome 138+; the toggle is
+  per extension on its Details page and is **off** for a freshly loaded unpacked
+  extension), as in the normal install, otherwise `eval` and JS `waitFor` need
+  `--debugger`. On Chrome 135–137 Developer mode alone enables it.
 - **No bridge on the PC itself.** If this PC had a source install: stop and remove its
   launchd/systemd/Task Scheduler service, run `npm run register-host -- --unregister`,
   and make sure nothing listens on 8765 (`netstat -an | findstr 8765` on Windows,

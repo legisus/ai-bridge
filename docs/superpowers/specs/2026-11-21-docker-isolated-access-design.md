@@ -803,6 +803,10 @@ does not forget them:
   revoked, so the phone side knows why a task failed.
 - A tiny native host for the Docker layout that only reads the token from a mounted
   file (never starts anything), so the paste step goes away.
+- An unlisted Chrome Web Store listing of the extension, so the PC no longer needs
+  Developer mode on `chrome://extensions` (today the extension is loaded unpacked,
+  which requires it and keeps it on; managed Chrome profiles can forbid it). Allow
+  User Scripts would still be a per-extension toggle the user turns on.
 
 ## Open questions (builder decides unless marked)
 
