@@ -115,6 +115,60 @@
 
     ACCESS_REVOKED, ACCESS_NOT_GRANTED,
 
+    // ---- alarms, reload, startup --------------------------------------------
+    // `access-expiry-<gen>` fires the revoke on time; the gen in the name keeps
+    // a stale alarm from an earlier grant away from a renewed one.
+    async onAlarm(name) {
+      const m = /^access-expiry-(\d+)$/.exec(String(name || ""));
+      if (!m) return false;
+      const gen = Number(m[1]);
+      let raw; try { raw = (await chrome.storage.local.get("access")).access; } catch { return false; }
+      if (!raw || typeof raw !== "object" || raw.gen !== gen || raw.granted !== true) return false;
+      await this.setAccess({ granted: false, source: "alarm" });
+      return true;
+    },
+    // After any reload, update or install: revoked, and the user is told why.
+    async onInstalled() {
+      await this.setAccess({ granted: false, source: "reload" });
+      await this.setNotice("access was revoked because the extension was reloaded; tabs opened before the reload are no longer tracked");
+    },
+    // Worker start: adopt the stored generation and reconcile the record.
+    async init() {
+      await this.ensureBrowserSession();
+      let raw; try { raw = (await chrome.storage.local.get("access")).access; } catch { raw = null; }
+      const storedGen = raw && typeof raw === "object" && Number.isInteger(raw.gen) && raw.gen >= 0 ? raw.gen : 0;
+      if (storedGen > accessGen) accessGen = storedGen;
+      const a = normalizeRecord(raw);
+      lastRecord = a;
+      if (raw && typeof raw === "object" && raw.granted === true && !a.granted) {
+        await this.setAccess({ granted: false, source: "startup" }); // expired while the worker was away
+      } else if (a.granted && a.until !== null) {
+        const have = (await chrome.alarms.getAll().catch(() => [])).some((x) => x.name === `access-expiry-${a.gen}`);
+        if (!have) await chrome.alarms.create(`access-expiry-${a.gen}`, { when: a.until }).catch((e) => hooks.log(`alarm recreate failed: ${e && e.message}`));
+      }
+      if (typeof this.reconcileOwnership === "function") await this.reconcileOwnership();
+    },
+
+    // ---- notices (popup) ----------------------------------------------------
+    async notices() { const { notices } = await chrome.storage.local.get("notices"); return Array.isArray(notices) ? notices : []; },
+    async setNotice(text) { const n = await this.notices(); if (!n.includes(text)) await chrome.storage.local.set({ notices: [...n, text] }); },
+    async dismissNotices() { await chrome.storage.local.remove("notices"); },
+
+    badgeState(record, now = Date.now()) {
+      if (!record || !record.granted) return { text: "", color: "#9e9e9e" };
+      if (record.until === null) return { text: "ON", color: "#1e8e3e" };
+      const min = Math.max(0, Math.round((record.until - now) / 60000));
+      return { text: min >= 60 ? `${Math.floor(min / 60)}h` : `${min}m`, color: "#1e8e3e" };
+    },
+
+    // Popup "Close agent tabs": every tab the bridge opened, access unchanged.
+    async closeAgentTabs() { const r = await this.closeOwnedTabs(await this.agentTabIds()); return { closed: r.closed }; },
+    async status() {
+      const a = await this.readAccess();
+      return { granted: a.granted, until: a.until, gen: a.gen, remainingMs: a.granted && a.until !== null ? Math.max(0, a.until - Date.now()) : null,
+        browserSession: await this.ensureBrowserSession(), notices: await this.notices(), agentTabs: await this.agentTabIds() };
+    },
+
     async accessMessage(sessionName) {
       const [a, browserSession] = await Promise.all([this.readAccess(), this.ensureBrowserSession()]);
       return { type: "access", session: sessionName || "chrome", granted: a.granted, until: a.until, gen: a.gen, browserSession };
@@ -163,15 +217,27 @@
 
   // Grant/revoke side effects (alarms, downloads and tab closing arrive with the
   // next tasks; the envelope and the badge go through the configured hooks).
+  async function clearExpiryAlarms() {
+    try { for (const a of await chrome.alarms.getAll()) if (/^access-expiry-/.test(a.name)) await chrome.alarms.clear(a.name); } catch {}
+  }
+  function badge(record) { try { hooks.badge({ ...BridgeAccess.badgeState(record), granted: record.granted, until: record.until }); } catch {} }
   async function grantSteps(record) {
+    await clearExpiryAlarms();
+    if (record.until !== null) {
+      // The deadline is enforced by assertAccess/dispatch anyway; the alarm only flips the badge and detaches on time.
+      try { await chrome.alarms.create(`access-expiry-${record.gen}`, { when: record.until }); }
+      catch (e) { hooks.log(`expiry alarm not created: ${e && e.message}`); }
+    }
     try { hooks.send(await BridgeAccess.accessMessage(await session())); } catch {}
-    try { hooks.badge({ granted: true, until: record.until }); } catch {}
+    badge(record);
   }
   async function revokeSteps(record, closeTabs) {
+    if (typeof BridgeAccess.cancelBridgeDownloads === "function") { try { await BridgeAccess.cancelBridgeDownloads(); } catch {} }
     try { await hooks.onRevoke(); } catch (e) { hooks.log(`detach on revoke failed: ${e && e.message}`); }
     if (closeTabs) { try { await BridgeAccess.closeOwnedTabs(await BridgeAccess.agentTabIds()); } catch {} }
     try { hooks.send(await BridgeAccess.accessMessage(await session())); } catch {}
-    try { hooks.badge({ granted: false, until: null }); } catch {}
+    badge(record);
+    await clearExpiryAlarms();
   }
 
   if (typeof module !== "undefined" && module.exports) module.exports = BridgeAccess;

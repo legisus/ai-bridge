@@ -129,6 +129,54 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   err = null; try { await B.assertAccess(B.currentGen()); } catch (e) { err = e.message; }
   assert(/^access_revoked:/.test(err), "storage failure → access_revoked");
 
+  // ---- alarms, hooks, reload, startup, popup helpers (Task 2) -----------
+  await B.setAccess({ granted: true, until: Date.now() + 3600e3 });
+  let gg = B.currentGen();
+  assert(S.alarms.list.some((x) => x.name === `access-expiry-${gg}`) && S.alarms.list.length === 1, "timed grant creates access-expiry-<gen>");
+  await B.setAccess({ granted: true });
+  assert(S.alarms.list.length === 0, "indefinite grant clears expiry alarms");
+  await B.setAccess({ granted: true, until: Date.now() + 3600e3 }); gg = B.currentGen();
+  assert((await B.onAlarm(`access-expiry-${gg - 1}`)) === false && (await B.readAccess()).granted === true, "a stale alarm from an earlier grant does not revoke");
+  assert((await B.onAlarm(`access-expiry-${gg}`)) === true && (await B.readAccess()).granted === false && S.alarms.list.length === 0, "the current alarm revokes and clears the alarm");
+  assert((await B.onAlarm("reconnect")) === false, "other alarms are ignored");
+  S.alarms.failCreate = true;
+  rec = await B.setAccess({ granted: true, until: Date.now() + 30 });
+  assert(rec.granted === true, "alarm failure does not fail the grant");
+  await sleep(40);
+  err = null; try { await B.assertAccess(B.currentGen()); } catch (e) { err = e.message; }
+  assert(/^access_revoked:/.test(err), "…and the deadline still holds without the alarm");
+  S.alarms.failCreate = false;
+  // hooks, in order
+  const calls = [];
+  B.configure({ sessionName: async () => "chrome", onRevoke: async () => { calls.push("detach"); }, send: (m) => calls.push(`send:${m.granted}:${m.gen}`), badge: (b) => calls.push(`badge:${b.text}`) });
+  await B.setAccess({ granted: true });
+  assert(calls.join() === `send:true:${B.currentGen()},badge:ON`, "grant: access envelope sent, badge ON");
+  calls.length = 0;
+  await B.setAccess({ granted: false });
+  assert(calls.join() === `detach,send:false:${B.currentGen()},badge:`, "revoke: detach, then envelope, then grey badge, in order");
+  assert(B.badgeState({ granted: true, until: null }).text === "ON" && B.badgeState({ granted: true, until: Date.now() + 2.5 * 3600e3 }).text === "2h" && B.badgeState({ granted: true, until: Date.now() + 45 * 60e3 }).text === "45m" && B.badgeState({ granted: false, until: null }).text === "" && B.badgeState({ granted: false, until: null }).color !== B.badgeState({ granted: true, until: null }).color, "badgeState");
+  // onInstalled → revoked, bumped gen, notice
+  await B.setAccess({ granted: true }); gg = B.currentGen();
+  await B.onInstalled();
+  assert((await B.readAccess()).granted === false && B.currentGen() === gg + 1 && /reloaded/.test((await B.notices())[0]), "onInstalled revokes with a bumped gen and sets the notice");
+  await B.dismissNotices(); assert((await B.notices()).length === 0, "dismissNotices");
+  // init reconciliation
+  await S.chrome.storage.local.set({ access: { granted: true, until: Date.now() - 1, gen: 40 } });
+  await B.init();
+  assert((await B.readAccess()).granted === false && B.currentGen() === 41, "init: expired grant revoked at startup");
+  await S.chrome.storage.local.set({ access: { granted: true, until: Date.now() + 3600e3, gen: 50 } }); S.alarms.list.length = 0;
+  await B.init();
+  assert(B.currentGen() === 50 && S.alarms.list.some((x) => x.name === "access-expiry-50"), "init: missing expiry alarm recreated, gen loaded from the record");
+  await B.assertAccess(50);
+  assert(true, "init: a live grant stays live and passes the check");
+  // popup helpers
+  await S.chrome.storage.session.set({ agentTabs: [] });
+  await B.rememberAgentTab(70); await B.rememberAgentTab(71);
+  const cl = await B.closeAgentTabs();
+  assert(JSON.stringify(cl.closed) === "[70,71]" && (await B.readAccess()).granted === true && (await B.agentTabIds()).length === 0, "Close agent tabs closes every agent tab and leaves access unchanged");
+  const st = await B.status();
+  assert(st.granted === true && st.remainingMs > 0 && st.gen === 50 && /^[0-9a-f]{32}$/.test(st.browserSession) && Array.isArray(st.notices), "status() for the popup");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
