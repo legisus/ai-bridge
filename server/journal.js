@@ -10,6 +10,7 @@
 const fs = require("fs");
 const path = require("path");
 const { DIR } = require("./token");
+const { atomicWrite, withLock } = require("./atomic");
 
 const JOURNAL_FILE = path.join(DIR, "journal.jsonl");
 const TRACES_DIR = path.join(DIR, "traces");
@@ -86,10 +87,29 @@ function signatureOf({ job, task, domains }) {
   return `auto:${(domains || []).join(",")}|${normalizeTask(task)}`;
 }
 
+// Every journal writer takes the same lock: patchRun rewrites the file, so an
+// unlocked append could land between its read and its rename and be lost.
 function appendJournal(record) {
   ensureDir(DIR);
-  fs.appendFileSync(JOURNAL_FILE, JSON.stringify(record) + "\n");
+  withLock(JOURNAL_FILE, () => { fs.appendFileSync(JOURNAL_FILE, JSON.stringify(record) + "\n"); });
   return JOURNAL_FILE;
+}
+
+// Update the last record of `runId` in place (the server patches tab counters
+// when a creation is closed after the run ended). False when there is none.
+function patchRun(runId, patch) {
+  return withLock(JOURNAL_FILE, () => {
+    let lines;
+    try { lines = fs.readFileSync(JOURNAL_FILE, "utf8").split("\n").filter(Boolean); } catch { return false; }
+    let idx = -1;
+    for (let i = lines.length - 1; i >= 0 && idx < 0; i--) {
+      try { if (JSON.parse(lines[i]).runId === runId) idx = i; } catch {}
+    }
+    if (idx < 0) return false;
+    lines[idx] = JSON.stringify({ ...JSON.parse(lines[idx]), ...patch });
+    atomicWrite(JOURNAL_FILE, lines.join("\n") + "\n");
+    return true;
+  });
 }
 
 function readJournal({ days } = {}) {
@@ -114,7 +134,7 @@ function summarize(records, { minPasses = CANDIDATE_MIN_PASSES } = {}) {
     const key = r.signature || signatureOf(r);
     if (!groups.has(key)) {
       groups.set(key, { signature: key, job: r.job || null, runs: 0, passes: 0, costUsd: 0,
-        inputTokens: 0, outputTokens: 0, lastRun: null, lastVerdict: null, modes: {}, example: r.task });
+        inputTokens: 0, outputTokens: 0, tabsRetained: 0, lastRun: null, lastVerdict: null, modes: {}, example: r.task });
     }
     const g = groups.get(key);
     g.runs++;
@@ -122,6 +142,7 @@ function summarize(records, { minPasses = CANDIDATE_MIN_PASSES } = {}) {
     g.costUsd += Number(r.costUsd) || 0;
     g.inputTokens += Number(r.inputTokens) || 0;
     g.outputTokens += Number(r.outputTokens) || 0;
+    g.tabsRetained += Number(r.tabsRetained) || 0;  // tabs a run left behind (bridge tabs)
     g.modes[r.mode || "regular"] = (g.modes[r.mode || "regular"] || 0) + 1;
     const t = r.endedAt || r.startedAt;
     if (!g.lastRun || Date.parse(t) > Date.parse(g.lastRun)) { g.lastRun = t; g.lastVerdict = r.verdict; }
@@ -140,7 +161,7 @@ function summarize(records, { minPasses = CANDIDATE_MIN_PASSES } = {}) {
 
 function formatReport(rows, { days }) {
   if (!rows.length) return `journal: no agent runs in the last ${days} days (${JOURNAL_FILE}).`;
-  const head = ["", "runs", "pass", "total $", "avg $", "avg tok", "last run", "signature"];
+  const head = ["", "runs", "pass", "total $", "avg $", "avg tok", "last run", "tabs left", "signature"];
   const lines = rows.map((r) => [
     r.candidate ? "*" : " ",
     String(r.runs),
@@ -149,6 +170,7 @@ function formatReport(rows, { days }) {
     r.avgCostUsd.toFixed(3),
     String(r.avgTokens),
     (r.lastRun || "").slice(0, 16).replace("T", " "),
+    String(r.tabsRetained || 0),
     r.signature.length > 70 ? r.signature.slice(0, 67) + "…" : r.signature,
   ]);
   const widths = head.map((h, i) => Math.max(h.length, ...lines.map((l) => l[i].length)));
@@ -180,7 +202,7 @@ function main(argv) {
     const t = readTrace(opts.trace);
     if (!t.length) { console.error(`no trace for run ${opts.trace} (${traceFile(opts.trace)})`); process.exit(1); }
     process.stdout.write(opts.json ? JSON.stringify(t, null, 2) + "\n"
-      : t.map((e) => `${e.ts || ""} ${String(e.ms || 0).padStart(5)}ms ${e.ok ? "ok  " : "FAIL"} ${e.cmd} ${JSON.stringify(e.params || {}).slice(0, 140)}${e.error ? `  -> ${e.error}` : ""}`).join("\n") + "\n");
+      : t.map((e) => `${e.ts || ""} ${e.reqId || "-"} ${String(e.ms || 0).padStart(5)}ms ${e.ok ? "ok  " : e.outcome === "refused" ? "REF " : e.outcome === "cancelled" ? "CAN " : "FAIL"} ${e.cmd} ${JSON.stringify(e.params || {}).slice(0, 140)}${e.error ? `  -> ${String(e.error).replace(/\s*\r?\n\s*/g, " | ")}` : ""}`).join("\n") + "\n");
     return;
   }
   let records = readJournal({ days: opts.days });
@@ -192,5 +214,5 @@ function main(argv) {
 module.exports = {
   JOURNAL_FILE, TRACES_DIR, CANDIDATE_MIN_PASSES, traceFile, safeRunId,
   appendTrace, readTrace, domainsFromTrace, normalizeTask, signatureOf,
-  appendJournal, readJournal, summarize, formatReport, main,
+  appendJournal, patchRun, readJournal, summarize, formatReport, main,
 };

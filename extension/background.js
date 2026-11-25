@@ -16,7 +16,9 @@
 // protocol), which rich-text editors and CSP-strict apps require, plus pdf and
 // background-tab screenshots. Chrome shows its banner while it is attached.
 
-const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "" };
+importScripts("access.js"); // BridgeAccess: browserSession, access message, agentTabs, closeTabs
+
+const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "", session: "chrome" };
 
 let ws = null;
 let attached = new Set(); // tabIds with debugger attached
@@ -87,6 +89,12 @@ async function connect() {
   sock.onmessage = async (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "auth" && msg.ok) {
+      // Tell the relay whether the user has granted this browser session, and
+      // which session this is (browserSession), before any command is served.
+      try { sock.send(JSON.stringify(await BridgeAccess.accessMessage(cfg.session))); } catch {}
+      return;
+    }
     if (msg.type !== "command") return;
     let reply;
     try {
@@ -153,7 +161,7 @@ async function dbgAttach(tabId) {
 }
 
 chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); lastActivity.delete(src.tabId); setIndicator(src.tabId, false); } });
-chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); lastActivity.delete(tabId); });
+chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); lastActivity.delete(tabId); BridgeAccess.forgetAgentTab(tabId); });
 
 function dbg(tabId, method, params) {
   return chrome.debugger.sendCommand({ tabId }, method, params || {});
@@ -494,6 +502,7 @@ async function handle(cmd, p) {
       if (p.newWindow) {
         const win = await chrome.windows.create({ url: p.url, focused: !!p.active });
         const tab = (win.tabs && win.tabs[0]) || (await chrome.tabs.query({ windowId: win.id }))[0];
+        await BridgeAccess.rememberAgentTab(tab.id);
         return { id: tab.id, windowId: win.id, newWindow: true };
       }
       // windowId → open in that specific window (e.g. an automation's own
@@ -501,6 +510,7 @@ async function handle(cmd, p) {
       const opts = { url: p.url, active: !!p.active };
       if (p.windowId != null) opts.windowId = p.windowId;
       const tab = await chrome.tabs.create(opts);
+      await BridgeAccess.rememberAgentTab(tab.id);
       return { id: tab.id, windowId: tab.windowId };
     }
 
@@ -528,8 +538,18 @@ async function handle(cmd, p) {
     }
 
     case "closeTab":
+      // A user tab is subject to the allowlist like every other target; the
+      // bridge's own tabs were opened on allowed hosts anyway.
+      await assertAllowed(p.tabId);
       await chrome.tabs.remove(p.tabId);
+      await BridgeAccess.forgetAgentTab(p.tabId);
       return { ok: true };
+
+    case "closeTabs":
+      // Run cleanup / `bridge closeTabs`: closes only tabs this extension
+      // opened (agentTabs); every other id comes back as skipped. No window
+      // removal — a window that becomes empty is closed by Chrome itself.
+      return await BridgeAccess.closeOwnedTabs(p.tabIds);
 
     case "eval": {
       // Direct mode: chrome.userScripts.execute in the MAIN world (no CDP).
@@ -741,7 +761,8 @@ async function handle(cmd, p) {
 
     case "status": {
       const cfg = await config();
-      return { version: chrome.runtime.getManifest().version, extensionId: chrome.runtime.id, attachedTabs: [...attached], indicator: cfg.indicator, idleDetachMs: cfg.idleDetachMs, provisionedBy: cfg.provisionedBy || "manual" };
+      return { version: chrome.runtime.getManifest().version, extensionId: chrome.runtime.id, attachedTabs: [...attached], agentTabs: await BridgeAccess.agentTabIds(),
+        indicator: cfg.indicator, idleDetachMs: cfg.idleDetachMs, provisionedBy: cfg.provisionedBy || "manual", session: cfg.session };
     }
 
     default:

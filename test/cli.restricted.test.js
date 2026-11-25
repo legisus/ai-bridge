@@ -18,7 +18,7 @@ const run = (args, extraEnv = {}, cwd = outbox) => new Promise((resolve) => exec
   (err, stdout, stderr) => resolve({ code: err ? (err.code || 1) : 0, stdout: String(stdout), stderr: String(stderr) })));
 
 (async () => {
-  for (const sub of ["agent", "jobs", "recipe", "journal", "pairing", "channels", "claude-md", "download", "activateTab", "detachAll", "reloadExtension"]) {
+  for (const sub of ["agent", "jobs", "recipe", "journal", "pairing", "channels", "claude-md", "download", "activateTab", "detachAll", "reloadExtension", "tabs", "closeTabs"]) {
     const r = await run([sub, "{}"]);
     assert(r.code === 7 && /restricted/.test(r.stderr), `restricted: ${sub} refused with exit 7`);
   }

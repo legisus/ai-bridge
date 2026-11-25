@@ -4,9 +4,12 @@
 after nine rounds of the Codex `gpt-6-astra` review (53 findings folded in; the
 base design approved in round six, the observability and tab-hygiene additions in
 round nine, with the untested CLI pin pair left as an implementation gate; the
-review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
-machine it was written on, and the code changes it depends on (listed in
-[What has to change](#what-has-to-change-in-the-code)) are not implemented. The
+review text is not part of the repo). Nothing Docker-related in this guide has been run: there is no Docker on the
+machine it was written on. Of the code changes it depends on (listed in
+[What has to change](#what-has-to-change-in-the-code)), the `tab-hygiene` branch
+implements the server side of the access contract, `BRIDGE_BIND` (#1), the
+request-id correlation of #13 (without the extension event buffer) and the tab
+hygiene of #14 (without the popup button); the rest is not implemented. The
 Dockerfile and compose file below are the target, not something that works today.
 
 This branch stacks on the channels chain (`feat/channels-core` →
@@ -93,8 +96,8 @@ for each is in
 | 10 | Several browser sessions on one relay (Chrome + Edge, two profiles): registry keyed by session name, `--session` on the CLI. | Not needed for one browser; today a second extension supersedes the first. | Later |
 | 11 | `bridge token --rotate`. | Convenience; the manual procedure is below. | Later |
 | 12 | The restricted-run env filter (`server/channels/restricted.js`) passes `AI_BRIDGE_HOME`, `AI_BRIDGE_DEBUGGER` and `AI_BRIDGE_CODEX_SANDBOX` through to channel children (never messenger tokens). | Today it keeps only `BRIDGE_PORT`, so a channel run inside the container would look for the token under `/home/node/.ai-browser-bridge` and exit 6. | **Yes** |
-| 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in full in the popup and in redacted form by `bridge status --events`; every CLI failure prints the request id, and every server log and trace line carries request id, client label, run id and outcome, written once per request. | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, the server log says `cmd newTab {...}` without saying who asked, and a locally refused command of a run is never traced. | **Yes** |
-| 14 | Tab hygiene: the server keeps a registry of every tab the bridge opened (who, when, which run, which Chrome session) and closes a run's tabs when the run ends or its supervisor dies, with the extension confirming ownership of every tab before closing it (`--keep-tabs` to opt out); `bridge tabs` lists them; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
+| 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in full in the popup and in redacted form by `bridge status --events`; every CLI failure prints the request id, and every server log and trace line carries request id, client label, run id and outcome, written once per request. *Request ids, log and trace lines implemented on `tab-hygiene`; the event buffer and `--events` are next.* | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, the server log says `cmd newTab {...}` without saying who asked, and a locally refused command of a run is never traced. | **Yes** |
+| 14 | Tab hygiene: the server keeps a registry of every tab the bridge opened (who, when, which run, which Chrome session) and closes a run's tabs when the run ends or its supervisor dies, with the extension confirming ownership of every tab before closing it (`--keep-tabs` to opt out); `bridge tabs` lists them; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. *Implemented on `tab-hygiene` except the popup button.* | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
 
 The wire protocol gains: the `access` message from the extension (session name,
 granted, until, generation, Chrome-session id); `run` / `runEnd` messages from the
@@ -501,7 +504,7 @@ and is readable from the PC:
 ```
 docker compose -f deploy/docker/compose.yml logs -f bridge          # server log (also /data/bridge.log)
 docker compose -f deploy/docker/compose.yml exec bridge sh -c 'tail -50 /data/bridge.log'
-bridge status --events                                              # extension's last 200 events (grant, revoke, refused, closed tab…)
+bridge status --events                                              # extension's last 200 events (grant, revoke, refused, closed tab…) — next slice
 bridge journal                                                      # agent runs, verdicts, cost
 bridge journal --trace <runId>                                      # every bridge command of one run
 bridge tabs                                                         # tabs the bridge opened, with age, owner and run id
@@ -511,11 +514,27 @@ docker compose -f deploy/docker/compose.yml --profile channels logs -f channels 
 Each server log line names the request id, the client label (`AI_BRIDGE_CLIENT`,
 default the process name), the run id when the command came from an agent run,
 and the outcome (`done`, `refused …`, `cancelled …`), once per request. The CLI
-prints the same request id with every failure, `ERROR: … (req <id>)`, so an
-`access_revoked` or `target changed` can be matched to the log line, to the trace
-line, and, when the command reached Chrome, to the extension's event list. A
-command the server refused without forwarding has no extension event; the log
-line says `refused`, which is the whole story.
+prints the same request id with every failure, `ERROR: … (req <id>)` on stderr
+and one JSON line `{"error":…,"reqId":…}` on stdout, so an `access_revoked` or
+`target changed` can be matched to the log line, to the trace line, and, when the
+command reached Chrome, to the extension's event list. A command the server
+refused without forwarding has no extension event; the log line says `refused`,
+which is the whole story. `bridge journal --trace <runId>` prints one line per
+command with the request id and the outcome: `ok`, `FAIL` (the extension
+answered with an error), `REF` (refused by the server) or `CAN` (cancelled:
+extension gone, superseded, or access revoked while pending).
+
+Log line shapes, one `cmd` line and one terminal line per request:
+
+```
+2026-11-24T19:02:11.481Z 3bd5c0acb5653922 bridge agent 22d938490de9 cmd newTab {"url":"https://…","direct":true}
+2026-11-24T19:02:11.612Z 3bd5c0acb5653922 bridge agent 22d938490de9 done ok 131ms
+2026-11-24T19:02:30.007Z 9a1f…             zsh          -            refused access_revoked
+2026-11-24T19:02:31.220Z c0de…             bridge agent 22d938490de9 cancelled extension disconnected
+2026-11-24T19:03:02.000Z srv-4             server       -            cmd closeTabs {"tabIds":[580216684]}
+```
+
+`srv-<n>` requests are the relay's own (run cleanup, registry reconciliation).
 
 `bridge status --events` is a redacted view: while access is revoked it shows only
 how many events of each kind happened; while granted it hides the origin and tab
@@ -558,9 +577,31 @@ Chrome session) and closes a run's tabs when the run ends, however it ends:
   `bridge closeTabs --older-than 60` closes bridge-opened tabs no bridge command
   has touched for an hour. There is no automatic sweep.
 
+```
+$ bridge tabs
+tabId      age  client        run           origin                     status
+580216684  3m   bridge agent  22d938490de9  https://www.kbb.com        live
+580216702  41m  zsh           -             https://turo.com           live
+580216610  2h   bridge agent  1b7e0c4d9f21  https://thetollroads.com   retained
+
+from an earlier Chrome session (not acted on, pruned on the next reconciliation):
+tabId      client  run  origin
+4211       zsh     -    https://example.com
+```
+
+`client` is `AI_BRIDGE_CLIENT` when set (the agent sets `bridge agent` for its
+children; a launchd job can set its own name), otherwise the name of the process
+that ran the CLI. `bridge closeTabs --mine` uses the same label. Every run's
+journal record carries `tabsOpened`, `tabsClosed`, `tabsRetained` and `keptTabs`,
+and `bridge journal` shows a `tabs left` column per job.
+
 Limits: if the relay itself dies mid-run, its registry on disk survives but the
 run's end is only noticed when the agent reconnects or you run `bridge
-closeTabs`; and nothing closes while Chrome is not connected.
+closeTabs`; nothing closes while Chrome is not connected; and a messenger
+session's turns (`bridge channels`) take no lease yet, so their tabs are closed
+by `bridge closeTabs`, not automatically. The relay needs an extension that sends
+the `access` message: after updating the server, reload the extension too, or
+every command except `ping`/`status` is refused with `access_not_granted`.
 
 ## Troubleshooting
 

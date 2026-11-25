@@ -123,7 +123,14 @@ bridge closeTab '{"tabId":123}'
 bridge detach   '{"tabId":123}'                               # release debugger + clear the tab indicator
 bridge detachAll                                              # release every attached tab in one call
 bridge reloadExtension                                        # reload the extension after a git pull (no chrome://extensions visit)
+bridge tabs                                                   # tabs the bridge opened: age, who opened them, run id, origin
+bridge closeTabs --mine                                       # close the ones this client opened (also --run <id>, --older-than <minutes>)
+bridge agent "task" --keep-tabs                               # leave the run's tabs open instead of closing them at the end
 ```
+
+Every failure prints `ERROR: <reason> (req <id>)`; the same id is on the server's
+log lines and in the run's trace, so one id leads from a failed shell call to what
+the relay and the extension did with it.
 
 For an AI agent, the contract is simple: every command is one shell invocation that
 prints JSON to stdout and exits non-zero on failure.
@@ -297,7 +304,14 @@ Full policy: [PRIVACY.md](PRIVACY.md). Read this before installing — the exten
   (created `chmod 600`). Without it, sockets are dropped.
 - Optional **host allowlist** (extension Options): restrict commands to named domains
   and their subdomains. Empty list = allow all — set it if you want defense in depth.
-- Every command is **logged** to `~/.ai-browser-bridge/bridge.log`.
+- Every command is **logged** to `~/.ai-browser-bridge/bridge.log` with its request
+  id, the client label and the run id, and ends in exactly one `done` / `refused` /
+  `cancelled` line.
+- The relay keeps a **registry of the tabs it opened** (`~/.ai-browser-bridge/tabs.json`:
+  tab id, Chrome session, who, when, which run, origin only — never page content or
+  full URLs). An agent run's tabs are closed when the run ends or its process dies;
+  only tabs the extension itself opened can ever be closed this way, and never a
+  whole window.
 - Commands run in **direct mode by default** (no debugger, no banner). The
   `chrome.debugger` route is opt-in via `--debugger` and gated behind approval —
   see [Direct mode by default, debugger on approval](#direct-mode-by-default-debugger-on-approval).

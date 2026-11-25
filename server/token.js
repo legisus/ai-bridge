@@ -9,6 +9,7 @@ const DIR = process.env.AI_BRIDGE_HOME || path.join(os.homedir(), ".ai-browser-b
 const TOKEN_FILE = path.join(DIR, "token");
 const LOG_FILE = path.join(DIR, "bridge.log");
 const SERVER_OUT = path.join(DIR, "server.out");
+const TABS_FILE = path.join(DIR, "tabs.json");   // registry of bridge-opened tabs (server/tabs.js)
 
 // Create the state dir and a random token on first use; return the token.
 // Returns { token, created } so callers can print a hint only on first run.
@@ -22,4 +23,4 @@ function ensureToken() {
   return { token: fs.readFileSync(TOKEN_FILE, "utf8").trim(), created };
 }
 
-module.exports = { DIR, TOKEN_FILE, LOG_FILE, SERVER_OUT, ensureToken };
+module.exports = { DIR, TOKEN_FILE, LOG_FILE, SERVER_OUT, TABS_FILE, ensureToken };

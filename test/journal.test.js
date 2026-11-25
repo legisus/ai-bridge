@@ -58,6 +58,24 @@ assert(J.summarize(withSessions).length === rows.length && J.summarize(withSessi
 const report = J.formatReport(rows, { days: 30 });
 assert(report.includes("* = economy-mode candidate") && /\*\s+4\s+75%/.test(report), "formatReport: marks candidate row");
 assert(J.formatReport([], { days: 7 }).includes("no agent runs"), "formatReport: empty");
+const leaky = J.summarize([rec({ job: "a", tabsRetained: 1 }), rec({ job: "a", tabsRetained: 0 }), rec({ job: "b", signature: "job:b" })]);
+assert(leaky.find((r) => r.signature === "job:a").tabsRetained === 1 && leaky.find((r) => r.signature === "job:b").tabsRetained === 0, "summarize: tabsRetained summed per job");
+const leakReport = J.formatReport(leaky, { days: 30 });
+assert(/tabs left/.test(leakReport) && /job:a/.test(leakReport.split("\n").find((l) => /\b1\s+job:a$/.test(l)) || ""), "formatReport: tabs left column shows retained tabs per job");
+
+// patchRun: the server updates a run's record in place (late tab closures)
+J.appendJournal(rec({ runId: "patchme", job: "p" }));
+assert(J.patchRun("patchme", { tabsClosed: 2, late: true }) === true, "patchRun returns true");
+const got = J.readJournal().find((r) => r.runId === "patchme");
+assert(got.tabsClosed === 2 && got.late === true && got.job === "p", "patchRun merges into the record in place");
+assert(J.patchRun("nope", { x: 1 }) === false, "patchRun unknown run → false");
+assert(J.readJournal().filter((r) => r.runId === "patchme").length === 1, "patchRun does not duplicate the record");
+// every journal writer takes the same lock: with the lock held, appendJournal waits and gives up instead of writing
+fs.writeFileSync(J.JOURNAL_FILE + ".lock", String(process.pid));
+let appendBlocked = false;
+try { J.appendJournal(rec({ runId: "locked" })); } catch (e) { appendBlocked = /busy/.test(e.message); }
+fs.unlinkSync(J.JOURNAL_FILE + ".lock");
+assert(appendBlocked && !J.readJournal().some((r) => r.runId === "locked"), "appendJournal takes the journal lock");
 
 console.log(failures === 0 ? "\nAll journal tests passed." : `\n${failures} test(s) FAILED.`);
 process.exit(failures ? 1 : 0);

@@ -91,6 +91,11 @@ details such as titles, values, file paths>
 Screenshots: <paths, or "none">
 Blockers: <what stopped you, or "none">`;
 
+// Overrides the playbook's "close your window's tabs when finished" rule when
+// the user asked to keep them (--keep-tabs or the task's own wording).
+const KEEP_TABS_ADDENDUM = `KEEP TABS OPEN: the user asked to keep the tabs you open. Do NOT close any tab
+or window when you finish; leave them exactly as they are.`;
+
 function judgePrompt(task, evidence) {
   return `You are a strict verifier. A browser-operations agent was given this task:
 
@@ -364,7 +369,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   const D = {
     runRecipe: recipes.runRecipe, loadRecipe: recipes.loadRecipe, getJob: jobs.getJob, putJob: jobs.putJob,
     loadJobs: jobs.loadJobs, readJournal: journal.readJournal, readTrace: journal.readTrace,
-    propose: proposeRecipe, runLogin: runLoginCmd, ...deps,
+    propose: proposeRecipe, runLogin: runLoginCmd, openLease: require("./lease").openLease, ...deps,
   };
   let blocker = null; // "auth" when the site wants a login nobody here can give; "cancelled" on abort
   const signal = opts.signal;
@@ -377,10 +382,18 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   // Common options for every model call of this run.
   const runOpts = (o) => ({ ...o, signal, baseEnv, cwd: opts.cwd, restricted });
 
+  // Who opened the tabs (server registry, `bridge closeTabs --mine`) and whether
+  // to leave them open: --keep-tabs, or the task's own "leave the tab open".
+  const client = opts.client || process.env.AI_BRIDGE_CLIENT || "bridge agent";
+  const keepTabs = !!opts.keepTabs || /\b(leave|keep)\b.{0,40}\btabs?\b.{0,20}\bopen\b/i.test(task);
+  let lease = null, leaseEnd = null;
+  const endLease = () => { if (lease && !leaseEnd) leaseEnd = lease.end().catch(() => null); return leaseEnd || Promise.resolve(null); };
+
   const auto = !opts.noAuto && opts.job !== "none";
   let job = opts.job && opts.job !== "none" ? String(opts.job).trim() : null;
   let autoMatch = null, childEnv, state = null, recipe = null, planned = { mode: "regular", judge: true }, newPhrasing = false;
   let mode = "regular", fellBack = false, mismatch = false, recipeResult = null;
+  try { // the lease ends on every exit path, including a thrown error (see finally)
   try {
   // ---- which job is this? explicit --job, or matched from the task text -------
   if (!job && auto) {
@@ -399,7 +412,13 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   // Child model processes inherit these; the CLI tags every bridge command
   // with them and the server writes traces/<runId>.jsonl.
   const restrictedEnv = restricted ? { AI_BRIDGE_RESTRICTED: "1" } : {};
-  childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}), ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
+  childEnv = { AI_BRIDGE_RUN_ID: runId, AI_BRIDGE_CLIENT: client, ...(job ? { AI_BRIDGE_JOB: job } : {}), ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
+
+  // Tab lease: the relay closes this run's tabs when the lease ends (runEnd, or
+  // this process dying). Bookkeeping only — a relay that cannot take the lease
+  // does not stop the run.
+  try { lease = await D.openLease({ runId, client, keepTabs }); }
+  catch (e) { if (verbose) console.error(`[agent] tab lease unavailable: ${e.message}`); }
 
   const judge = async (evidence) => {
     let judgeRes = await run(runOpts({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose }));
@@ -480,7 +499,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
           // says the recipe's result does not satisfy it: wrong job, not a
           // broken recipe. No penalty for the job; run the task on its own.
           mismatch = true; fellBack = true; job = null; state = null;
-          childEnv = { AI_BRIDGE_RUN_ID: runId, ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
+          childEnv = { AI_BRIDGE_RUN_ID: runId, AI_BRIDGE_CLIENT: client, ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
           feedback = `A recipe for a similar job (${autoMatch.job}) ran first but its result does not satisfy this task: ${v.feedback}`;
         } else {
           fellBack = true; feedback = `The deterministic recipe for this job ran but the judge rejected its evidence: ${v.feedback}`;
@@ -509,7 +528,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     // --only: stay on the start rung (no escalation to pricier models on a fail)
     let rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
     if (restricted && !opts.codex) rungs = rungs.filter((r) => r.engine !== "codex");
-    const playbookExtra = restricted ? restrictedRun.PLAYBOOK_ADDENDUM : "";
+    const playbookExtra = [restricted ? restrictedRun.PLAYBOOK_ADDENDUM : "", keepTabs ? KEEP_TABS_ADDENDUM : ""].filter(Boolean).join("\n\n");
     const opsTools = restricted ? restrictedRun.allowedTools(SELF_CMD) : [`Bash(${SELF_CMD}:*)`];
     for (const rung of rungs) {
       const opsPrompt = [
@@ -615,7 +634,8 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     } catch (e) { if (verbose) console.error(`[agent] job state write failed: ${e.message}`); }
   }
 
-  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence });
+  const tabs = await endLease();
+  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence, tabs });
   if (blocker) record.blocker = blocker;
   if (opts.source) record.source = String(opts.source);
   let journalFile = null;
@@ -625,6 +645,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
   return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, mode: journalMode, state, repaired, record, journalFile,
     autoMatch, mismatch, learned, blocker };
+  } finally { await endLease(); }
 }
 
 // Per-job login hook: a shell command (bridge jobs set <job> --login-cmd "…")
@@ -705,10 +726,11 @@ async function proposeRecipe({ job, task, traces, previous, failure, run = runMo
 
 // One journal.jsonl line for a finished run. Domains come from the run's trace
 // (newTab/navigate URLs), so auto signatures group by site even without --job.
-function journalRecord({ runId, job, task, startedAt, stages, verdict, mode, evidence }) {
+function journalRecord({ runId, job, task, startedAt, stages, verdict, mode, evidence, tabs }) {
   const domains = journal.domainsFromTrace(journal.readTrace(runId));
   const sum = (k) => stages.reduce((n, s) => n + (Number(s[k]) || 0), 0);
   return {
+    ...(tabs ? { tabsOpened: tabs.opened, tabsClosed: tabs.closed, tabsRetained: tabs.retained, keptTabs: tabs.kept } : {}),
     runId, job, signature: journal.signatureOf({ job, task, domains }), task,
     startedAt, endedAt: new Date().toISOString(), mode,
     verdict: verdict ? verdict.verdict : "fail",
@@ -755,9 +777,13 @@ function printJournalLine({ runId, job, journalFile, record, mode, state, repair
       (state.mode === "economy" ? ` (canary in ${(state.canaryEvery || 5) - (state.runsSinceCanary || 0)} runs)` : "") +
       (repaired && repaired.version ? `; recipe repaired → v${repaired.version}` : repaired && repaired.error ? `; repair failed: ${repaired.error}` : ""));
   }
+  const tabs = record && typeof record.tabsOpened === "number"
+    ? `; tabs: opened ${record.tabsOpened} closed ${record.tabsClosed} retained ${record.tabsRetained} kept ${record.keptTabs}` +
+      (record.tabsRetained + record.keptTabs > 0 ? `; ${record.tabsRetained + record.keptTabs} tab(s) left open (bridge tabs)` : "")
+    : "";
   console.log(`run ${runId}${job ? ` job=${job}` : ""}: ${cmds} bridge command(s) traced` +
     (record && record.domains.length ? ` on ${record.domains.join(", ")}` : "") +
-    (journalFile ? `; journaled (bridge journal --trace ${runId})` : ""));
+    (journalFile ? `; journaled (bridge journal --trace ${runId})` : "") + tabs);
 }
 
 async function main(argv) {
@@ -780,12 +806,13 @@ async function main(argv) {
     else if (args[i] === "--params") opts.params = JSON.parse(args[++i]);
     else if (args[i] === "--no-repair") opts.noRepair = true;
     else if (args[i] === "--no-auto") opts.noAuto = true;
+    else if (args[i] === "--keep-tabs") opts.keepTabs = true;
     else if (args[i] === "--help" || args[i] === "-h") { rest.length = 0; break; }
     else rest.push(args[i]);
   }
   const task = rest.join(" ").trim();
   if (!task) {
-    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name|none] [--params json] [--no-repair] [--no-auto]');
+    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name|none] [--params json] [--no-repair] [--no-auto] [--keep-tabs]');
     process.exit(2);
   }
 

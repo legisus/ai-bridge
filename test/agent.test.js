@@ -111,6 +111,46 @@ function mockRun(judgeVerdicts) {
     assert(rows.some((x) => x.signature === "job:toll-invoices" && x.runs === 1), "journal: appended to journal.jsonl");
   }
 
+  // 8b) tab lease: opened with runId/client/keepTabs, ended on every exit path, counters journaled
+  function mockLease() {
+    const calls = [];
+    const open = async (o) => { calls.push({ open: o }); return { end: async () => { calls.push({ end: o.runId }); return { opened: 2, closed: 1, retained: 1, kept: 0 }; }, close() {} }; };
+    return { open, calls };
+  }
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']); const L = mockLease();
+    const r = await runAgent("test task", { runId: "leaseok00001" }, m.run, { openLease: L.open });
+    assert(L.calls[0].open.runId === "leaseok00001" && L.calls[0].open.client === "bridge agent" && L.calls[0].open.keepTabs === false, "lease: opened with runId/client/keepTabs");
+    assert(L.calls.filter((c) => c.end === "leaseok00001").length === 1 && r.record.tabsOpened === 2 && r.record.tabsClosed === 1 && r.record.tabsRetained === 1 && r.record.keptTabs === 0, "lease: runEnd sent once; counters in the journal record");
+    assert(m.calls[0].env.AI_BRIDGE_CLIENT === "bridge agent", "lease: children get AI_BRIDGE_CLIENT");
+  }
+  {
+    const m = mockRun(['{"verdict":"fail","feedback":"no"}', '{"verdict":"fail","feedback":"no"}', '{"verdict":"fail","feedback":"no"}']); const L = mockLease();
+    await runAgent("test task", {}, m.run, { openLease: L.open });
+    assert(L.calls.filter((c) => c.end).length === 1, "lease: a run that fails every rung still sends runEnd exactly once");
+  }
+  {
+    const L = mockLease(); const thrower = async () => { throw new Error("model exploded"); };
+    let threw = false; try { await runAgent("t", {}, thrower, { openLease: L.open }); } catch { threw = true; }
+    assert(threw && L.calls.some((c) => c.end), "lease: runEnd sent even when the ladder throws");
+  }
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']); const L = mockLease();
+    await runAgent("open the page and leave the tab open for me", {}, m.run, { openLease: L.open });
+    assert(L.calls[0].open.keepTabs === true, "lease: 'leave the tab open' in the task → keepTabs");
+    const L2 = mockLease(); const m2 = mockRun(['{"verdict":"fail","feedback":"x"}', '{"verdict":"pass","feedback":"ok"}']);
+    await runAgent("t", { keepTabs: true }, m2.run, { openLease: L2.open });
+    assert(L2.calls[0].open.keepTabs === true, "lease: --keep-tabs → keepTabs");
+    const ops = m2.calls.filter((c) => !c.prompt.includes("strict verifier"));
+    assert(ops.length === 2 && ops.every((c) => /KEEP TABS OPEN/.test(c.prompt)), "lease: --keep-tabs tells every ops rung to leave its tabs open");
+    assert(!m.calls.some((c) => /KEEP TABS OPEN/.test(c.prompt) && !/leave the tab open/.test(c.prompt)), "lease: without keepTabs the prompt keeps the close-your-tabs rule");
+  }
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    const r = await runAgent("t", {}, m.run, { openLease: async () => { throw new Error("ECONNREFUSED"); } });
+    assert(r.verdict.verdict === "pass" && r.record.tabsOpened === undefined, "lease: lease failure does not fail the run; counters omitted");
+  }
+
   // 9) journal: auto signature uses domains from the run's trace
   {
     journal.appendTrace("testrun0002", { cmd: "newTab", params: { url: "https://www.kbb.com/x" }, ok: true });
