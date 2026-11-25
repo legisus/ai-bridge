@@ -40,7 +40,7 @@ const assert = (cond, name) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}
     assert(same.length === 2 && new RegExp(`^\\S+ ${reqId} unit test logrun0001 done ok \\d+ms$`).test(same[1]), "done line once, same reqId");
     assert(lines.some((l) => /^\S+ [0-9a-f]{16} unit test logrun0001 refused access_revoked$/.test(l)), "refused line with code");
     assert(lines.some((l) => /^\S+ [0-9a-f]{16} unit test logrun0001 cancelled extension disconnected$/.test(l)), "cancelled line");
-    assert(lines.filter((l) => / (done|refused|cancelled) /.test(l)).length === 3, "each terminal outcome logged exactly once");
+    assert(lines.filter((l) => / unit test logrun0001 (done|refused|cancelled) /.test(l)).length === 3, "each terminal outcome logged exactly once");
 
     // trace
     const t = fs.readFileSync(path.join(relay.home, "traces", "logrun0001.jsonl"), "utf8").trim().split("\n").map(JSON.parse);

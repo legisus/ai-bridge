@@ -16,7 +16,8 @@
 
 const { WebSocketServer } = require("ws");
 const fs = require("fs");
-const { TOKEN_FILE, LOG_FILE, ensureToken } = require("./token");
+const { TOKEN_FILE, LOG_FILE, TABS_FILE, ensureToken } = require("./token");
+const { openRegistry } = require("./tabs");
 const crypto = require("crypto");
 const { appendTrace, safeRunId } = require("./journal");
 const { normalizeAccess, stateOf, ACCESS_REVOKED, ACCESS_NOT_GRANTED } = require("./access");
@@ -42,6 +43,8 @@ let ext = null;                       // { sock, gen, access } — the single ex
 let extGen = 0;                       // bumped on every extension authentication
 const pending = new Map();            // request id -> { id, sock, cmd, params, meta, t0, gen }
 const PASS_ALWAYS = new Set(["ping", "status"]); // touch no tab: forwarded whatever the access state
+const registry = openRegistry(TABS_FILE, { log });  // tabs the bridge opened (server/tabs.js)
+let internalSeq = 0;
 
 const accessState = () => (ext ? stateOf(ext.access) : "not_granted");
 const sessionName = () => (ext && ext.access ? ext.access.session : "chrome");
@@ -75,6 +78,7 @@ function finish(req, outcome) {
     error = outcome.reason;
     log(`${who} cancelled ${error}`);
   }
+  noteOutcome(req, ok, result);
   if (req.runId) {
     const as = req.meta && req.meta.as && typeof req.meta.as === "object" ? req.meta.as : null; // e.g. snapshot sent as eval
     appendTrace(req.runId, {
@@ -88,6 +92,47 @@ function finish(req, outcome) {
   if (req.sock && req.sock.readyState === 1) req.sock.send(JSON.stringify(msg));
   if (req.resolve) req.resolve({ ok, result, error });
 }
+// Registry bookkeeping on a request's terminal outcome. Creation records are
+// completed here whether or not the CLI that asked is still connected.
+function noteOutcome(req, ok, result) {
+  const p = req.params && typeof req.params === "object" ? req.params : {};
+  if (req.cmd === "newTab") {
+    if (ok && result && Number.isInteger(result.id)) registry.completePending(req.id, result.id);
+    else registry.dropPending(req.id);
+    return;
+  }
+  if (!ok) return;
+  if (Number.isInteger(p.tabId)) registry.touch(p.tabId, Date.now());
+  if (req.cmd === "closeTab" && Number.isInteger(p.tabId)) registry.remove([p.tabId]);
+  else if (req.cmd === "closeTabs" && result && Array.isArray(result.closed)) registry.remove(result.closed);
+  else if (req.cmd === "status" && result && Array.isArray(result.agentTabs)) registry.reconcile(result.agentTabs);
+}
+
+// A command the server itself sends to the extension (cleanup, reconciliation).
+// Same gate, same finish(), ids srv-<n>; resolves { ok, result?, error? }.
+function sendInternal(cmd, params) {
+  return new Promise((resolve) => {
+    const req = { id: `srv-${++internalSeq}`, sock: null, cmd, params, meta: null, t0: Date.now(), gen: ext ? ext.gen : 0, client: "server", runId: null, resolve };
+    dispatch(req);
+  });
+}
+
+// Accept a request: log it, refuse it locally when it cannot be forwarded, or
+// forward it to the extension (recording a pending creation for newTab).
+function dispatch(req) {
+  pending.set(req.id, req);
+  log(`${req.id} ${req.client} ${req.runId || "-"} cmd ${req.cmd} ${JSON.stringify(req.params || {}).slice(0, 200)}`);
+  if (!extUp()) return finish(req, { kind: "refused", error: "extension not connected" });
+  if (!PASS_ALWAYS.has(req.cmd) && accessState() !== "granted") {
+    return finish(req, { kind: "refused", error: ext.access == null ? ACCESS_NOT_GRANTED(sessionName()) : ACCESS_REVOKED(sessionName()) });
+  }
+  if (req.cmd === "newTab") {
+    const p = req.params && typeof req.params === "object" ? req.params : {};
+    registry.addPending({ reqId: req.id, runId: req.runId, client: req.client, origin: registry.originOf(p.url), createdAt: req.t0, browserSession: ext.access.browserSession });
+  }
+  ext.sock.send(JSON.stringify({ type: "command", id: req.id, cmd: req.cmd, params: req.params }));
+}
+
 // Cancel every pending request of one extension generation that `filter` selects.
 function cancelPending(gen, filter, reason) {
   for (const r of [...pending.values()]) if (r.gen === gen && filter(r)) finish(r, { kind: "cancelled", reason });
@@ -133,15 +178,8 @@ wss.on("connection", (sock) => {
     if (role === "cli" && msg.type === "request") {
       // meta: { client, runId?, job?, as? } from the CLI (AI_BRIDGE_CLIENT, AI_BRIDGE_RUN_ID…).
       const meta = msg.meta && typeof msg.meta === "object" ? msg.meta : null;
-      const req = { id: String(msg.id), sock, cmd: msg.cmd, params: msg.params, meta, t0: Date.now(), gen: ext ? ext.gen : 0,
-        client: sanitizeClient(meta && meta.client), runId: meta ? safeRunId(meta.runId) : null };
-      pending.set(req.id, req);
-      log(`${req.id} ${req.client} ${req.runId || "-"} cmd ${msg.cmd} ${JSON.stringify(msg.params || {}).slice(0, 200)}`);
-      if (!extUp()) return finish(req, { kind: "refused", error: "extension not connected" });
-      if (!PASS_ALWAYS.has(msg.cmd) && accessState() !== "granted") {
-        return finish(req, { kind: "refused", error: ext.access == null ? ACCESS_NOT_GRANTED(sessionName()) : ACCESS_REVOKED(sessionName()) });
-      }
-      ext.sock.send(JSON.stringify({ type: "command", id: msg.id, cmd: msg.cmd, params: msg.params }));
+      dispatch({ id: String(msg.id), sock, cmd: msg.cmd, params: msg.params, meta, t0: Date.now(), gen: ext ? ext.gen : 0,
+        client: sanitizeClient(meta && meta.client), runId: meta ? safeRunId(meta.runId) : null });
       return;
     }
 
@@ -159,6 +197,11 @@ wss.on("connection", (sock) => {
       }
       // The extension will refuse them anyway; do not make the CLI wait for that.
       if (next !== "granted") cancelPending(ext.gen, (r) => !PASS_ALWAYS.has(r.cmd), ACCESS_REVOKED(a.session));
+      if (a.browserSession) {
+        if (registry.browserSession !== a.browserSession) registry.setBrowserSession(a.browserSession);
+        // Reconcile the registry against what the extension still owns.
+        if (next === "granted") sendInternal("status", {});
+      }
       return;
     }
 

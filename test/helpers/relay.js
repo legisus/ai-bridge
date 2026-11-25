@@ -52,10 +52,12 @@ function startRelay({ env = {}, home } = {}) {
 // A simulated extension socket. Sends `access granted` after auth unless
 // access === false. `handler(cmd, params, id)` returns the result, or
 // undefined to leave the command unanswered (answer later with respond()).
-function fakeExtension(relay, { browserSession = randomHex32(), session = "chrome", access = true, handler } = {}) {
+// `hold(cmd, params)` → true leaves a command unanswered while the default
+// handler serves everything else.
+function fakeExtension(relay, { browserSession = randomHex32(), session = "chrome", access = true, handler, hold, agentTabs = [] } = {}) {
   const ws = new WebSocket(`ws://127.0.0.1:${relay.port}`);
   const ext = {
-    ws, browserSession, session, received: [], agentTabs: [],
+    ws, browserSession, session, received: [], agentTabs: [...agentTabs],
     nextTabId: 100,
     sendAccess(fields = {}) {
       ws.send(JSON.stringify({ type: "access", session, granted: true, until: null, gen: 1, browserSession, ...fields }));
@@ -109,6 +111,7 @@ function fakeExtension(relay, { browserSession = randomHex32(), session = "chrom
       }
       if (msg.type !== "command") return;
       ext.received.push(msg);
+      if (hold && hold(msg.cmd, msg.params || {})) return;
       let result = handler ? handler(msg.cmd, msg.params || {}, msg.id) : undefined;
       if (result === undefined && !handler) result = defaultHandler(msg.cmd, msg.params || {});
       else if (result === undefined && handler) result = undefined;
