@@ -98,6 +98,10 @@ on the same page: [Binary install](docs/INSTALL.md#binary-install-no-nodejs).
 6. **Keep it running:** not needed with the native host — Chrome starts the server
    on demand. Otherwise copy a template from `deploy/`, fix the paths, load it.
 
+Running the relay and the agent in **Docker** on a PC while Chrome stays on the
+host, with grant/revoke from the extension: see [docs/DOCKER.md](docs/DOCKER.md)
+(`Dockerfile`, `deploy/docker/compose.yml`, `test/docker-smoke.sh`).
+
 ## Usage
 
 ```bash
