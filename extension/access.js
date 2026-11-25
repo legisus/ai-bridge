@@ -158,6 +158,36 @@
 
     ACCESS_REVOKED, ACCESS_NOT_GRANTED,
 
+    // ---- target rules ----------------------------------------------------------
+    // Only http(s) documents are ever a target: not Chrome's own pages, not this
+    // extension's pages, not file:, javascript:, data: or view-source:. The
+    // allowlist cannot override this (`*` means any http(s) host).
+    isHttpUrl(url) {
+      try { const u = new URL(String(url)); return (u.protocol === "http:" || u.protocol === "https:") && !!u.hostname; } catch { return false; }
+    },
+    assertTarget(url) { if (!this.isHttpUrl(url)) throw new Error("privileged target refused"); },
+    hostAllowed(host, allowlist) {
+      if (!Array.isArray(allowlist) || allowlist.length === 0) return true; // empty = allow all (see README)
+      return allowlist.some((pat) => pat === "*" || host === pat || host.endsWith("." + pat));
+    },
+    assertAllowedUrl(url, allowlist) {
+      this.assertTarget(url);
+      const host = new URL(String(url)).hostname;
+      if (!this.hostAllowed(host, allowlist)) throw new Error(`host "${host}" not in allowlist`);
+    },
+    // A tab the agent may not touch is listed with its id only.
+    redactTabs(tabs, allowlist, agentTabIds = []) {
+      return (tabs || []).map((t) => {
+        const ok = this.isHttpUrl(t.url) && this.hostAllowed(new URL(t.url).hostname, allowlist);
+        const base = { id: t.id, windowId: t.windowId, active: t.active };
+        if (agentTabIds.includes(t.id)) base.agent = true;
+        return ok ? { ...base, url: t.url, title: t.title } : { ...base, url: "redacted" };
+      });
+    },
+    // A fresh or empty tab: no document to protect, so a command that supplies
+    // its own destination (navigate) may use it.
+    blankUrl(url) { const u = String(url || ""); return u === "" || u === "about:blank" || /^chrome:\/\/newtab\/?$/.test(u) || /^chrome:\/\/new-tab-page\/?/.test(u); },
+
     // ---- alarms, reload, startup --------------------------------------------
     // `access-expiry-<gen>` fires the revoke on time; the gen in the name keeps
     // a stale alarm from an earlier grant away from a renewed one.

@@ -297,6 +297,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await alarmP; await renew;
   assert((await B.readAccess()).granted === true, "an alarm racing a renewal cannot revoke the renewed grant");
 
+  // ---- Task 1 (target guard): pure target rules ----------------------------
+  for (const u of ["chrome://extensions", "chrome-extension://x/options.html", "about:blank", "javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "view-source:https://a", "devtools://x", "edge://x", "brave://x", "", undefined, "https://"]) {
+    let te = null; try { B.assertTarget(u); } catch (e) { te = e.message; }
+    assert(te === "privileged target refused", `assertTarget refuses ${JSON.stringify(u)}`);
+  }
+  for (const u of ["https://a.example/p?q=1", "http://localhost:8080/"]) { let te = null; try { B.assertTarget(u); } catch (e) { te = e.message; } assert(te === null && B.isHttpUrl(u), `assertTarget passes ${u}`); }
+  assert(B.hostAllowed("a.b.example", ["example"]) && B.hostAllowed("a.b.example", ["b.example"]) && !B.hostAllowed("a.b.example", ["c.example"]) && B.hostAllowed("x", []) && B.hostAllowed("x", ["*"]) && !B.hostAllowed("notexample.com", ["example.com"]), "hostAllowed: exact, subdomain, empty = all, *");
+  let te = null; try { B.assertAllowedUrl("chrome://x", ["*"]); } catch (e) { te = e.message; }
+  assert(te === "privileged target refused", "assertAllowedUrl: privileged first, even with *");
+  te = null; try { B.assertAllowedUrl("https://no.example/", ["ok.example"]); } catch (e) { te = e.message; }
+  assert(te === 'host "no.example" not in allowlist', "assertAllowedUrl: host outside the allowlist");
+  te = null; try { B.assertAllowedUrl("https://sub.ok.example/x", ["ok.example"]); } catch (e) { te = e.message; }
+  assert(te === null, "assertAllowedUrl: subdomain allowed");
+  const tabs = [{ id: 1, windowId: 1, active: true, url: "https://ok.example/x", title: "T" }, { id: 2, windowId: 1, active: false, url: "chrome://extensions", title: "E" }, { id: 3, windowId: 2, active: true, url: "https://no.example", title: "N" }];
+  let red = B.redactTabs(tabs, ["ok.example"], [3]);
+  assert(red[0].url === "https://ok.example/x" && red[0].title === "T" && red[0].windowId === 1, "redactTabs: allowed tab in full");
+  assert(red[1].url === "redacted" && !("title" in red[1]) && red[1].id === 2 && red[1].active === false, "redactTabs: privileged tab redacted, no title");
+  assert(red[2].url === "redacted" && !("title" in red[2]) && red[2].agent === true, "redactTabs: disallowed tab redacted, marked agent");
+  red = B.redactTabs(tabs, [], []);
+  assert(red[2].url === "https://no.example" && red[1].url === "redacted", "redactTabs: empty allowlist still redacts privileged tabs");
+  assert(B.blankUrl("about:blank") && B.blankUrl("chrome://newtab/") && B.blankUrl("") && B.blankUrl(undefined) && !B.blankUrl("chrome://extensions"), "blankUrl");
+  const man2 = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "extension", "manifest.json"), "utf8"));
+  assert(man2.permissions.includes("webNavigation"), "manifest: webNavigation permission");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
