@@ -92,6 +92,8 @@ for each is in
 | 10 | Several browser sessions on one relay (Chrome + Edge, two profiles): registry keyed by session name, `--session` on the CLI. | Not needed for one browser; today a second extension supersedes the first. | Later |
 | 11 | `bridge token --rotate`. | Convenience; the manual procedure is below. | Later |
 | 12 | The restricted-run env filter (`server/channels/restricted.js`) passes `AI_BRIDGE_HOME`, `AI_BRIDGE_DEBUGGER` and `AI_BRIDGE_CODEX_SANDBOX` through to channel children (never messenger tokens). | Today it keeps only `BRIDGE_PORT`, so a channel run inside the container would look for the token under `/home/node/.ai-browser-bridge` and exit 6. | **Yes** |
+| 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in the popup and printed by `bridge status --events`; every error the extension returns carries the request id, and every server log line carries the request id, the client label and the run id. | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, and the server log says `cmd newTab {...}` without saying who asked. | **Yes** |
+| 14 | Tab hygiene: the server records every tab and window a run opens and closes them when the run ends, whatever the outcome (`--keep-tabs` to opt out); `bridge tabs` lists bridge-opened tabs with age and owner; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
 
 Nothing in the extension's command set changes. The wire protocol gains one message
 type, `access`, plus `session` and `access` fields on the results of `ping` and
@@ -475,6 +477,49 @@ appears under `/work`.
 - Named volumes live inside Docker's WSL distro.
   `docker compose -f deploy/docker/compose.yml exec bridge cat /data/token` is how
   you read anything from them.
+
+## Debugging
+
+Everything the bridge writes lives in the `data` volume, so it survives restarts
+and is readable from the PC:
+
+```
+docker compose -f deploy/docker/compose.yml logs -f bridge          # server log (also /data/bridge.log)
+docker compose -f deploy/docker/compose.yml exec bridge sh -c 'tail -50 /data/bridge.log'
+bridge status --events                                              # extension's last 200 events (grant, revoke, refused, closed tab…)
+bridge journal                                                      # agent runs, verdicts, cost
+bridge journal --trace <runId>                                      # every bridge command of one run
+bridge tabs                                                         # tabs the bridge opened, with age, owner and run id
+docker compose -f deploy/docker/compose.yml --profile channels logs -f channels   # Telegram daemon (also /data/channels.log, rotated)
+```
+
+Each server log line names the client label (`AI_BRIDGE_CLIENT`, default the
+process name), the run id when the command came from an agent run, and the request
+id. The same request id is in every error the extension returns, so an
+`access_revoked` or `target changed` seen by the CLI can be matched to the
+extension's event list and to the trace line. The extension's own `console` output
+is at `chrome://extensions` → the bridge card → **service worker**.
+
+`bridge agent … --verbose` prints each rung's model, judge verdict and token spend
+while the run goes. A run stopped by a revoke ends with the structured reason
+`access_revoked` rather than a model failure.
+
+Node's inspector is deliberately not exposed by the compose file (it would be
+another published port). To step through the server, run it on the PC outside
+Docker for that session.
+
+### Abandoned tabs
+
+Tabs the bridge opens are supposed to be closed by whoever opened them. In
+practice they are not: a model may ignore the "close your window's tabs" rule, a
+run that fails, times out or is revoked never reaches it, and launchd jobs that
+drive the CLI directly have no cleanup step at all. Change #14 fixes this at the
+server: it remembers every tab and window a run opened and closes them when the
+run ends (any outcome) unless the run was started with `--keep-tabs` or the task
+says to leave a tab open. For direct CLI use, `bridge tabs` shows what is open and
+who opened it, and `bridge closeTabs --older-than 60` closes bridge-opened tabs
+untouched for an hour; nothing the user opened is ever touched. The popup gets a
+standalone **Close agent tabs** button for the same purpose, without revoking.
 
 ## Troubleshooting
 
