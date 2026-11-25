@@ -8,7 +8,7 @@ const os = require("os");
 // Journal/trace files go to a temp state dir, never the real ~/.ai-browser-bridge.
 process.env.AI_BRIDGE_NO_ACCESS_GATE = "1"; // unit tests inject a mock runner; there is no relay to ping
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(require("path").join(os.tmpdir(), "ai-bridge-agent-"));
-const { runAgent, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL } =
+const { runAgent, journalRecord, parseVerdict, extractEvidence, codexArgs, OPS_LADDER, JUDGE_MODEL } =
   require("../server/agent.js");
 const journal = require("../server/journal.js");
 
@@ -150,6 +150,17 @@ function mockRun(judgeVerdicts) {
     const m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
     const r = await runAgent("t", {}, m.run, { openLease: async () => { throw new Error("ECONNREFUSED"); } });
     assert(r.verdict.verdict === "pass" && r.record.tabsOpened === undefined, "lease: lease failure does not fail the run; counters omitted");
+  }
+
+  // 8c) codex sandbox: inside the container the container is the sandbox
+  {
+    const base = { model: "gpt-6-astra", effort: "medium", cwd: "/w", outPath: "/o", prompt: "p" };
+    const host = codexArgs(base, {});
+    assert(host.includes("-s") && host[host.indexOf("-s") + 1] === "workspace-write" && host.includes("sandbox_workspace_write.network_access=true"), "codexArgs: host default keeps workspace-write with network");
+    const inContainer = codexArgs(base, { AI_BRIDGE_CODEX_SANDBOX: "container" });
+    assert(inContainer.includes("--sandbox") && inContainer[inContainer.indexOf("--sandbox") + 1] === "danger-full-access" && !inContainer.includes("workspace-write") && !inContainer.some((a) => /network_access/.test(a)), "codexArgs: AI_BRIDGE_CODEX_SANDBOX=container runs codex without its own sandbox");
+    assert(JSON.stringify(codexArgs(base, { AI_BRIDGE_CODEX_SANDBOX: "other" })) === JSON.stringify(host), "codexArgs: any other value keeps the host arguments");
+    assert(inContainer.slice(-1)[0] === "p" && inContainer.includes("-o") && inContainer[inContainer.indexOf("-o") + 1] === "/o", "codexArgs: prompt last, output path kept");
   }
 
   // 9) journal: auto signature uses domains from the run's trace
