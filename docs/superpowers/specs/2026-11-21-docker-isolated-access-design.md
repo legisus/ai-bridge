@@ -100,16 +100,27 @@ for every command, not only `newTab`/`navigate`.
 ## Wire contract (canonical)
 
 Today, after `{type:"auth"}` the server sends `{type:"auth",ok:true}` and the
-extension waits for `{type:"command"}` messages. One message type is added, two
-fields are merged into two results, and two error codes are defined. Both documents
-use only these.
+extension waits for `{type:"command"}` messages. This section is the whole list of
+what is added: the `access` message (extension → server), the `run` / `runEnd`
+messages (supervisor → server, on a lease socket), one extension command
+(`closeTabs`), one option on `status` (`events`), fields merged into the `ping` /
+`status` results, and two error codes. Both documents use only these.
 
 **`access`, extension → server.** Sent once right after `auth ok` (before the
 extension accepts any command on that socket) and again on every change:
 
 ```json
-{ "type": "access", "session": "work-chrome", "granted": true, "until": null, "gen": 3 }
+{ "type": "access", "session": "work-chrome", "granted": true, "until": null, "gen": 3,
+  "browserSession": "c1d2…(32 hex)" }
 ```
+
+- `browserSession` — a random 128-bit id that identifies the current Chrome
+  session (see Tab hygiene). The worker initialises it **on every worker start if
+  it is missing** from session storage, not only in `onStartup`: an install or an
+  extension reload clears session storage without a profile startup, so relying on
+  `onStartup` alone would leave it absent. The extension does not send `access` or
+  accept a command until it exists. The server treats an `access` message without
+  a well-formed `browserSession` as **revoked** (fail closed) and logs it.
 
 - `session` — the user-chosen name (Options; default `"chrome"`; 1–40 printable
   characters; the server truncates and strips control characters before logging).
@@ -151,6 +162,36 @@ instance, so two Chrome profiles can both be at `3`; on its own it does not iden
 The triple `(serverId, extGen, accessGen)` is the identity a run latches: any change
 means a different server, a different (or reconnected) extension, or a different
 grant.
+
+**`run` / `runEnd`, supervisor → server.** Sent on a dedicated CLI-role socket
+that the supervisor keeps open for the life of a run (authenticated with the token
+like any CLI socket):
+
+```json
+{ "type": "run",    "runId": "22d938490de9", "client": "bridge agent", "keepTabs": false }
+{ "type": "runEnd", "runId": "22d938490de9" }
+```
+
+`runId` must match the `meta.runId` the run's commands carry; a second `run` for a
+live `runId` is refused. The socket closing without `runEnd` is treated as
+`runEnd` after the drain described under Tab hygiene. Neither message needs
+access: registering or ending a run is not a browser operation.
+
+**`closeTabs`, server → extension.** The only new extension command:
+
+```json
+{ "type": "command", "id": 41, "cmd": "closeTabs", "params": { "tabIds": [580216684, 580216690] } }
+{ "type": "response", "id": 41, "ok": true, "result": { "closed": [580216684], "skipped": [580216690] } }
+```
+
+The extension closes only the ids that are in its own `agentTabs` for the current
+browser session and reports the rest as `skipped`. It is subject to the access
+gates like every other command. It is reachable from the CLI as `bridge closeTabs`
+(restricted children: denied) and used by the server for run cleanup.
+
+**`status {events:true}`.** Adds the projected event buffer (see Observability) to
+the `status` result; without the option `status` is unchanged apart from the merged
+fields.
 
 **Server bind.** `BRIDGE_BIND` (default `127.0.0.1`) is the listen address. The CLI
 keeps connecting to `127.0.0.1:BRIDGE_PORT`; no client-side variable is added in v1.
@@ -438,7 +479,14 @@ The service worker logs nothing today. It gains:
   `kind`; while granted it carries the entries, but `origin` is replaced by
   `"redacted"` for any origin that is privileged or not in the *current* allowlist,
   `tabId` is dropped for those entries, and `detail` is limited to an enumerated
-  set of fields (`reason`, `source`, `gen`, `until`). A refusal event for a
+  set of fields (`reason`, `source`, `gen`, `until`) whose **values** are fixed
+  codes, never error strings: `reason` ∈ {`access_revoked`, `access_not_granted`,
+  `privileged_target`, `not_allowed`, `target_changed`, `extension_disconnected`},
+  `source` ∈ {`popup`, `options`, `alarm`, `reload`, `startup`}, `gen` and `until`
+  numbers. Existing error strings embed hosts (`not allowed: <host>`), so they are
+  mapped to the code and the string itself is never stored in `detail`. The
+  projection test records a refusal for a disallowed `https://secret.example` and
+  asserts the host appears nowhere in the projected JSON. A refusal event for a
   disallowed target therefore never tells the container what the target was, and
   entries recorded before an allowlist change are projected with the rules of
   now, not then.
@@ -484,8 +532,9 @@ does not forget them:
 { tabId, browserSession, runId?, client, origin, createdAt, lastCmdAt, reqId }
 ```
 
-- `browserSession` is a random id the extension draws on `chrome.runtime.onStartup`
-  (kept in session storage) and sends in every `access` message. A record whose
+- `browserSession` is the id defined in the wire contract: drawn on any worker
+  start that finds none in session storage (so install and reload are covered, not
+  only `onStartup`), and sent in every `access` message. A record whose
   `browserSession` is not the current one is **dead**: never acted on, shown by
   `bridge tabs` as "from an earlier Chrome session", and pruned on the next
   reconciliation. Bare tab ids are meaningless across browser sessions (Chrome
@@ -493,9 +542,11 @@ does not forget them:
   run's cleanup from hitting a replacement browser.
 - `client` and `runId` come from the request (`AI_BRIDGE_CLIENT`, `meta.runId`);
   direct CLI use has a client and no run, so `--mine` and age work for launchd jobs
-  too. `lastCmdAt` is maintained by the **server**, which sees every command that
-  names a `tabId`, so it does not depend on the worker's `lastActivity` map (which
-  is in memory, is not set on creation and is deleted on debugger detach).
+  too. `lastCmdAt` is set to `createdAt` when the record is created (`newTab` has
+  no input `tabId`, so a never-touched tab would otherwise have no activity time)
+  and then maintained by the **server**, which sees every command that names a
+  `tabId`; it does not depend on the worker's `lastActivity` map (which is in
+  memory, is not set on creation and is deleted on debugger detach).
 - **Bookkeeping is independent of response delivery.** The server records a
   creation as *pending* (`reqId`, run, client, origin, `createdAt`) when it
   forwards a `newTab`, and completes the record when the extension's response
@@ -514,7 +565,12 @@ does not forget them:
   `{type:"runEnd", runId}` or the socket closes for any reason (crash, SIGKILL,
   machine sleep that drops the connection), the server marks the run *ending*,
   waits up to 5 s for creations still pending for that run (a `newTab` whose
-  response has not arrived), then issues cleanup. A process that dies cannot run
+  response has not arrived), then issues cleanup. Pending records are **not**
+  dropped at the deadline: a response that arrives later completes the record,
+  marks it `late`, and, if the run was not `keepTabs` and access is granted,
+  triggers one more `closeTabs` for that id; the run's journal counters
+  (`tabsClosed` / `tabsRetained`) are updated in place with `late: true`, so the
+  totals stay right. A process that dies cannot run
   its own `finally`; the OS closing its socket is the signal that does not depend
   on it. `keepTabs` (CLI `--keep-tabs`, or the task's existing "leave the tab open"
   escape) makes `runEnd` and lease loss record the tabs as kept instead.
@@ -662,7 +718,12 @@ does not forget them:
   log and trace carry `reqId`, client and run id for a forwarded result, a local
   refusal and a cancellation, each exactly once; `status {events:true}` while
   revoked returns counts only, and while granted returns `"redacted"` origins for
-  entries whose origin is outside the current allowlist; a `tabs.json` written
+  entries whose origin is outside the current allowlist and no host string
+  anywhere in the projection; a `newTab` response arriving after the 5-s drain
+  completes the record, triggers a late `closeTabs` and updates the counters;
+  `--older-than` selects a tab that received no command after creation, by its
+  `createdAt`; an `access` message without `browserSession` is treated as revoked;
+  a `run` for an already live `runId` is refused; a `tabs.json` written
   by a previous server process is loaded and reconciled on start.
 - `test/cli.*` additions: `ERROR: … (req <id>)` is printed on failure with exit 8
   still recognised; `tabs` and `closeTabs` are refused under a restricted run.
@@ -675,8 +736,9 @@ does not forget them:
   a refused command writes an event with the request's `reqId`; `closeTabs
   {tabIds}` closes only the intersection with `agentTabs` and reports it, so a
   user tab opened in the agent's window is untouched; **Close agent tabs** closes
-  `agentTabs` and leaves `access` unchanged; `browserSession` changes after a
-  simulated `onStartup`.
+  `agentTabs` and leaves `access` unchanged; `browserSession` is created on a
+  worker start with empty session storage (install, reload) and changes after a
+  simulated `onStartup`; no `access` message is sent before it exists.
 - `test/channels.restricted.test.js`: `cleanEnv` passes `AI_BRIDGE_HOME`,
   `AI_BRIDGE_DEBUGGER`, `AI_BRIDGE_CODEX_SANDBOX` and still drops every
   `AI_BRIDGE_*_TOKEN`.
