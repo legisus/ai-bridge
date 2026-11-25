@@ -2,6 +2,13 @@
 // Maintains a WebSocket to the local bridge server and executes commands
 // against chrome.* APIs.
 //
+// Access (extension/access.js): the user grants or revokes the bridge's access
+// to this Chrome session from the popup or Options. Every command captures the
+// access generation when it starts, is checked before it runs and after every
+// await that precedes a browser operation, and every browser operation itself
+// goes through BridgeAccess.dispatch(gen, …) — the last check and the call are
+// one synchronous step, so a revoke never lets a queued operation through.
+//
 // Direct mode (params.direct === true — the CLI default): the command is
 // executed with ordinary extension APIs and never attaches chrome.debugger.
 // eval runs through chrome.userScripts.execute() in the page's MAIN world
@@ -16,9 +23,11 @@
 // protocol), which rich-text editors and CSP-strict apps require, plus pdf and
 // background-tab screenshots. Chrome shows its banner while it is attached.
 
-importScripts("access.js"); // BridgeAccess: browserSession, access message, agentTabs, closeTabs
+importScripts("access.js"); // BridgeAccess: access record + transition, browserSession, agentTabs, downloads
 
-const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "", session: "chrome" };
+const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "", session: "chrome", manualMode: false };
+const PASS_ALWAYS = new Set(["ping", "status"]); // touch no tab: served whatever the access state
+const TYPE_CHUNK = 20; // direct-mode `type` runs from the worker in chunks, with an access check between chunks
 
 let ws = null;
 let attached = new Set(); // tabIds with debugger attached
@@ -32,6 +41,36 @@ async function config() {
   return { ...DEFAULTS, ...stored };
 }
 
+// ---------- access wiring ----------
+
+function setBadge({ text, color }) {
+  try { chrome.action.setBadgeText({ text: text || "" }); chrome.action.setBadgeBackgroundColor({ color: color || "#9e9e9e" }); } catch {}
+}
+async function refreshBadge() {
+  try { setBadge(BridgeAccess.badgeState(await BridgeAccess.readAccess())); } catch {}
+}
+// Revoke step: release every attached tab and every attach still in flight.
+async function detachEverything() {
+  for (const p of [...attaching.values()]) { try { await p; } catch {} }
+  for (const tabId of [...attached]) await detachTab(tabId);
+}
+function sendAccess(msg) {
+  try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); } catch {}
+}
+BridgeAccess.configure({
+  onRevoke: detachEverything,
+  send: sendAccess,
+  badge: setBadge,
+  sessionName: async () => (await config()).session,
+  log: (line) => console.info(`[bridge] ${line}`),
+});
+// Worker start: adopt the stored record (expired grant → revoked, missing
+// expiry alarm recreated), reconcile tab/download ownership, then connect.
+const initDone = (async () => {
+  try { await BridgeAccess.init(); } catch (e) { console.warn("[bridge] access init failed", e); }
+  await refreshBadge();
+})();
+
 // ---------- connection ----------
 
 const NATIVE_HOST = "com.ai_bridge.host";
@@ -40,8 +79,10 @@ let lastProvisionAttempt = 0;
 // Ask the native messaging host (server/native-host.js, registered with
 // `npm run register-host`) for the token and port. The host also starts the
 // relay server if it is not running. Silently a no-op when no host is
-// registered — the manual Options-page path keeps working.
-function provisionViaNativeHost(reason) {
+// registered — the manual Options-page path keeps working — and when the user
+// turned Manual mode on (a pasted token must never be overwritten by a host).
+async function provisionViaNativeHost(reason) {
+  if ((await config()).manualMode) return;
   const now = Date.now();
   if (now - lastProvisionAttempt < 15000) return;   // throttle: once per 15 s
   lastProvisionAttempt = now;
@@ -50,10 +91,13 @@ function provisionViaNativeHost(reason) {
   port.onMessage.addListener(async (msg) => {
     if (!msg || msg.type !== "hello" || !msg.token) return;
     const cfg = await config();
+    if (cfg.manualMode) { try { port.disconnect(); } catch {} return; }
     const changed = cfg.token !== msg.token || cfg.port !== msg.port;
+    // A changed token/port is picked up by the storage.onChanged listener below
+    // (revoke, then reconnect); an unchanged one only needs a connect.
     await chrome.storage.local.set({ token: msg.token, port: msg.port, provisionedBy: "native-host", provisionedAt: now });
     try { port.disconnect(); } catch {}
-    if (changed || !ws) { try { ws && ws.close(); } catch {} ws = null; connect(); }
+    if (!changed && !ws) connect();
   });
   port.onDisconnect.addListener(() => {
     // Reading lastError marks it handled. It is "Specified native messaging
@@ -70,7 +114,7 @@ async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   connecting = true;
   let cfg;
-  try { cfg = await config(); } finally { connecting = false; }
+  try { await initDone; cfg = await config(); } finally { connecting = false; }
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   if (!cfg.token) { provisionViaNativeHost("no token"); return; } // not provisioned yet — native host, or paste in Options
   let sock;
@@ -87,6 +131,7 @@ async function connect() {
     sock.send(JSON.stringify({ type: "auth", role: "extension", token: cfg.token }));
   };
   sock.onmessage = async (ev) => {
+    if (ws !== sock) return; // a superseded socket has nothing to say
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === "auth" && msg.ok) {
@@ -96,13 +141,16 @@ async function connect() {
       return;
     }
     if (msg.type !== "command") return;
+    const gen = BridgeAccess.currentGen(); // the generation this command belongs to
     let reply;
     try {
-      const result = await handle(msg.cmd, msg.params || {});
+      if (!PASS_ALWAYS.has(msg.cmd)) await BridgeAccess.assertAccess(gen);
+      const result = await handle(msg.cmd, msg.params || {}, gen);
       reply = { type: "response", id: msg.id, ok: true, result };
     } catch (e) {
       reply = { type: "response", id: msg.id, ok: false, error: String(e && e.message || e) };
     }
+    if (ws !== sock) return;
     try { sock.send(JSON.stringify(reply)); } catch {}
   };
   sock.onclose = () => {
@@ -124,11 +172,54 @@ async function connect() {
   sock.onerror = () => { try { sock.close(); } catch {} };
 }
 
+// A new token or port means a new (or restarted) relay: revoke first, so
+// in-flight commands fail on the generation bump and the debugger is released,
+// then reconnect. The new relay starts not_granted; the user grants again.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !(changes.token || changes.port)) return;
+  (async () => {
+    await BridgeAccess.setAccess({ granted: false, source: "token-change" });
+    try { ws && ws.close(); } catch {}
+    ws = null;
+    connect();
+  })();
+});
+
 chrome.alarms.create("reconnect", { periodInMinutes: 0.4 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === "reconnect") { connect(); idleDetachSweep(); } });
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === "reconnect") { connect(); idleDetachSweep(); refreshBadge(); return; }
+  if (/^access-expiry-/.test(a.name)) BridgeAccess.onAlarm(a.name);
+});
 chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onInstalled.addListener(connect);
+// After any reload, update or install: revoked, with a notice in the popup.
+chrome.runtime.onInstalled.addListener(() => { initDone.then(() => BridgeAccess.onInstalled()).then(connect, connect); });
 connect();
+
+// ---------- messages from the popup and the Options page ----------
+// The worker is the only writer of `access`; its own pages ask it to change
+// the state. Anything else (a web page, another extension) is refused.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  const own = sender && sender.id === chrome.runtime.id && String(sender.url || "").startsWith("chrome-extension://");
+  if (!own) { sendResponse({ ok: false, error: "unauthorised sender" }); return false; }
+  (async () => {
+    switch (msg && msg.type) {
+      case "access-set": {
+        const req = BridgeAccess.parseAccessSet(msg);
+        if (req.error) return { ok: false, error: req.error };
+        const rec = await BridgeAccess.setAccess({ ...req, source: msg.source || "popup" });
+        return { ok: !rec.error, access: rec, ...(rec.error ? { error: rec.error } : {}) };
+      }
+      case "access-get": {
+        const st = await BridgeAccess.status();
+        return { ok: true, ...st, connected: !!(ws && ws.readyState === WebSocket.OPEN), session: (await config()).session };
+      }
+      case "close-agent-tabs": return { ok: true, ...(await BridgeAccess.closeAgentTabs()) };
+      case "dismiss-notices": await BridgeAccess.dismissNotices(); return { ok: true };
+      default: return { ok: false, error: `unknown message: ${msg && msg.type}` };
+    }
+  })().then(sendResponse, (e) => sendResponse({ ok: false, error: String(e && e.message || e) }));
+  return true;
+});
 
 // ---------- allowlist ----------
 
@@ -145,26 +236,32 @@ async function assertAllowed(tabId) {
 
 // ---------- debugger helpers ----------
 
-async function dbgAttach(tabId) {
-  if (attached.has(tabId)) return;
+async function dbgAttach(tabId, gen) {
+  if (attached.has(tabId)) { await BridgeAccess.assertAccess(gen); return; }
   // Dedupe concurrent first-touch: several commands hitting the same not-yet-attached
   // tab at once must share ONE attach, or Chrome rejects the extras with
   // "Another debugger is already attached". Later callers await the same promise.
   let p = attaching.get(tabId);
   if (!p) {
-    p = chrome.debugger.attach({ tabId }, "1.3")
+    p = BridgeAccess.dispatch(gen, () => chrome.debugger.attach({ tabId }, "1.3"))
       .then(() => { attached.add(tabId); return setIndicator(tabId, true); })
       .finally(() => { attaching.delete(tabId); });
     attaching.set(tabId, p);
   }
-  return p;
+  await p;
+  // A late attach completion that finds the generation moved detaches itself.
+  try { await BridgeAccess.assertAccess(gen); }
+  catch (e) { await detachTab(tabId); throw e; }
 }
 
 chrome.debugger.onDetach.addListener((src) => { if (src.tabId) { attached.delete(src.tabId); attaching.delete(src.tabId); lastActivity.delete(src.tabId); setIndicator(src.tabId, false); } });
 chrome.tabs.onRemoved.addListener((tabId) => { attached.delete(tabId); attaching.delete(tabId); lastActivity.delete(tabId); BridgeAccess.forgetAgentTab(tabId); });
 
-function dbg(tabId, method, params) {
-  return chrome.debugger.sendCommand({ tabId }, method, params || {});
+// Every debugger command: a fresh access read (an await has always preceded
+// it) immediately followed by the synchronous dispatch check and the call.
+async function dbg(tabId, method, params, gen) {
+  await BridgeAccess.assertAccess(gen);
+  return BridgeAccess.dispatch(gen, () => chrome.debugger.sendCommand({ tabId }, method, params || {}));
 }
 
 // Detach one tab: release the debugger, clear its indicator and activity record.
@@ -280,26 +377,26 @@ async function setIndicator(tabId, on) {
 
 // Resolve a CSS selector to its viewport-center coordinates (CSS px), scrolling it
 // into view first — lets click target elements by selector with no pixel math.
-async function selectorCenter(tabId, selector) {
-  await dbgAttach(tabId);
+async function selectorCenter(tabId, selector, gen) {
+  await dbgAttach(tabId, gen);
   const r = await dbg(tabId, "Runtime.evaluate", {
     expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; el.scrollIntoView({ block: "center", inline: "center" }); const b = el.getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; })()`,
     returnByValue: true,
-  });
+  }, gen);
   return (r.result && r.result.value) || null;
 }
 
 // Run a self-contained fn(arg) in the page. Prefers chrome.scripting (no debugger
 // banner); if the page blocks injection (about:blank, chrome://, the Web Store),
 // falls back to CSP-proof debugger eval. fn must not close over outer variables.
-async function pageRun(tabId, fn, arg, noDebugger) {
+async function pageRun(tabId, fn, arg, noDebugger, gen) {
   try {
-    const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: fn, args: [arg] });
+    const [res] = await BridgeAccess.dispatch(gen, () => chrome.scripting.executeScript({ target: { tabId }, func: fn, args: [arg] }));
     return res && res.result;
   } catch (e) {
-    if (noDebugger) throw e; // direct mode: never fall back to the debugger
-    await dbgAttach(tabId);
-    const r = await dbg(tabId, "Runtime.evaluate", { expression: `(${fn.toString()})(${JSON.stringify(arg)})`, returnByValue: true });
+    if (noDebugger || /^access_/.test(String(e && e.message))) throw e; // direct mode: never fall back to the debugger
+    await dbgAttach(tabId, gen);
+    const r = await dbg(tabId, "Runtime.evaluate", { expression: `(${fn.toString()})(${JSON.stringify(arg)})`, returnByValue: true }, gen);
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
     return r.result && r.result.value;
   }
@@ -309,18 +406,21 @@ async function pageRun(tabId, fn, arg, noDebugger) {
 // (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND). Parallel automations trip that,
 // so direct screenshots go through a FIFO pacer that spaces calls ≥ 520 ms
 // apart — no call is wasted on a guaranteed quota error and callers are served
-// in order. The catch/retry below is only a safety net for edge timing.
+// in order. The catch/retry below is only a safety net for edge timing. Each
+// queued capture re-checks access right before it fires: a revoke while a
+// screenshot waits in the queue discards it.
 const CAPTURE_GAP_MS = 520;
 let captureQueue = Promise.resolve();
 let lastCaptureAt = 0;
-function pacedCapture(windowId) {
+function pacedCapture(windowId, gen) {
   const run = async () => {
     const wait = lastCaptureAt + CAPTURE_GAP_MS - Date.now();
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     for (let attempt = 0; ; attempt++) {
+      await BridgeAccess.assertAccess(gen);
       try {
         lastCaptureAt = Date.now();
-        return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+        return await BridgeAccess.dispatch(gen, () => chrome.tabs.captureVisibleTab(windowId, { format: "png" }));
       } catch (e) {
         if (!/MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/.test(String(e && e.message || e)) || attempt >= 3) throw e;
         await new Promise((r) => setTimeout(r, CAPTURE_GAP_MS));
@@ -344,17 +444,18 @@ function pacedCapture(windowId) {
 // Developer mode (Chrome 135–137). Promises are awaited; the completion value
 // of the script is returned, like Runtime.evaluate.
 const USER_SCRIPTS_HELP = 'User Scripts API is not enabled for AI Browser Bridge: open chrome://extensions, click Details on the extension, turn on "Allow User Scripts" (Chrome 138+) or Developer mode (Chrome 135–137) — or add --debugger for this call';
-async function directEval(tabId, code) {
+async function directEval(tabId, code, gen) {
   if (!chrome.userScripts || typeof chrome.userScripts.execute !== "function") throw new Error(USER_SCRIPTS_HELP);
   let results;
   try {
-    results = await chrome.userScripts.execute({
+    results = await BridgeAccess.dispatch(gen, () => chrome.userScripts.execute({
       target: { tabId },
       js: [{ code: String(code) }],
       world: "MAIN",
       injectImmediately: true,
-    });
+    }));
   } catch (e) {
+    if (/^access_/.test(String(e && e.message))) throw e;
     throw new Error(`direct eval failed: ${e && e.message || e}`);
   }
   const res = results && results[0];
@@ -365,10 +466,10 @@ async function directEval(tabId, code) {
 // Run a fixed, self-contained fn(arg) via chrome.scripting (no debugger, no
 // eval — CSP-safe). Default ISOLATED world is enough: page listeners still
 // receive events dispatched here (one shared DOM); only event.isTrusted differs.
-async function directRun(tabId, fn, arg) {
-  const [res] = await chrome.scripting.executeScript({
+async function directRun(tabId, fn, arg, gen) {
+  const [res] = await BridgeAccess.dispatch(gen, () => chrome.scripting.executeScript({
     target: { tabId }, func: fn, args: [arg === undefined ? null : arg],
-  });
+  }));
   return res && res.result;
 }
 
@@ -473,14 +574,24 @@ async function __directType(o) {
 
 // ---------- commands ----------
 
-async function handle(cmd, p) {
+// `gen` is the access generation captured when the command arrived. The
+// caller already ran assertAccess(gen) (except for ping/status); inside, every
+// await that precedes a browser operation is followed by another check, and
+// every browser operation goes through BridgeAccess.dispatch(gen, …).
+const ck = (gen) => BridgeAccess.assertAccess(gen);
+const originOf = (url) => { try { return new URL(String(url)).origin; } catch { return "unknown"; } };
+
+async function handle(cmd, p, gen) {
   // Record activity so the idle sweep leaves actively-driven tabs attached.
   if (p && p.tabId != null) lastActivity.set(p.tabId, Date.now());
   switch (cmd) {
     case "reloadExtension":
       // Reload this extension so an updated extension/ folder takes effect
-      // (same as the reload icon on chrome://extensions). The socket drops;
-      // the new service worker reconnects within a second.
+      // (same as the reload icon on chrome://extensions). The reload clears
+      // session storage (tab records), so the full revoke runs first: agent
+      // tabs closed, bridge downloads cancelled, debugger released. The socket
+      // drops; the new service worker reconnects within a second, revoked.
+      await BridgeAccess.setAccess({ granted: false, closeTabs: true, source: "reload" });
       setTimeout(() => chrome.runtime.reload(), 50);
       return { ok: true, reloading: true };
 
@@ -499,32 +610,44 @@ async function handle(cmd, p) {
       // active:false → opens in background, never steals the user's focus.
       // newWindow:true → its own (unfocused) window, so later activateTab calls
       // never change the active tab of the user's / other automations' windows.
-      if (p.newWindow) {
-        const win = await chrome.windows.create({ url: p.url, focused: !!p.active });
-        const tab = (win.tabs && win.tabs[0]) || (await chrome.tabs.query({ windowId: win.id }))[0];
-        await BridgeAccess.rememberAgentTab(tab.id);
-        return { id: tab.id, windowId: win.id, newWindow: true };
+      // The pending entry is written before Chrome is called: a tab whose id
+      // comes back after a revoke is closed by completeTab, not returned.
+      const nonce = await BridgeAccess.beginTab({ gen, origin: originOf(p.url) });
+      let tab, windowId, newWindow = false;
+      try {
+        await ck(gen);
+        if (p.newWindow) {
+          const win = await BridgeAccess.dispatch(gen, () => chrome.windows.create({ url: p.url, focused: !!p.active }));
+          tab = (win.tabs && win.tabs[0]) || (await chrome.tabs.query({ windowId: win.id }))[0];
+          windowId = win.id; newWindow = true;
+        } else {
+          // windowId → open in that specific window (e.g. an automation's own
+          // window), not whichever window was focused last.
+          const opts = { url: p.url, active: !!p.active };
+          if (p.windowId != null) opts.windowId = p.windowId;
+          tab = await BridgeAccess.dispatch(gen, () => chrome.tabs.create(opts));
+          windowId = tab.windowId;
+        }
+      } catch (e) {
+        await BridgeAccess.completeTab(nonce, null);
+        throw e;
       }
-      // windowId → open in that specific window (e.g. an automation's own
-      // window), not whichever window was focused last.
-      const opts = { url: p.url, active: !!p.active };
-      if (p.windowId != null) opts.windowId = p.windowId;
-      const tab = await chrome.tabs.create(opts);
-      await BridgeAccess.rememberAgentTab(tab.id);
-      return { id: tab.id, windowId: tab.windowId };
+      if (!(await BridgeAccess.completeTab(nonce, tab.id))) throw new Error(BridgeAccess.ACCESS_REVOKED((await config()).session));
+      return newWindow ? { id: tab.id, windowId, newWindow: true } : { id: tab.id, windowId };
     }
 
     case "navigate": {
       await assertAllowed(p.tabId);
-      await chrome.tabs.update(p.tabId, { url: p.url });
+      await ck(gen);
+      await BridgeAccess.dispatch(gen, () => chrome.tabs.update(p.tabId, { url: p.url }));
       return { ok: true };
     }
 
     case "activateTab": {
       // Focus a tab and bring its window to the front.
-      const tab = await chrome.tabs.update(p.tabId, { active: true });
+      const tab = await BridgeAccess.dispatch(gen, () => chrome.tabs.update(p.tabId, { active: true }));
       if (tab && tab.windowId != null) {
-        await chrome.windows.update(tab.windowId, { focused: true });
+        await BridgeAccess.dispatch(gen, () => chrome.windows.update(tab.windowId, { focused: true }));
       }
       return { ok: true, tabId: p.tabId, windowId: tab && tab.windowId };
     }
@@ -533,7 +656,7 @@ async function handle(cmd, p) {
       // Make the tab active WITHIN its window without focusing the window —
       // for background automation that must never steal the user's focus
       // (activateTab does both; this does only the tab half).
-      await chrome.tabs.update(p.tabId, { active: true });
+      await BridgeAccess.dispatch(gen, () => chrome.tabs.update(p.tabId, { active: true }));
       return { ok: true, tabId: p.tabId };
     }
 
@@ -541,7 +664,8 @@ async function handle(cmd, p) {
       // A user tab is subject to the allowlist like every other target; the
       // bridge's own tabs were opened on allowed hosts anyway.
       await assertAllowed(p.tabId);
-      await chrome.tabs.remove(p.tabId);
+      await ck(gen);
+      await BridgeAccess.dispatch(gen, () => chrome.tabs.remove(p.tabId));
       await BridgeAccess.forgetAgentTab(p.tabId);
       return { ok: true };
 
@@ -549,20 +673,21 @@ async function handle(cmd, p) {
       // Run cleanup / `bridge closeTabs`: closes only tabs this extension
       // opened (agentTabs); every other id comes back as skipped. No window
       // removal — a window that becomes empty is closed by Chrome itself.
-      return await BridgeAccess.closeOwnedTabs(p.tabIds);
+      return await BridgeAccess.closeOwnedTabs(p.tabIds, { gen });
 
     case "eval": {
       // Direct mode: chrome.userScripts.execute in the MAIN world (no CDP).
       // Debugger mode: Runtime.evaluate (trusted context, works on every page).
       await assertAllowed(p.tabId);
-      if (p.direct) return await directEval(p.tabId, p.code);
-      await dbgAttach(p.tabId);
+      await ck(gen);
+      if (p.direct) return await directEval(p.tabId, p.code, gen);
+      await dbgAttach(p.tabId, gen);
       const r = await dbg(p.tabId, "Runtime.evaluate", {
         expression: p.code,
         returnByValue: true,
         awaitPromise: true,
         userGesture: true,
-      });
+      }, gen);
       if (r.exceptionDetails) {
         throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
       }
@@ -574,22 +699,23 @@ async function handle(cmd, p) {
       // center (resolved in-page — no screenshot/DPR pixel math needed).
       // Direct mode: synthetic pointer/mouse events instead of CDP Input.dispatch*.
       await assertAllowed(p.tabId);
+      await ck(gen);
       if (p.direct) {
-        const out = await directRun(p.tabId, __directClick, { selector: p.selector, x: p.x, y: p.y });
+        const out = await directRun(p.tabId, __directClick, { selector: p.selector, x: p.x, y: p.y }, gen);
         if (out && out.error) throw new Error(`click: ${out.error}`);
         return out;
       }
-      await dbgAttach(p.tabId);
+      await dbgAttach(p.tabId, gen);
       let x = p.x, y = p.y;
       if (p.selector) {
-        const c = await selectorCenter(p.tabId, p.selector);
+        const c = await selectorCenter(p.tabId, p.selector, gen);
         if (!c) throw new Error(`click: selector not found: ${p.selector}`);
         x = Math.round(c.x); y = Math.round(c.y);
       }
       const base = { x, y, button: "left", clickCount: p.clickCount || 1 };
-      await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none" });
-      await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...base });
-      await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...base });
+      await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...base, button: "none" }, gen);
+      await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...base }, gen);
+      await dbg(p.tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...base }, gen);
       return { ok: true, x, y };
     }
 
@@ -597,13 +723,14 @@ async function handle(cmd, p) {
       // Trusted text insertion at the current caret (equivalent of a real paste).
       // Direct mode: execCommand/native-setter insertion instead of CDP Input.insertText.
       await assertAllowed(p.tabId);
+      await ck(gen);
       if (p.direct) {
-        const out = await directRun(p.tabId, __directInsert, { text: p.text });
+        const out = await directRun(p.tabId, __directInsert, { text: p.text }, gen);
         if (out && out.error) throw new Error(`insertText: ${out.error}`);
         return out;
       }
-      await dbgAttach(p.tabId);
-      await dbg(p.tabId, "Input.insertText", { text: p.text });
+      await dbgAttach(p.tabId, gen);
+      await dbg(p.tabId, "Input.insertText", { text: p.text }, gen);
       return { ok: true };
     }
 
@@ -616,11 +743,12 @@ async function handle(cmd, p) {
       // instead of CDP Input.dispatchKeyEvent. `commands` (native editing ops)
       // are CDP-only and are ignored in direct mode.
       await assertAllowed(p.tabId);
+      await ck(gen);
       if (p.direct) {
         return await directRun(p.tabId, __directKey,
-          { key: p.key, code: p.code, modifiers: p.modifiers || 0, keycodes: __KEYCODES });
+          { key: p.key, code: p.code, modifiers: p.modifiers || 0, keycodes: __KEYCODES }, gen);
       }
-      await dbgAttach(p.tabId);
+      await dbgAttach(p.tabId, gen);
       const mods = p.modifiers || 0;
       const ev = { key: p.key, code: p.code || p.key, modifiers: mods };
       const down = { type: "keyDown", ...ev };
@@ -632,49 +760,64 @@ async function handle(cmd, p) {
       const text = p.text != null ? p.text : (isChar && !ctrlOrMeta ? p.key : null);
       if (text != null) { down.text = text; down.unmodifiedText = text; }
       if (Array.isArray(p.commands) && p.commands.length) down.commands = p.commands;
-      await dbg(p.tabId, "Input.dispatchKeyEvent", down);
-      await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...ev });
+      await dbg(p.tabId, "Input.dispatchKeyEvent", down, gen);
+      await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...ev }, gen);
       return { ok: true };
     }
 
     case "screenshot": {
       await assertAllowed(p.tabId);
+      await ck(gen);
       if (p.direct) {
         // No CDP: fall back to captureVisibleTab, which only shoots the ACTIVE
         // tab of its window. Background-tab capture is a CDP-only capability.
         const tab = await chrome.tabs.get(p.tabId);
         if (!tab.active) throw new Error("direct screenshot: tab must be active in its window (captureVisibleTab limitation) — call selectTab first, or add --debugger");
-        const dataUrl = await pacedCapture(tab.windowId);
+        const dataUrl = await pacedCapture(tab.windowId, gen);
         return { base64: (dataUrl.split(",")[1]) || "" };
       }
-      await dbgAttach(p.tabId);
-      const r = await dbg(p.tabId, "Page.captureScreenshot", { format: "png" });
+      await dbgAttach(p.tabId, gen);
+      const r = await dbg(p.tabId, "Page.captureScreenshot", { format: "png" }, gen);
       return { base64: r.data };
     }
 
     case "pdf": {
       await assertAllowed(p.tabId);
+      await ck(gen);
       if (p.direct) throw new Error("direct pdf: Page.printToPDF is CDP-only — add --debugger for this command");
-      await dbgAttach(p.tabId);
+      await dbgAttach(p.tabId, gen);
       const r = await dbg(p.tabId, "Page.printToPDF", {
         printBackground: true,
         displayHeaderFooter: false,
-      });
+      }, gen);
       return { base64: r.data };
     }
 
     case "download": {
       // Uses the browser's own cookie jar — authenticated downloads just work.
-      // filename is relative to the user's Downloads directory.
-      const id = await chrome.downloads.download({
-        url: p.url,
-        filename: p.filename,
-        conflictAction: "uniquify",
-        saveAs: false,
-      });
-      // Poll until the download settles.
+      // filename is relative to the user's Downloads directory. Ownership is
+      // recorded before the call (pending) and completed when the id returns;
+      // a revoke in between cancels the download instead of returning it.
+      const nonce = await BridgeAccess.beginDownload({ gen, origin: originOf(p.url) });
+      let id;
+      try {
+        await ck(gen);
+        id = await BridgeAccess.dispatch(gen, () => chrome.downloads.download({
+          url: p.url,
+          filename: p.filename,
+          conflictAction: "uniquify",
+          saveAs: false,
+        }));
+      } catch (e) {
+        await BridgeAccess.completeDownload(nonce, null);
+        throw e;
+      }
+      if (!(await BridgeAccess.completeDownload(nonce, id))) throw new Error(BridgeAccess.ACCESS_REVOKED((await config()).session));
+      // Poll until the download settles; a revoke while polling stops the wait
+      // (the revoke itself cancels the download).
       const deadline = Date.now() + (p.timeoutMs || 60000);
       while (Date.now() < deadline) {
+        await ck(gen);
         const [item] = await chrome.downloads.search({ id });
         if (item && item.state === "complete") return { id, path: item.filename };
         if (item && item.state === "interrupted") throw new Error(`download interrupted: ${item.error}`);
@@ -699,19 +842,28 @@ async function handle(cmd, p) {
     case "type": {
       // Real per-character keystrokes — what autocomplete / React widgets listen
       // for, where insertText (a paste) is silently ignored.
-      // Direct mode: synthetic per-char keydown/input/keyup instead of CDP.
+      // Direct mode: synthetic per-char keydown/input/keyup, run from the worker
+      // in chunks so a revoke lands between chunks, not after the whole string.
       await assertAllowed(p.tabId);
-      if (p.direct) {
-        const out = await directRun(p.tabId, __directType, { text: p.text, delay: p.delay || 0 });
-        if (out && out.error) throw new Error(`type: ${out.error}`);
-        return out;
-      }
-      await dbgAttach(p.tabId);
+      await ck(gen);
       const text = String(p.text ?? "");
       const delay = p.delay || 0;
+      if (p.direct) {
+        const chars = [...text];
+        let typed = 0;
+        for (let i = 0; i < chars.length || (i === 0 && !chars.length); i += TYPE_CHUNK) {
+          await ck(gen);
+          const out = await directRun(p.tabId, __directType, { text: chars.slice(i, i + TYPE_CHUNK).join(""), delay }, gen);
+          if (out && out.error) throw new Error(`type: ${out.error}`);
+          typed += out && out.typed ? out.typed : 0;
+          if (!chars.length) break;
+        }
+        return { ok: true, typed };
+      }
+      await dbgAttach(p.tabId, gen);
       for (const ch of text) {
-        await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch, unmodifiedText: ch });
-        await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: ch });
+        await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch, unmodifiedText: ch }, gen);
+        await dbg(p.tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: ch }, gen);
         if (delay) await new Promise((r) => setTimeout(r, delay));
       }
       return { ok: true, typed: [...text].length };
@@ -722,12 +874,13 @@ async function handle(cmd, p) {
       // pageRun uses chrome.scripting (no banner), falling back to the debugger
       // on special-scheme pages it can't inject into.
       await assertAllowed(p.tabId);
+      await ck(gen);
       const out = await pageRun(p.tabId, (o) => {
         if (o.selector) { const el = document.querySelector(o.selector); if (!el) return { error: "selector not found" }; el.scrollIntoView({ block: "center", inline: "center" }); return { ok: true, into: o.selector }; }
         if (o.top) { window.scrollTo(0, 0); return { ok: true, y: 0 }; }
         if (o.bottom) { window.scrollTo(0, document.body.scrollHeight); return { ok: true, y: window.scrollY }; }
         window.scrollBy(o.dx || 0, o.dy || 0); return { ok: true, x: window.scrollX, y: window.scrollY };
-      }, { selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom }, p.direct);
+      }, { selector: p.selector, dx: p.dx, dy: p.dy, top: !!p.top, bottom: !!p.bottom }, p.direct, gen);
       if (out && out.error) throw new Error(`scroll: ${out.error}`);
       return out || { ok: true };
     }
@@ -735,23 +888,25 @@ async function handle(cmd, p) {
     case "waitFor": {
       // Poll until a `selector` exists or a JS `code` condition is truthy.
       // Code uses CSP-proof debugger eval; selectors go through pageRun (no banner
-      // on normal pages, debugger fallback on special-scheme ones).
+      // on normal pages, debugger fallback on special-scheme ones). Every tick
+      // re-checks access, so a revoke stops the poll within one tick.
       await assertAllowed(p.tabId);
       const timeout = p.timeoutMs || 10000;
       const poll = p.pollMs || 200;
       const start = Date.now();
       while (Date.now() < start + timeout) {
+        await ck(gen);
         let ok = false;
         if (p.code) {
           if (p.direct) {
-            ok = !!(await directEval(p.tabId, `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`));
+            ok = !!(await directEval(p.tabId, `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, gen));
           } else {
-            await dbgAttach(p.tabId);
-            const r = await dbg(p.tabId, "Runtime.evaluate", { expression: `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, returnByValue: true });
+            await dbgAttach(p.tabId, gen);
+            const r = await dbg(p.tabId, "Runtime.evaluate", { expression: `(() => { try { return !!(${p.code}); } catch (e) { return false; } })()`, returnByValue: true }, gen);
             ok = !!(r.result && r.result.value);
           }
         } else {
-          ok = !!(await pageRun(p.tabId, (sel) => !!document.querySelector(sel), p.selector || "", p.direct));
+          ok = !!(await pageRun(p.tabId, (sel) => !!document.querySelector(sel), p.selector || "", p.direct, gen));
         }
         if (ok) return { ok: true, waitedMs: Date.now() - start };
         await new Promise((r) => setTimeout(r, poll));
@@ -761,8 +916,10 @@ async function handle(cmd, p) {
 
     case "status": {
       const cfg = await config();
+      const a = await BridgeAccess.readAccess();
       return { version: chrome.runtime.getManifest().version, extensionId: chrome.runtime.id, attachedTabs: [...attached], agentTabs: await BridgeAccess.agentTabIds(),
-        indicator: cfg.indicator, idleDetachMs: cfg.idleDetachMs, provisionedBy: cfg.provisionedBy || "manual", session: cfg.session };
+        indicator: cfg.indicator, idleDetachMs: cfg.idleDetachMs, provisionedBy: cfg.provisionedBy || "manual", session: cfg.session, manualMode: !!cfg.manualMode,
+        access: a.exists ? (a.granted ? "granted" : "revoked") : "not_granted", until: a.until, accessGen: a.gen };
     }
 
     default:

@@ -9,7 +9,10 @@ machine it was written on. Of the code changes it depends on (listed in
 [What has to change](#what-has-to-change-in-the-code)), the `tab-hygiene` branch
 implements the server side of the access contract, `BRIDGE_BIND` (#1), the
 request-id correlation of #13 (without the extension event buffer) and the tab
-hygiene of #14 (without the popup button); the rest is not implemented. The
+hygiene of #14; the `access-switch` branch on top of it implements the grant/revoke
+switch (#2), the agent's access gate and the restricted-env passthrough (#12); the
+privileged-origin block (#3), the allowlist on every target (#4) and the event
+buffer are not implemented yet. The
 Dockerfile and compose file below are the target, not something that works today.
 
 This branch stacks on the channels chain (`feat/channels-core` →
@@ -85,7 +88,7 @@ for each is in
 | # | Change | Why | Blocking? |
 |---|---|---|---|
 | 1 | `BRIDGE_BIND` env var for the server's bind address (default `127.0.0.1`; the container sets `0.0.0.0`). The CLI keeps connecting to `127.0.0.1`. | `server/server.js` hard-codes `host: "127.0.0.1"`; a published port would point at nothing. | **Yes** |
-| 2 | Access grant/revoke in the extension: popup with **Grant** / **Grant for 1 h** / **Revoke** / **Revoke and close agent tabs**; enforced in the service worker with a revocation generation so in-flight and queued work stops; debugger released and bridge downloads cancelled on revoke; state pushed to the server. | The control this layout is built around. | **Yes** |
+| 2 | Access grant/revoke in the extension: popup with **Grant** / **Grant for 1 h** / **Revoke** / **Revoke and close agent tabs**; enforced in the service worker with a revocation generation so in-flight and queued work stops; debugger released and bridge downloads cancelled on revoke; state pushed to the server. *Implemented on `access-switch`.* | The control this layout is built around. | **Yes** |
 | 3 | Privileged-origin block, not overridable: the extension refuses to open, navigate to, attach to, or run code in `chrome://`, `chrome-extension://`, `edge://`, `brave://`, `about:`, `devtools://`, `file://` and `view-source:` targets, whatever the allowlist says. | Otherwise a granted agent can open the extension's own Options page and edit the allowlist or the access state from inside Chrome. | **Yes** |
 | 4 | Allowlist on every command's **target**, not only on the current tab: destination URL for `newTab`/`navigate`/`download`, the tab for `closeTab`/`selectTab`/`activateTab`, re-check inside `waitFor` on every tick, `listTabs` shows only allowed hosts (others as `redacted`), `screenshot` confirms the tab is the active one in its window before capturing. | Today those commands skip `assertAllowed`, and `navigate` checks the old URL rather than the destination. With a container on the other side the allowlist becomes a real boundary. | **Yes** |
 | 5 | Manual-provisioning mode in the extension: when the token was entered by hand, never call the native host; on a token or port change in Options, drop the open socket and reconnect. | Today a registered native host overwrites a pasted token, and changing the token in Options leaves the old connection open. | **Yes** |
@@ -97,7 +100,7 @@ for each is in
 | 11 | `bridge token --rotate`. | Convenience; the manual procedure is below. | Later |
 | 12 | The restricted-run env filter (`server/channels/restricted.js`) passes `AI_BRIDGE_HOME`, `AI_BRIDGE_DEBUGGER` and `AI_BRIDGE_CODEX_SANDBOX` through to channel children (never messenger tokens). | Today it keeps only `BRIDGE_PORT`, so a channel run inside the container would look for the token under `/home/node/.ai-browser-bridge` and exit 6. | **Yes** |
 | 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in full in the popup and in redacted form by `bridge status --events`; every CLI failure prints the request id, and every server log and trace line carries request id, client label, run id and outcome, written once per request. *Request ids, log and trace lines implemented on `tab-hygiene`; the event buffer and `--events` are next.* | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, the server log says `cmd newTab {...}` without saying who asked, and a locally refused command of a run is never traced. | **Yes** |
-| 14 | Tab hygiene: the server keeps a registry of every tab the bridge opened (who, when, which run, which Chrome session) and closes a run's tabs when the run ends or its supervisor dies, with the extension confirming ownership of every tab before closing it (`--keep-tabs` to opt out); `bridge tabs` lists them; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. *Implemented on `tab-hygiene` except the popup button.* | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
+| 14 | Tab hygiene: the server keeps a registry of every tab the bridge opened (who, when, which run, which Chrome session) and closes a run's tabs when the run ends or its supervisor dies, with the extension confirming ownership of every tab before closing it (`--keep-tabs` to opt out); `bridge tabs` lists them; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. *Implemented (`tab-hygiene`, popup button on `access-switch`).* | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
 
 The wire protocol gains: the `access` message from the extension (session name,
 granted, until, generation, Chrome-session id); `run` / `runEnd` messages from the
@@ -600,8 +603,10 @@ run's end is only noticed when the agent reconnects or you run `bridge
 closeTabs`; nothing closes while Chrome is not connected; and a messenger
 session's turns (`bridge channels`) take no lease yet, so their tabs are closed
 by `bridge closeTabs`, not automatically. The relay needs an extension that sends
-the `access` message: after updating the server, reload the extension too, or
-every command except `ping`/`status` is refused with `access_not_granted`.
+the `access` message: after updating the server, reload the extension too, then
+**Grant** once in the popup (an extension reload always starts revoked), or every
+command except `ping`/`status` is refused with `access_not_granted` /
+`access_revoked`.
 
 ## Troubleshooting
 
