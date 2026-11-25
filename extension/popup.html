@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AI Browser Bridge</title>
+  <style>
+    body { font-family: system-ui, sans-serif; width: 300px; margin: 0; padding: 14px 16px 16px; line-height: 1.45; color: #222; }
+    h2 { font-size: 15px; margin: 0 0 8px; }
+    .row { display: flex; justify-content: space-between; font-size: 13px; margin: 3px 0; }
+    .row span:last-child { font-weight: 600; }
+    .on { color: #1e8e3e; } .off { color: #9e9e9e; } .warn { color: #b3261e; }
+    .notice { background: #fff4e5; border: 1px solid #f0c27a; border-radius: 6px; padding: 7px 9px; font-size: 12.5px; margin: 10px 0; }
+    .notice a { float: right; color: #555; cursor: pointer; }
+    .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
+    button { padding: 7px 8px; font-size: 13px; border-radius: 6px; border: 1px solid #bbb; background: #f7f7f7; cursor: pointer; }
+    button.primary { background: #1e8e3e; color: #fff; border-color: #1e8e3e; }
+    button.danger { background: #fbe9e7; border-color: #e0a9a3; }
+    button.wide { grid-column: 1 / -1; }
+    button:disabled { opacity: .5; cursor: default; }
+    .hint { color: #666; font-size: 11.5px; margin-top: 10px; }
+    #result { font-size: 12px; color: #555; min-height: 14px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h2>AI Browser Bridge</h2>
+  <div class="row"><span>Browser session</span><span id="session">—</span></div>
+  <div class="row"><span>Relay</span><span id="connected">—</span></div>
+  <div class="row"><span>Access</span><span id="access">—</span></div>
+  <div class="row"><span>Tabs opened by the bridge</span><span id="tabs">—</span></div>
+  <div id="notices"></div>
+  <div class="buttons">
+    <button id="grant" class="primary">Grant</button>
+    <button id="grant1h">Grant for 1 h</button>
+    <button id="revoke" class="danger">Revoke</button>
+    <button id="revokeClose" class="danger">Revoke and close agent tabs</button>
+    <button id="closeTabs" class="wide">Close agent tabs</button>
+  </div>
+  <div id="result"></div>
+  <details style="margin-top:10px"><summary style="font-size:12.5px;cursor:pointer">Recent events</summary>
+    <div id="events" style="font-size:11.5px;font-family:ui-monospace,monospace;max-height:160px;overflow:auto;margin-top:4px"></div>
+  </details>
+  <div class="hint">Granting lets the bridge drive this Chrome session (open tabs, run scripts, download). Revoking stops every running command at once. A grant survives a browser restart; an extension reload revokes it.</div>
+  <script src="popup.js"></script>
+</body>
+</html>

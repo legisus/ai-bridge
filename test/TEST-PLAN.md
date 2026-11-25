@@ -59,6 +59,51 @@ Two layers:
 - **Allowlist enforcement**: set a host allowlist in Options, then `eval` on a
   non-listed domain must return `host "..." not in allowlist`.
 
+## Access switch — manual rows (need a real Chrome)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| A1 | revoke during `waitFor` | `bridge waitFor '{"tabId":N,"selector":"#never","timeoutMs":60000}'`, then **Revoke** | the command fails with `access_revoked` within one poll tick (~200 ms) |
+| A2 | revoke during `type` | `bridge type '{"tabId":N,"text":"<200 chars>","delay":50}'`, **Revoke** mid-way | typing stops mid-string; the CLI exits 8 |
+| A3 | revoke while an attach is in flight | `bridge eval … --debugger` on a fresh tab, **Revoke** at once | no "is debugging" banner stays, the command fails `access_revoked` |
+| A4 | queued direct screenshot after revoke | two parallel `bridge screenshot` (direct) then **Revoke** | the second capture is discarded with `access_revoked`, no image written |
+| A5 | expiry alarm after a worker restart | **Grant for 1 h**, go to chrome://serviceworker-internals and stop the worker, wait for T | the badge turns grey at T and the next command is refused |
+| A6 | late alarm does not revoke a renewed grant | **Grant for 1 h**, then **Grant** (indefinite) | at the old T nothing happens; access stays granted |
+| A7 | grant from the popup without a reload | revoked state, **Grant**, `bridge newTab …` | the tab opens; no reload needed |
+| A8 | changing the token in Options revokes | paste a different token, **Save** | access state shows revoked, the extension reconnects with the new token; Manual mode is on |
+| A9 | manual mode ignores the native host | Manual mode on, native host registered, reload the extension | the token in Options is not overwritten |
+| A10 | download in progress cancelled on revoke, finished one not | `bridge download` of a large file, **Revoke** while it runs; then a small finished download, **Revoke** | the large one shows as cancelled in chrome://downloads; the finished one stays |
+| A11 | "revoke and close" after a worker restart | `bridge newTab`, stop the worker (A5), **Revoke and close agent tabs** | the tab closes (agentTabs lives in session storage, not in the worker) |
+| A12 | extension reload revokes with a notice | **Grant**, `bridge reloadExtension` | the popup shows revoked and the "reloaded" notice; `bridge tabs` lists the old tabs as from an earlier session |
+
+## Target guard — manual rows (need a real Chrome)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| G1 | privileged destinations refused | `bridge newTab '{"url":"chrome://extensions"}'`, same for `chrome-extension://<id>/options.html` with the allowlist empty and with `*` | `privileged target refused` |
+| G2 | listTabs redaction | open chrome://settings and a site outside the allowlist, `bridge listTabs` | both appear as `{id, url:"redacted"}` with no title |
+| G3 | redirect out of the allowlist stops waitFor | allowlist `ok.example`; tab on it; `bridge waitFor '{"tabId":N,"selector":"#never","timeoutMs":60000}'`; navigate the tab by hand to another host | the command fails `host "…" not in allowlist` within one tick |
+| G4 | attached tab redirected to chrome:// detaches | `bridge eval … --debugger` on a tab, then type `chrome://version` in its address bar | the banner disappears; `bridge status` shows the tab is no longer attached; the event list has `detach … target_changed` |
+| G5 | document changed under a direct eval | `bridge eval` with code that navigates the page, then a second `bridge eval` racing it | the second fails `target changed` or runs in the new document only after re-validation; never in the old one |
+| G6 | status --events redaction | revoke, `bridge status --events` → counts only; grant, refuse a command on a disallowed host, `bridge status --events` | the refused event shows `origin: "redacted"` and `reason: not_allowed`; the popup's "Recent events" shows the real origin |
+
+## Docker (needs Docker; scripts, not npm test)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| D1 | smoke job | `bash test/docker-smoke.sh` | `SMOKE OK (claude 2.1.317, codex 0.171.0, linux/…)` — last run 2026-11-25 on the authoring Mac (Colima, arm64) |
+| D2 | round trip with the real extension | `bash test/docker-roundtrip.sh` (stops the host relay for ~1 min) | `ROUNDTRIP OK (extension access: granted|revoked)`; the container log shows `extension connected` and the access line |
+| D3 | fail closed inside the container | round trip while the popup shows revoked | `listTabs` from inside the container is refused with `access_revoked` |
+
+## Tab hygiene — manual rows (need a real Chrome)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| T1 | reload the extension with agent tabs open | `bridge newTab`, then `bridge reloadExtension`, then `bridge tabs` | the tab is listed under "from an earlier Chrome session"; `bridge closeTabs --mine` does not touch it |
+| T2 | a run killed with Ctrl-C closes its tabs | `bridge agent "open example.com and wait"`, Ctrl-C while it runs | within ~5 s the run's tabs are gone; `bridge journal` shows `tabsClosed` for the run |
+| T3 | a user tab in the agent's window survives | run opens a tab with `newWindow:true`; drag one of your tabs into that window; end the run | your tab stays, the agent's tab closes, the window stays open |
+| T4 | restart the relay mid-session | `bridge newTab`, restart `server.js`, `bridge tabs` | the tab is still listed as live (registry reloaded, reconciled against the extension) |
+
 ## Last run
 
 `integration.sh` — **15/15 PASS** (2026-07-07, extension v0.1.0, Chrome on macOS).

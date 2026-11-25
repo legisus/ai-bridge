@@ -26,6 +26,7 @@ const path = require("path");
 
 const { SELF_CMD, selfArgs } = require("./runtime");
 const journal = require("./journal");
+const { AccessError, withAccess, defaultGate } = require("./access-gate");
 const recipes = require("./recipe");
 const jobs = require("./jobs");
 const restrictedRun = require("./channels/restricted");
@@ -90,6 +91,11 @@ Final state: <what the page shows now / what was produced, with concrete
 details such as titles, values, file paths>
 Screenshots: <paths, or "none">
 Blockers: <what stopped you, or "none">`;
+
+// Overrides the playbook's "close your window's tabs when finished" rule when
+// the user asked to keep them (--keep-tabs or the task's own wording).
+const KEEP_TABS_ADDENDUM = `KEEP TABS OPEN: the user asked to keep the tabs you open. Do NOT close any tab
+or window when you finish; leave them exactly as they are.`;
 
 function judgePrompt(task, evidence) {
   return `You are a strict verifier. A browser-operations agent was given this task:
@@ -209,6 +215,20 @@ function runClaude({ model, prompt, allowedTools, timeoutMs, verbose, env, signa
 // ladder treats both engines alike. The sandbox allows network so the bridge
 // CLI can reach the localhost relay; cwd stays the caller's so screenshots land
 // where Claude ops sessions put them.
+// The codex argv. On the host Codex keeps its own sandbox (workspace-write with
+// network, so the bridge CLI is reachable). Inside the Docker container
+// (AI_BRIDGE_CODEX_SANDBOX=container, docs/DOCKER.md) the container is the
+// sandbox: Codex's own one needs kernel features the hardened container drops.
+function codexArgs({ model, effort, prompt, cwd, outPath }, env = process.env) {
+  const sandbox = env && env.AI_BRIDGE_CODEX_SANDBOX === "container"
+    ? ["--sandbox", "danger-full-access"]
+    : ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
+  return ["exec", "--skip-git-repo-check", "--ephemeral",
+    "-m", model, "-c", `model_reasoning_effort="${effort || "medium"}"`,
+    ...sandbox,
+    "-C", cwd || process.cwd(), "-o", outPath, prompt];
+}
+
 function runCodex({ model, effort, prompt, timeoutMs, verbose, env, signal, cwd, baseEnv }) {
   const fs = require("fs");
   const os = require("os");
@@ -216,10 +236,7 @@ function runCodex({ model, effort, prompt, timeoutMs, verbose, env, signal, cwd,
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-codex-"));
     const outPath = path.join(tmp, "last.txt");
     const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
-    const args = ["exec", "--skip-git-repo-check", "--ephemeral",
-      "-m", model, "-c", `model_reasoning_effort="${effort || "medium"}"`,
-      "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
-      "-C", cwd || process.cwd(), "-o", outPath, prompt];
+    const args = codexArgs({ model, effort, prompt, cwd, outPath }, { ...(baseEnv || process.env), ...(env || {}) });
     let child;
     try { child = spawnTracked("codex", args, { signal, cwd, baseEnv, env, detach: true, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (e) { cleanup(); return reject(e); }
@@ -302,14 +319,16 @@ function turnNote({ turn, authorized, declined }) {
 // child environment itself: scrubbed base without any inherited job, a fresh call id
 // per physical spawn, the session directory as outbox, the restriction flag.
 async function runTurn({ model, text, claudeSessionId, resume, retryFresh = false, cwd, systemPrompt, baseEnv, envPassthrough,
-  signal, timeoutMs = 10 * 60 * 1000, verbose, onSpawn }, run = runClaude) {
+  signal, timeoutMs = 10 * 60 * 1000, verbose, onSpawn, accessGate }, run = runClaude) {
   const base = { ...(baseEnv || restrictedRun.cleanEnv(process.env, envPassthrough)) };
   delete base.AI_BRIDGE_JOB;
+  const gate = accessGate || defaultGate();
+  await gate.preflight(); // throws AccessError when the browser is not granted
   const calls = [];
   const attempt = (resumeNow) => {
     const callRunId = crypto.randomBytes(6).toString("hex");
     calls.push(callRunId);
-    return run({
+    return withAccess(gate, run, {
       model, prompt: text, allowedTools: restrictedRun.allowedTools(SELF_CMD), restricted: true, timeoutMs, verbose, signal, cwd,
       baseEnv: base, env: { AI_BRIDGE_RUN_ID: callRunId, AI_BRIDGE_OUTBOX: cwd, AI_BRIDGE_RESTRICTED: "1" },
       session: { id: claudeSessionId, resume: resumeNow }, systemPrompt, onSpawn,
@@ -364,8 +383,12 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   const D = {
     runRecipe: recipes.runRecipe, loadRecipe: recipes.loadRecipe, getJob: jobs.getJob, putJob: jobs.putJob,
     loadJobs: jobs.loadJobs, readJournal: journal.readJournal, readTrace: journal.readTrace,
-    propose: proposeRecipe, runLogin: runLoginCmd, ...deps,
+    propose: proposeRecipe, runLogin: runLoginCmd, openLease: require("./lease").openLease, accessGate: null, ...deps,
   };
+  // Every model spawn goes through the access gate: a relay ping before the
+  // spawn and every 10 s while the child runs; any change ends the run.
+  const gate = D.accessGate || defaultGate();
+  const guarded = (o) => withAccess(gate, run, o);
   let blocker = null; // "auth" when the site wants a login nobody here can give; "cancelled" on abort
   const signal = opts.signal;
   // Restricted runs (messenger-originated): browser-only tools, scrubbed env, no
@@ -377,17 +400,27 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   // Common options for every model call of this run.
   const runOpts = (o) => ({ ...o, signal, baseEnv, cwd: opts.cwd, restricted });
 
+  // Who opened the tabs (server registry, `bridge closeTabs --mine`) and whether
+  // to leave them open: --keep-tabs, or the task's own "leave the tab open".
+  const client = opts.client || process.env.AI_BRIDGE_CLIENT || "bridge agent";
+  const keepTabs = !!opts.keepTabs || /\b(leave|keep)\b.{0,40}\btabs?\b.{0,20}\bopen\b/i.test(task);
+  let lease = null, leaseEnd = null;
+  const endLease = () => { if (lease && !leaseEnd) leaseEnd = lease.end().catch(() => null); return leaseEnd || Promise.resolve(null); };
+
   const auto = !opts.noAuto && opts.job !== "none";
   let job = opts.job && opts.job !== "none" ? String(opts.job).trim() : null;
   let autoMatch = null, childEnv, state = null, recipe = null, planned = { mode: "regular", judge: true }, newPhrasing = false;
   let mode = "regular", fellBack = false, mismatch = false, recipeResult = null;
+  try { // the lease ends on every exit path, including a thrown error (see finally)
   try {
+  // ---- pre-flight: the browser must be granted before any token is spent ------
+  await gate.preflight();
   // ---- which job is this? explicit --job, or matched from the task text -------
   if (!job && auto) {
     const found = jobs.findJobForTask(task, D.loadJobs());
     if (found.match) autoMatch = found.match;
     else if (found.uncertain.length) {
-      const res = await run(runOpts({ model: MATCH_MODEL, prompt: jobs.classifyPrompt(task, found.uncertain), allowedTools: [], timeoutMs, verbose }));
+      const res = await guarded(runOpts({ model: MATCH_MODEL, prompt: jobs.classifyPrompt(task, found.uncertain), allowedTools: [], timeoutMs, verbose }));
       pushStage({ stage: `match:${MATCH_MODEL}`, ...usageOf(res) });
       const obj = recipes.extractJson(String(res.result || ""));
       if (obj && obj.job && found.uncertain.some((u) => u.job === obj.job) && (obj.confidence == null || obj.confidence >= 0.7)) {
@@ -399,15 +432,21 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   // Child model processes inherit these; the CLI tags every bridge command
   // with them and the server writes traces/<runId>.jsonl.
   const restrictedEnv = restricted ? { AI_BRIDGE_RESTRICTED: "1" } : {};
-  childEnv = { AI_BRIDGE_RUN_ID: runId, ...(job ? { AI_BRIDGE_JOB: job } : {}), ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
+  childEnv = { AI_BRIDGE_RUN_ID: runId, AI_BRIDGE_CLIENT: client, ...(job ? { AI_BRIDGE_JOB: job } : {}), ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
+
+  // Tab lease: the relay closes this run's tabs when the lease ends (runEnd, or
+  // this process dying). Bookkeeping only — a relay that cannot take the lease
+  // does not stop the run.
+  try { lease = await D.openLease({ runId, client, keepTabs }); }
+  catch (e) { if (verbose) console.error(`[agent] tab lease unavailable: ${e.message}`); }
 
   const judge = async (evidence) => {
-    let judgeRes = await run(runOpts({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose }));
+    let judgeRes = await guarded(runOpts({ model: JUDGE_MODEL, prompt: judgePrompt(task, evidence), allowedTools: [], timeoutMs, verbose }));
     pushStage({ stage: "judge:fable-5.1", ...usageOf(judgeRes) });
     let verdict = parseVerdict(String(judgeRes.result || ""));
     if (!verdict) {
       // one re-ask on malformed JSON
-      judgeRes = await run(runOpts({
+      judgeRes = await guarded(runOpts({
         model: JUDGE_MODEL,
         prompt: judgePrompt(task, evidence) + "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object.",
         allowedTools: [], timeoutMs, verbose,
@@ -480,7 +519,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
           // says the recipe's result does not satisfy it: wrong job, not a
           // broken recipe. No penalty for the job; run the task on its own.
           mismatch = true; fellBack = true; job = null; state = null;
-          childEnv = { AI_BRIDGE_RUN_ID: runId, ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
+          childEnv = { AI_BRIDGE_RUN_ID: runId, AI_BRIDGE_CLIENT: client, ...(opts.cwd ? { AI_BRIDGE_OUTBOX: opts.cwd } : {}), ...restrictedEnv };
           feedback = `A recipe for a similar job (${autoMatch.job}) ran first but its result does not satisfy this task: ${v.feedback}`;
         } else {
           fellBack = true; feedback = `The deterministic recipe for this job ran but the judge rejected its evidence: ${v.feedback}`;
@@ -509,7 +548,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     // --only: stay on the start rung (no escalation to pricier models on a fail)
     let rungs = opts.only ? OPS_LADDER.slice(startIdx, startIdx + 1) : OPS_LADDER.slice(startIdx);
     if (restricted && !opts.codex) rungs = rungs.filter((r) => r.engine !== "codex");
-    const playbookExtra = restricted ? restrictedRun.PLAYBOOK_ADDENDUM : "";
+    const playbookExtra = [restricted ? restrictedRun.PLAYBOOK_ADDENDUM : "", keepTabs ? KEEP_TABS_ADDENDUM : ""].filter(Boolean).join("\n\n");
     const opsTools = restricted ? restrictedRun.allowedTools(SELF_CMD) : [`Bash(${SELF_CMD}:*)`];
     for (const rung of rungs) {
       const opsPrompt = [
@@ -519,7 +558,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
         `TASK:\n${task}`,
       ].filter(Boolean).join("\n\n");
 
-      const opsRes = await run(runOpts({
+      const opsRes = await guarded(runOpts({
         engine: rung.engine,
         model: rung.model,
         effort: rung.effort,
@@ -543,7 +582,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
           finalVerdict = { verdict: "declined", feedback: decision === "expired" ? `approval expired: ${pending}` : `not approved: ${pending}` };
           break;
         }
-        const again = await run(runOpts({
+        const again = await guarded(runOpts({
           engine: rung.engine, model: rung.model, effort: rung.effort,
           prompt: [OPS_PLAYBOOK, playbookExtra, `Your previous attempt stopped with: NEEDS APPROVAL: ${pending}\napproved: ${pending}; proceed`, `TASK:\n${task}`].filter(Boolean).join("\n\n"),
           allowedTools: opsTools, timeoutMs, verbose, env: childEnv,
@@ -569,9 +608,15 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
 
   } catch (e) {
-    if (!(e && e.name === "AbortError")) throw e;
-    blocker = "cancelled";
-    finalVerdict = { ...CANCELLED };
+    if (e && e.name === "AccessError") {
+      // The user revoked (or the relay/extension changed) — fail closed, no climb.
+      blocker = "access_revoked";
+      finalVerdict = { verdict: "fail", feedback: e.message };
+    } else {
+      if (!(e && e.name === "AbortError")) throw e;
+      blocker = "cancelled";
+      finalVerdict = { ...CANCELLED };
+    }
   }
   if (blocker === "cancelled" || blocker === "declined") { fellBack = false; }
 
@@ -581,41 +626,48 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
     try {
       repaired = await D.propose({
         job, task, previous: recipe, failure: recipeResult.failure,
-        traces: [journal.readTrace(runId)], run, timeoutMs, verbose,
+        traces: [journal.readTrace(runId)], run: guarded, timeoutMs, verbose,
       });
       state = jobs.transition(state, { kind: "repaired", version: repaired.version });
       pushStage({ stage: `repair:${RECIPE_MODEL}`, ...(repaired._usage || { input: 0, output: 0 }) });
     } catch (e) {
-      if (verbose) console.error(`[agent] recipe repair failed: ${e.message}`);
-      repaired = { error: e.message };
+      if (e && e.name === "AccessError") { blocker = "access_revoked"; finalVerdict = { verdict: "fail", feedback: e.message }; repaired = null; }
+      else {
+        if (verbose) console.error(`[agent] recipe repair failed: ${e.message}`);
+        repaired = { error: e.message };
+      }
     }
   }
 
   const journalMode = mismatch ? "regular" : mode === "regular" ? "regular" : fellBack ? `${mode}-fallback` : mode;
-  if (blocker) finalVerdict.blocker = blocker;
 
   // ---- learn: enough passing model runs of the same task → propose a recipe ----
   // (and repair a flagged recipe from a plain regular pass). The bridge decides
   // on its own; nobody has to tag jobs or run `recipe propose`.
   let learned = null;
-  if (auto && !restricted && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
+  if (!blocker && auto && !restricted && journalMode === "regular" && finalVerdict.verdict === "pass" && !opts.noAutoPropose) {
     try {
-      learned = await autoLearn({ job, state, task, runId, startedAt, stages, D, run, timeoutMs, verbose });
+      learned = await autoLearn({ job, state, task, runId, startedAt, stages, D, run: guarded, timeoutMs, verbose });
       if (learned && learned.recipe) {
         job = learned.job; state = learned.state;
         pushStage({ stage: `learn:${RECIPE_MODEL}`, ...(learned.recipe._usage || { input: 0, output: 0 }) });
       }
-    } catch (e) { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
+    } catch (e) {
+      if (e && e.name === "AccessError") { blocker = "access_revoked"; finalVerdict = { verdict: "fail", feedback: e.message }; learned = null; }
+      else { learned = { error: e.message }; if (verbose) console.error(`[agent] auto-learn failed: ${e.message}`); }
+    }
   }
+  if (blocker) finalVerdict.blocker = blocker;
 
-  if (state && blocker !== "cancelled" && blocker !== "declined") {
+  if (state && blocker !== "cancelled" && blocker !== "declined" && blocker !== "access_revoked") {
     try {
       D.putJob(jobs.pushHistory(state, { runId, mode: journalMode, verdict: finalVerdict.verdict, canary: planned.canary || undefined,
         repaired: repaired && repaired.version ? repaired.version : undefined }));
     } catch (e) { if (verbose) console.error(`[agent] job state write failed: ${e.message}`); }
   }
 
-  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence });
+  const tabs = await endLease();
+  const record = journalRecord({ runId, job, task, startedAt, stages, verdict: finalVerdict, mode: journalMode, evidence: lastEvidence, tabs });
   if (blocker) record.blocker = blocker;
   if (opts.source) record.source = String(opts.source);
   let journalFile = null;
@@ -625,6 +677,7 @@ async function runAgent(task, opts = {}, run = runModel, deps = {}) {
   }
   return { verdict: finalVerdict, evidence: lastEvidence, stages, runId, job, mode: journalMode, state, repaired, record, journalFile,
     autoMatch, mismatch, learned, blocker };
+  } finally { await endLease(); }
 }
 
 // Per-job login hook: a shell command (bridge jobs set <job> --login-cmd "…")
@@ -705,10 +758,11 @@ async function proposeRecipe({ job, task, traces, previous, failure, run = runMo
 
 // One journal.jsonl line for a finished run. Domains come from the run's trace
 // (newTab/navigate URLs), so auto signatures group by site even without --job.
-function journalRecord({ runId, job, task, startedAt, stages, verdict, mode, evidence }) {
+function journalRecord({ runId, job, task, startedAt, stages, verdict, mode, evidence, tabs }) {
   const domains = journal.domainsFromTrace(journal.readTrace(runId));
   const sum = (k) => stages.reduce((n, s) => n + (Number(s[k]) || 0), 0);
   return {
+    ...(tabs ? { tabsOpened: tabs.opened, tabsClosed: tabs.closed, tabsRetained: tabs.retained, keptTabs: tabs.kept } : {}),
     runId, job, signature: journal.signatureOf({ job, task, domains }), task,
     startedAt, endedAt: new Date().toISOString(), mode,
     verdict: verdict ? verdict.verdict : "fail",
@@ -755,9 +809,13 @@ function printJournalLine({ runId, job, journalFile, record, mode, state, repair
       (state.mode === "economy" ? ` (canary in ${(state.canaryEvery || 5) - (state.runsSinceCanary || 0)} runs)` : "") +
       (repaired && repaired.version ? `; recipe repaired → v${repaired.version}` : repaired && repaired.error ? `; repair failed: ${repaired.error}` : ""));
   }
+  const tabs = record && typeof record.tabsOpened === "number"
+    ? `; tabs: opened ${record.tabsOpened} closed ${record.tabsClosed} retained ${record.tabsRetained} kept ${record.keptTabs}` +
+      (record.tabsRetained + record.keptTabs > 0 ? `; ${record.tabsRetained + record.keptTabs} tab(s) left open (bridge tabs)` : "")
+    : "";
   console.log(`run ${runId}${job ? ` job=${job}` : ""}: ${cmds} bridge command(s) traced` +
     (record && record.domains.length ? ` on ${record.domains.join(", ")}` : "") +
-    (journalFile ? `; journaled (bridge journal --trace ${runId})` : ""));
+    (journalFile ? `; journaled (bridge journal --trace ${runId})` : "") + tabs);
 }
 
 async function main(argv) {
@@ -780,25 +838,18 @@ async function main(argv) {
     else if (args[i] === "--params") opts.params = JSON.parse(args[++i]);
     else if (args[i] === "--no-repair") opts.noRepair = true;
     else if (args[i] === "--no-auto") opts.noAuto = true;
+    else if (args[i] === "--keep-tabs") opts.keepTabs = true;
     else if (args[i] === "--help" || args[i] === "-h") { rest.length = 0; break; }
     else rest.push(args[i]);
   }
   const task = rest.join(" ").trim();
   if (!task) {
-    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name|none] [--params json] [--no-repair] [--no-auto]');
+    console.error('usage: bridge agent "task description" [--timeout ms] [--verbose] [--start opus-5.5|fable-5.1|astra-6] [--only] [--job name|none] [--params json] [--no-repair] [--no-auto] [--keep-tabs]');
     process.exit(2);
   }
 
-  // Pre-flight: bridge must be up before burning any model tokens.
-  await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, selfArgs(["ping"]), { stdio: ["ignore", "pipe", "pipe"] });
-    let err = "";
-    child.stderr.on("data", (d) => { err += d; });
-    child.on("close", (code) => code === 0 ? resolve()
-      : reject(new Error(`bridge ping failed — is the server running and the extension connected? ${err.trim()}`)));
-    child.on("error", reject);
-  });
-
+  // Pre-flight (relay up, extension connected, access granted) is the access
+  // gate's first check inside runAgent: no model token is spent before it.
   // Ctrl-C aborts the run (and kills the model's process group) instead of
   // leaving a headless claude driving Chrome.
   const controller = new AbortController();
@@ -806,6 +857,7 @@ async function main(argv) {
   const report = await runAgent(task, { ...opts, signal: controller.signal });
   printReport(report);
   printJournalLine(report);
+  if (report.blocker === "access_revoked") { console.error(`ERROR: ${report.verdict.feedback}`); process.exit(8); }
   process.exit(report.verdict.verdict === "pass" ? 0 : report.verdict.verdict === "cancelled" ? 130 : 1);
 }
 
@@ -813,4 +865,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).catch((e) => { console.error("ERROR:", e.message); process.exit(1); });
 }
 
-module.exports = { main, runAgent, proposeRecipe, autoLearn, runModel, runTurn, turnNote, lastNeedsApprovalLine, runLoginCmd, spawnTracked, journalRecord, parseVerdict, extractEvidence, needsApprovalLine, OPS_LADDER, OPS_PLAYBOOK, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };
+module.exports = { AccessError, codexArgs, main, runAgent, proposeRecipe, autoLearn, runModel, runTurn, turnNote, lastNeedsApprovalLine, runLoginCmd, spawnTracked, journalRecord, parseVerdict, extractEvidence, needsApprovalLine, OPS_LADDER, OPS_PLAYBOOK, JUDGE_MODEL, RECIPE_MODEL, MATCH_MODEL };

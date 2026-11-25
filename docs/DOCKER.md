@@ -4,10 +4,26 @@
 after nine rounds of the Codex `gpt-6-astra` review (53 findings folded in; the
 base design approved in round six, the observability and tab-hygiene additions in
 round nine, with the untested CLI pin pair left as an implementation gate; the
-review text is not part of the repo). Nothing in this guide has been run: there is no Docker on the
-machine it was written on, and the code changes it depends on (listed in
-[What has to change](#what-has-to-change-in-the-code)) are not implemented. The
-Dockerfile and compose file below are the target, not something that works today.
+review text is not part of the repo). Docker is now available on the authoring Mac (Colima + the Homebrew Docker CLI),
+and the smoke job below has been run there; the full round trip is scripted and
+waits for a run on the PC. Of the code changes it depends on (listed in
+[What has to change](#what-has-to-change-in-the-code)), the `tab-hygiene` branch
+implements the server side of the access contract, `BRIDGE_BIND` (#1), the
+request-id correlation of #13 (without the extension event buffer) and the tab
+hygiene of #14; the `access-switch` branch on top of it implements the grant/revoke
+switch (#2), the agent's access gate and the restricted-env passthrough (#12); the
+`target-guard` branch on top of that implements the privileged-origin block with
+document binding (#3), the allowlist on every target (#4) and the event buffer of
+#13 (`bridge status --events`). The `docker-container` branch on top of that adds the container files (#5–#11)
+exactly as written below, plus `test/docker-smoke.sh` (the smoke job) and
+`test/docker-roundtrip.sh` (the real-Chrome round trip). The smoke job was run
+on the authoring Mac with Colima (arm64): image builds, listening line,
+healthcheck, token mode, `/work` write, read-only root, both pinned CLIs
+(`claude` 2.1.317, `codex` 0.171.0) and a `codex exec` one-shot under the compose
+restrictions all pass; the pin pair is therefore confirmed on arm64, and the PC
+(x86_64) builds the same files. What is still unverified: the round trip with a
+real extension (scripted, not yet run), x86_64, an authenticated `claude` run
+inside the container, and the channels profile at runtime.
 
 This branch stacks on the channels chain (`feat/channels-core` →
 `fix/intent-gate-expiry`, PRs #5–#9): the Telegram daemon, the run journal and
@@ -82,7 +98,7 @@ for each is in
 | # | Change | Why | Blocking? |
 |---|---|---|---|
 | 1 | `BRIDGE_BIND` env var for the server's bind address (default `127.0.0.1`; the container sets `0.0.0.0`). The CLI keeps connecting to `127.0.0.1`. | `server/server.js` hard-codes `host: "127.0.0.1"`; a published port would point at nothing. | **Yes** |
-| 2 | Access grant/revoke in the extension: popup with **Grant** / **Grant for 1 h** / **Revoke** / **Revoke and close agent tabs**; enforced in the service worker with a revocation generation so in-flight and queued work stops; debugger released and bridge downloads cancelled on revoke; state pushed to the server. | The control this layout is built around. | **Yes** |
+| 2 | Access grant/revoke in the extension: popup with **Grant** / **Grant for 1 h** / **Revoke** / **Revoke and close agent tabs**; enforced in the service worker with a revocation generation so in-flight and queued work stops; debugger released and bridge downloads cancelled on revoke; state pushed to the server. *Implemented on `access-switch`.* | The control this layout is built around. | **Yes** |
 | 3 | Privileged-origin block, not overridable: the extension refuses to open, navigate to, attach to, or run code in `chrome://`, `chrome-extension://`, `edge://`, `brave://`, `about:`, `devtools://`, `file://` and `view-source:` targets, whatever the allowlist says. | Otherwise a granted agent can open the extension's own Options page and edit the allowlist or the access state from inside Chrome. | **Yes** |
 | 4 | Allowlist on every command's **target**, not only on the current tab: destination URL for `newTab`/`navigate`/`download`, the tab for `closeTab`/`selectTab`/`activateTab`, re-check inside `waitFor` on every tick, `listTabs` shows only allowed hosts (others as `redacted`), `screenshot` confirms the tab is the active one in its window before capturing. | Today those commands skip `assertAllowed`, and `navigate` checks the old URL rather than the destination. With a container on the other side the allowlist becomes a real boundary. | **Yes** |
 | 5 | Manual-provisioning mode in the extension: when the token was entered by hand, never call the native host; on a token or port change in Options, drop the open socket and reconnect. | Today a registered native host overwrites a pasted token, and changing the token in Options leaves the old connection open. | **Yes** |
@@ -93,8 +109,8 @@ for each is in
 | 10 | Several browser sessions on one relay (Chrome + Edge, two profiles): registry keyed by session name, `--session` on the CLI. | Not needed for one browser; today a second extension supersedes the first. | Later |
 | 11 | `bridge token --rotate`. | Convenience; the manual procedure is below. | Later |
 | 12 | The restricted-run env filter (`server/channels/restricted.js`) passes `AI_BRIDGE_HOME`, `AI_BRIDGE_DEBUGGER` and `AI_BRIDGE_CODEX_SANDBOX` through to channel children (never messenger tokens). | Today it keeps only `BRIDGE_PORT`, so a channel run inside the container would look for the token under `/home/node/.ai-browser-bridge` and exit 6. | **Yes** |
-| 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in full in the popup and in redacted form by `bridge status --events`; every CLI failure prints the request id, and every server log and trace line carries request id, client label, run id and outcome, written once per request. | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, the server log says `cmd newTab {...}` without saying who asked, and a locally refused command of a run is never traced. | **Yes** |
-| 14 | Tab hygiene: the server keeps a registry of every tab the bridge opened (who, when, which run, which Chrome session) and closes a run's tabs when the run ends or its supervisor dies, with the extension confirming ownership of every tab before closing it (`--keep-tabs` to opt out); `bridge tabs` lists them; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
+| 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in full in the popup and in redacted form by `bridge status --events`; every CLI failure prints the request id, and every server log and trace line carries request id, client label, run id and outcome, written once per request. *Request ids, log and trace lines implemented on `tab-hygiene`; the event buffer and `--events` are next.* | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, the server log says `cmd newTab {...}` without saying who asked, and a locally refused command of a run is never traced. | **Yes** |
+| 14 | Tab hygiene: the server keeps a registry of every tab the bridge opened (who, when, which run, which Chrome session) and closes a run's tabs when the run ends or its supervisor dies, with the extension confirming ownership of every tab before closing it (`--keep-tabs` to opt out); `bridge tabs` lists them; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. *Implemented (`tab-hygiene`, popup button on `access-switch`).* | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
 
 The wire protocol gains: the `access` message from the extension (session name,
 granted, until, generation, Chrome-session id); `run` / `runEnd` messages from the
@@ -179,12 +195,11 @@ CMD ["node", "/app/server/server.js"]
 - `AI_BRIDGE_CODEX_SANDBOX=container` tells the agent's Codex rung to run `codex`
   with its own sandbox off (the container is the sandbox) instead of
   `--sandbox workspace-write`, which needs kernel features the hardened container
-  drops. Whether the pinned Codex works under this compose file is one of the things
-  the first real run has to establish.
+  drops. The smoke job runs a `codex exec` one-shot under exactly this compose file
+  and checks a file the shell command created.
 - The pinned pair (`claude` 2.1.317, `codex` 0.171.0) is the pair installed on the
-  machine this guide was written on; it is **untested** in this container and under
-  this compose file. The first build fixes the pair that passes the Docker smoke job
-  and records it here; after that, bump only with the smoke job.
+  machine this guide was written on, and the pair the Docker smoke job passed with
+  on 2026-11-25 (linux/arm64). Bump only with the smoke job.
 
 ### .dockerignore (repo root)
 
@@ -290,7 +305,7 @@ get committed.
 
 1. **Clone the branch on the PC** (the extension folder has to live here):
    ```
-   git clone -b docker-isolated https://github.com/legisus/ai-bridge.git
+   git clone -b docker-container https://github.com/legisus/ai-bridge.git   # the branch with the container files; `main` once the chain is merged
    cd ai-bridge
    ```
 2. **Secrets.** `cp deploy/docker/.env.example deploy/docker/.env` and fill in
@@ -501,7 +516,7 @@ and is readable from the PC:
 ```
 docker compose -f deploy/docker/compose.yml logs -f bridge          # server log (also /data/bridge.log)
 docker compose -f deploy/docker/compose.yml exec bridge sh -c 'tail -50 /data/bridge.log'
-bridge status --events                                              # extension's last 200 events (grant, revoke, refused, closed tab…)
+bridge status --events                                              # extension's last 200 events (grant, revoke, refused, closed tab…), redacted
 bridge journal                                                      # agent runs, verdicts, cost
 bridge journal --trace <runId>                                      # every bridge command of one run
 bridge tabs                                                         # tabs the bridge opened, with age, owner and run id
@@ -511,17 +526,46 @@ docker compose -f deploy/docker/compose.yml --profile channels logs -f channels 
 Each server log line names the request id, the client label (`AI_BRIDGE_CLIENT`,
 default the process name), the run id when the command came from an agent run,
 and the outcome (`done`, `refused …`, `cancelled …`), once per request. The CLI
-prints the same request id with every failure, `ERROR: … (req <id>)`, so an
-`access_revoked` or `target changed` can be matched to the log line, to the trace
-line, and, when the command reached Chrome, to the extension's event list. A
-command the server refused without forwarding has no extension event; the log
-line says `refused`, which is the whole story.
+prints the same request id with every failure, `ERROR: … (req <id>)` on stderr
+and one JSON line `{"error":…,"reqId":…}` on stdout, so an `access_revoked` or
+`target changed` can be matched to the log line, to the trace line, and, when the
+command reached Chrome, to the extension's event list. A command the server
+refused without forwarding has no extension event; the log line says `refused`,
+which is the whole story. `bridge journal --trace <runId>` prints one line per
+command with the request id and the outcome: `ok`, `FAIL` (the extension
+answered with an error), `REF` (refused by the server) or `CAN` (cancelled:
+extension gone, superseded, or access revoked while pending).
+
+Log line shapes, one `cmd` line and one terminal line per request:
+
+```
+2026-11-24T19:02:11.481Z 3bd5c0acb5653922 bridge agent 22d938490de9 cmd newTab {"url":"https://…","direct":true}
+2026-11-24T19:02:11.612Z 3bd5c0acb5653922 bridge agent 22d938490de9 done ok 131ms
+2026-11-24T19:02:30.007Z 9a1f…             zsh          -            refused access_revoked
+2026-11-24T19:02:31.220Z c0de…             bridge agent 22d938490de9 cancelled extension disconnected
+2026-11-24T19:03:02.000Z srv-4             server       -            cmd closeTabs {"tabIds":[580216684]}
+```
+
+`srv-<n>` requests are the relay's own (run cleanup, registry reconciliation).
 
 `bridge status --events` is a redacted view: while access is revoked it shows only
 how many events of each kind happened; while granted it hides the origin and tab
-of any event about a page outside the current allowlist. The full list, with
-origins, is in the popup and in the service worker's `console` at
-`chrome://extensions` → the bridge card → **service worker**, on the PC only.
+of any event about a page outside the current allowlist (or on a privileged
+scheme), and `detail` carries only fixed codes (`reason`, `source`, `gen`,
+`until`), never an error string. The full list, with origins, is in the popup
+("Recent events") and in the service worker's `console` at `chrome://extensions`
+→ the bridge card → **service worker**, on the PC only.
+
+Target binding, as implemented: every tab command re-reads the tab, refuses
+anything that is not `http(s)` (whatever the allowlist says), applies the
+allowlist, and records the main frame's `documentId`; direct-mode injections name
+that document (`documentIds`), so Chrome itself refuses to run in a replacement
+page and the command fails `target changed`. In debugger mode code runs only in
+the main-world context whose origin passed the same checks (`uniqueContextId`);
+input and capture compare the frame's `loaderId` right before each send, which
+leaves one CDP round-trip of residual window. A direct screenshot is discarded if
+the window's active tab changed or the document changed during the capture; when
+the picture is evidence, use `--debugger`.
 
 `bridge agent … --verbose` prints each rung's model, judge verdict and token spend
 while the run goes. A run stopped by a revoke ends with the structured reason
@@ -558,14 +602,66 @@ Chrome session) and closes a run's tabs when the run ends, however it ends:
   `bridge closeTabs --older-than 60` closes bridge-opened tabs no bridge command
   has touched for an hour. There is no automatic sweep.
 
+```
+$ bridge tabs
+tabId      age  client        run           origin                     status
+580216684  3m   bridge agent  22d938490de9  https://www.kbb.com        live
+580216702  41m  zsh           -             https://turo.com           live
+580216610  2h   bridge agent  1b7e0c4d9f21  https://thetollroads.com   retained
+
+from an earlier Chrome session (not acted on, pruned on the next reconciliation):
+tabId      client  run  origin
+4211       zsh     -    https://example.com
+```
+
+`client` is `AI_BRIDGE_CLIENT` when set (the agent sets `bridge agent` for its
+children; a launchd job can set its own name), otherwise the name of the process
+that ran the CLI. `bridge closeTabs --mine` uses the same label. Every run's
+journal record carries `tabsOpened`, `tabsClosed`, `tabsRetained` and `keptTabs`,
+and `bridge journal` shows a `tabs left` column per job.
+
 Limits: if the relay itself dies mid-run, its registry on disk survives but the
 run's end is only noticed when the agent reconnects or you run `bridge
-closeTabs`; and nothing closes while Chrome is not connected.
+closeTabs`; nothing closes while Chrome is not connected; and a messenger
+session's turns (`bridge channels`) take no lease yet, so their tabs are closed
+by `bridge closeTabs`, not automatically. The relay needs an extension that sends
+the `access` message: after updating the server, reload the extension too, then
+**Grant** once in the popup (an extension reload always starts revoked), or every
+command except `ping`/`status` is refused with `access_not_granted` /
+`access_revoked`.
+
+## Smoke test and round trip
+
+`bash test/docker-smoke.sh` builds the image, starts the relay in a throwaway
+compose project (`ai-bridge-smoke`) on a free loopback port and checks the list
+from the design's Tests section: the listening line with the loopback warning,
+the healthcheck turning healthy with no extension and no token, `/data/token`
+mode 600 owned by uid 1000, `/data` 700, the CLI inside the container (`ping` →
+`extension not connected`, `bridge tabs` → empty registry), the published port
+reachable from the host loopback, a `/work` write visible on the host, the
+read-only root, the two pinned CLIs, and, when `~/.codex/auth.json` exists on the
+machine, a `codex exec` one-shot that runs a shell command inside the hardened
+container (`--sandbox danger-full-access`: the container is the sandbox). It
+ends with `docker compose down -v`. Nothing of the machine's own bridge state is
+touched.
+
+`bash test/docker-roundtrip.sh` is the round trip with the real extension: it
+stops the host relay, publishes the container on `127.0.0.1:8765` with the host's
+existing token copied into `/data/token` (so the extension reconnects by itself
+within its 24-s alarm), reads the access handshake from the container log and
+`bridge ping` on both sides, then stops the container and restores the host
+relay. The image build and the volume preparation happen before the host relay is
+stopped, so the interruption is the handoff plus the extension's reconnect: well
+under a minute. Run it yourself; it reports `ROUNDTRIP OK` only when the
+restoration also succeeded.
 
 ## Troubleshooting
 
 | Symptom | Meaning | Fix |
 |---|---|---|
+| `/work` is empty inside the container, or writes there are refused (Colima, Docker Desktop on macOS) | The bind-mounted folder lives outside the paths the Docker VM shares with macOS (Colima shares `$HOME` and `/tmp/colima`; macOS's `/var/folders` temp dirs are not). | Keep `BRIDGE_WORK_DIR` under your home directory (the default `./work` next to the compose file is). |
+| `codex exec` inside the container prints `Reading additional input from stdin...` and never finishes | Codex reads its prompt from stdin when stdin is not a TTY. | Redirect stdin from `/dev/null` in scripts (`codex exec … < /dev/null`); the agent's own spawns already do. |
+| `docker compose up` fails with "volume … already exists but was not created by Docker Compose" | A volume with the project's name was created by `docker run -v` before Compose made it. | Let `docker compose up`/`create` make the volumes first; copy files in with `docker run -v <project>_data:/data …` afterwards. |
 | `connect failed` from the CLI inside the container | The server is not up. | `docker compose -f deploy/docker/compose.yml logs bridge`. |
 | Options show "not provisioned" / `extension not connected` | Token not pasted, or the server still binds `127.0.0.1` inside the container so the published port is dead. | Check the log says `listening on ws://0.0.0.0:8765`; re-paste the token; reload the extension. |
 | Token in Options changes by itself | A native host from an old source install re-provisioned the extension. | Tick **Manual mode** in Options; unregister the host (prerequisites). |

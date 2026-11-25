@@ -6,6 +6,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+process.env.AI_BRIDGE_NO_ACCESS_GATE = "1"; // unit tests inject a mock runner; there is no relay to ping
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ai-bridge-turn-"));
 const { runTurn, lastNeedsApprovalLine, turnNote, OPS_PLAYBOOK } = require("../server/agent.js");
 

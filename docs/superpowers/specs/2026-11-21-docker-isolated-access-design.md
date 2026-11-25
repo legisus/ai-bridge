@@ -1,5 +1,26 @@
 # Docker-isolated agent with host-side access control — design
 
+**Implementation status (2026-11-25):** three slices are implemented: `tab-hygiene`
+(PR #12), `access-switch` (PR #13, stacked on it) and `target-guard` (stacked on
+that: the privileged-origin block with document binding — `webNavigation`
+`documentId` for direct injections, `uniqueContextId` and `loaderId` for the
+debugger route, the `onActivated` guard for direct screenshots, detach on
+navigation to a bad URL — the allowlist on every target with `listTabs`
+redaction, and the 200-entry event buffer with `status {events:true}`). The
+second slice adds the extension's grant/revoke switch (serialised transition, `assertAccess` /
+`dispatch` on every command, expiry alarms, reload and startup reconciliation,
+pending tab/download ownership, popup, Options session name and manual mode) and
+the agent's access gate (`server/access-gate.js`). Still to come: the channels
+daemon's `/status` and revoked-task refusal, and the container files. The first
+slice: the server side of the wire contract (`access` normalisation, extension
+generation, identity triple, gate, `BRIDGE_BIND`), request-id correlation with
+one `finish()` path, the tab registry, run leases, `closeTabs`, `bridge tabs` /
+`bridge closeTabs`, `--keep-tabs` and the journal counters. The extension sends
+`access` from a stored state whose default is *granted, indefinite, gen 1*: the
+grant/revoke switch, popup, Options, expiry alarm, `assertAccess`, document
+binding, the event buffer (`status {events:true}`) and the agent's `withAccess`
+latch are the next slice, and the container files after that.
+
 **Status:** design, 2026-11-21, revised the same day after nine rounds of the Codex
 `gpt-6-astra` review (53 findings folded in; the base design was approved in round
 six, the observability and tab-hygiene additions in round nine, with the untested
@@ -178,6 +199,16 @@ live `runId` is refused. The socket closing without `runEnd` is treated as
 `runEnd` after the drain described under Tab hygiene. Neither message needs
 access: registering or ending a run is not a browser operation.
 
+Both are acknowledged on the same socket. `run` is answered
+`{ "type": "run", "runId", "ok": true }` or `{ …, "ok": false, "error": "run already live: <id>" | "bad runId" }`;
+`runEnd` is answered after the drain and the cleanup with
+`{ "type": "runEnd", "runId", "ok": true, "tabs": { "opened", "closed", "retained", "kept" } }`
+(`ok: false, error: "unknown run"` for a run the server does not know). The
+supervisor copies `tabs` into the run's journal record; a creation that
+completes after the drain is patched into `journal.jsonl` by the server
+(`journal.patchRun`). Ordinary `request` messages on a lease socket are served
+like on any CLI socket.
+
 **`closeTabs`, server → extension.** The only new extension command:
 
 ```json
@@ -188,7 +219,17 @@ access: registering or ending a run is not a browser operation.
 The extension closes only the ids that are in its own `agentTabs` for the current
 browser session and reports the rest as `skipped`. It is subject to the access
 gates like every other command. It is reachable from the CLI as `bridge closeTabs`
-(restricted children: denied) and used by the server for run cleanup.
+(restricted children: denied) and used by the server for run cleanup. The server
+refuses a `closeTabs` whose `tabIds` is not an array of integers before forwarding
+(`closeTabs: tabIds must be an array of integers`).
+
+**`status` result, extension → server.** The extension's own `status` result
+gains `agentTabs` (the tab ids it currently owns, see Tab hygiene) and `session`
+(the configured session name). The server reconciles its registry against
+`agentTabs` on every `status` response and issues a `status` of its own (request
+ids `srv-<n>`, client `server`, same gate, same log lines) whenever an `access`
+message that grants arrives, so a relay restart or an extension reconnect
+re-synchronises the registry without a new message type.
 
 **`status {events:true}`.** Adds the projected event buffer (see Observability) to
 the `status` result; without the option `status` is unchanged apart from the merged
@@ -228,9 +269,10 @@ New keys in `chrome.storage.local` next to `token`, `port`, `allowlist`,
 `provisionedBy`:
 
 ```
-sessionName: "chrome"                          // Options
+session:     "chrome"                          // Options (browser session name; key kept from the first slice)
 manualMode:  true | false                      // Options; true = never call the native host
 access:      { granted: bool, until: null | number, gen: number }   // written by the worker only
+notices:     [ string ]                        // popup notices (reload revoked access, unidentified tabs)
 ```
 
 Also in `chrome.storage.local` (download ids are stable across browser sessions,
@@ -238,7 +280,7 @@ so ownership can be kept):
 
 ```
 bridgeDownloads:  { [downloadId]: { gen } }    // downloads started by the bridge
-pendingDownloads: [ { nonce, gen, url, startedAt } ]   // download dispatched, id not yet known
+pendingDownloads: [ { nonce, gen, origin, startedAt } ]   // download dispatched, id not yet known (origin, not URL)
 ```
 
 Download records, including the pending ones, are in **local** storage so that a
@@ -249,8 +291,8 @@ And in `chrome.storage.session` (survives service-worker restarts, cleared by Ch
 on browser restart, extension reload, update or disable):
 
 ```
-agentTabs:    { [tabId]: { gen, url } }        // tabs opened by newTab in this browser session
-pendingTabs:  [ { nonce, gen, url, startedAt } ]   // tab dispatched, id not yet known
+agentTabs:    [ tabId ]                        // tabs opened by newTab in this browser session (ids only; the gen is "for logging only" and is not kept)
+pendingTabs:  [ { nonce, gen, origin, startedAt } ]   // tab dispatched, id not yet known (origin, not URL)
 ```
 
 They live in storage, not in worker globals, because the service worker is
@@ -600,7 +642,10 @@ does not forget them:
 **Commands.**
 
 - `bridge tabs`: registry rows for the current browser session (age, client, run,
-  origin, `retained`/`live`), dead rows listed separately.
+  origin, `retained`/`live`), dead rows listed separately. The CLI reads
+  `AI_BRIDGE_HOME/tabs.json` directly: the file is server-maintained and records
+  the current `browserSession`, so no wire message is needed and the listing
+  works while access is revoked.
 - `bridge closeTabs --mine | --run <id> | --older-than <minutes>`: selects rows
   from the registry (`--older-than` uses the server's `lastCmdAt`), sends
   `closeTabs {tabIds}`, and the extension applies the `agentTabs` intersection
@@ -614,6 +659,14 @@ does not forget them:
 - No automatic idle sweep in v1: a tab left open on purpose during a long manual
   session must not vanish. `--older-than` is explicit. Revisit once `bridge tabs`
   has shown the real pattern for a month.
+- Channel turns (`runTurn`) take no lease in the first implementation: a
+  conversational session may want its tab to survive the turn, which needs its own
+  `keepTabs` rule. Their tabs are listed by `bridge tabs` and closed by
+  `bridge closeTabs` like direct CLI tabs.
+- `BRIDGE_DRAIN_MS` shortens the 5-s drain; it exists for the tests only and is
+  not documented in the guide. Likewise `AI_BRIDGE_NO_ACCESS_GATE=1` makes the
+  agent's access gate a pass-through for the unit tests that inject a mock model
+  runner and have no relay to ping.
 - Journal: each run record gains `tabsOpened`, `tabsClosed`, `tabsRetained`,
   `keptTabs`, so `bridge journal` can show leaks per job.
 
@@ -642,7 +695,9 @@ does not forget them:
   in the container looks for the token under `$HOME` and exits 6.
 - The channels daemon reports session name and access state in `/status`, answers a
   task sent while revoked with the one-line error instead of queueing it, and treats
-  `access_revoked` from a running turn as a terminal error for that turn.
+  `access_revoked` from a running turn as a terminal error for that turn. (The
+  `/status` line and the pre-queue refusal are deferred to the channels follow-up;
+  `runTurn` itself is gated, so a revoked turn ends with `access_revoked`.)
 
 ## Container
 

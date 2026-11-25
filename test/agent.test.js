@@ -6,8 +6,9 @@
 const fs = require("fs");
 const os = require("os");
 // Journal/trace files go to a temp state dir, never the real ~/.ai-browser-bridge.
+process.env.AI_BRIDGE_NO_ACCESS_GATE = "1"; // unit tests inject a mock runner; there is no relay to ping
 process.env.AI_BRIDGE_HOME = fs.mkdtempSync(require("path").join(os.tmpdir(), "ai-bridge-agent-"));
-const { runAgent, journalRecord, parseVerdict, extractEvidence, OPS_LADDER, JUDGE_MODEL } =
+const { runAgent, journalRecord, parseVerdict, extractEvidence, codexArgs, OPS_LADDER, JUDGE_MODEL } =
   require("../server/agent.js");
 const journal = require("../server/journal.js");
 
@@ -109,6 +110,57 @@ function mockRun(judgeVerdicts) {
       "journal: cost/tokens summed over ops + judge");
     const rows = journal.summarize(journal.readJournal({}));
     assert(rows.some((x) => x.signature === "job:toll-invoices" && x.runs === 1), "journal: appended to journal.jsonl");
+  }
+
+  // 8b) tab lease: opened with runId/client/keepTabs, ended on every exit path, counters journaled
+  function mockLease() {
+    const calls = [];
+    const open = async (o) => { calls.push({ open: o }); return { end: async () => { calls.push({ end: o.runId }); return { opened: 2, closed: 1, retained: 1, kept: 0 }; }, close() {} }; };
+    return { open, calls };
+  }
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']); const L = mockLease();
+    const r = await runAgent("test task", { runId: "leaseok00001" }, m.run, { openLease: L.open });
+    assert(L.calls[0].open.runId === "leaseok00001" && L.calls[0].open.client === "bridge agent" && L.calls[0].open.keepTabs === false, "lease: opened with runId/client/keepTabs");
+    assert(L.calls.filter((c) => c.end === "leaseok00001").length === 1 && r.record.tabsOpened === 2 && r.record.tabsClosed === 1 && r.record.tabsRetained === 1 && r.record.keptTabs === 0, "lease: runEnd sent once; counters in the journal record");
+    assert(m.calls[0].env.AI_BRIDGE_CLIENT === "bridge agent", "lease: children get AI_BRIDGE_CLIENT");
+  }
+  {
+    const m = mockRun(['{"verdict":"fail","feedback":"no"}', '{"verdict":"fail","feedback":"no"}', '{"verdict":"fail","feedback":"no"}']); const L = mockLease();
+    await runAgent("test task", {}, m.run, { openLease: L.open });
+    assert(L.calls.filter((c) => c.end).length === 1, "lease: a run that fails every rung still sends runEnd exactly once");
+  }
+  {
+    const L = mockLease(); const thrower = async () => { throw new Error("model exploded"); };
+    let threw = false; try { await runAgent("t", {}, thrower, { openLease: L.open }); } catch { threw = true; }
+    assert(threw && L.calls.some((c) => c.end), "lease: runEnd sent even when the ladder throws");
+  }
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']); const L = mockLease();
+    await runAgent("open the page and leave the tab open for me", {}, m.run, { openLease: L.open });
+    assert(L.calls[0].open.keepTabs === true, "lease: 'leave the tab open' in the task → keepTabs");
+    const L2 = mockLease(); const m2 = mockRun(['{"verdict":"fail","feedback":"x"}', '{"verdict":"pass","feedback":"ok"}']);
+    await runAgent("t", { keepTabs: true }, m2.run, { openLease: L2.open });
+    assert(L2.calls[0].open.keepTabs === true, "lease: --keep-tabs → keepTabs");
+    const ops = m2.calls.filter((c) => !c.prompt.includes("strict verifier"));
+    assert(ops.length === 2 && ops.every((c) => /KEEP TABS OPEN/.test(c.prompt)), "lease: --keep-tabs tells every ops rung to leave its tabs open");
+    assert(!m.calls.some((c) => /KEEP TABS OPEN/.test(c.prompt) && !/leave the tab open/.test(c.prompt)), "lease: without keepTabs the prompt keeps the close-your-tabs rule");
+  }
+  {
+    const m = mockRun(['{"verdict":"pass","feedback":"ok"}']);
+    const r = await runAgent("t", {}, m.run, { openLease: async () => { throw new Error("ECONNREFUSED"); } });
+    assert(r.verdict.verdict === "pass" && r.record.tabsOpened === undefined, "lease: lease failure does not fail the run; counters omitted");
+  }
+
+  // 8c) codex sandbox: inside the container the container is the sandbox
+  {
+    const base = { model: "gpt-6-astra", effort: "medium", cwd: "/w", outPath: "/o", prompt: "p" };
+    const host = codexArgs(base, {});
+    assert(host.includes("-s") && host[host.indexOf("-s") + 1] === "workspace-write" && host.includes("sandbox_workspace_write.network_access=true"), "codexArgs: host default keeps workspace-write with network");
+    const inContainer = codexArgs(base, { AI_BRIDGE_CODEX_SANDBOX: "container" });
+    assert(inContainer.includes("--sandbox") && inContainer[inContainer.indexOf("--sandbox") + 1] === "danger-full-access" && !inContainer.includes("workspace-write") && !inContainer.some((a) => /network_access/.test(a)), "codexArgs: AI_BRIDGE_CODEX_SANDBOX=container runs codex without its own sandbox");
+    assert(JSON.stringify(codexArgs(base, { AI_BRIDGE_CODEX_SANDBOX: "other" })) === JSON.stringify(host), "codexArgs: any other value keeps the host arguments");
+    assert(inContainer.slice(-1)[0] === "p" && inContainer.includes("-o") && inContainer[inContainer.indexOf("-o") + 1] === "/o", "codexArgs: prompt last, output path kept");
   }
 
   // 9) journal: auto signature uses domains from the run's trace

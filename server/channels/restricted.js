@@ -20,7 +20,11 @@ const KEEP = new Set(["PATH", "HOME", "USER", "LANG", "TMPDIR", "BRIDGE_PORT"]);
 // The model's own credentials: without them `claude -p` / `codex` cannot start
 // (servers authenticate through env). Messenger tokens are never in this list.
 const KEEP_AUTH = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "CODEX_HOME", "OPENAI_API_KEY"]);
-const KEEP_AI = new Set(["AI_BRIDGE_RUN_ID", "AI_BRIDGE_JOB", "AI_BRIDGE_OUTBOX", "AI_BRIDGE_AGENT", "AI_BRIDGE_RESTRICTED"]);
+// AI_BRIDGE_HOME / AI_BRIDGE_DEBUGGER / AI_BRIDGE_CODEX_SANDBOX: without them a
+// channel run inside the Docker container looks for the token under $HOME and
+// exits 6 (docs/DOCKER.md). AI_BRIDGE_CLIENT keeps the client label on the tabs.
+const KEEP_AI = new Set(["AI_BRIDGE_RUN_ID", "AI_BRIDGE_JOB", "AI_BRIDGE_OUTBOX", "AI_BRIDGE_AGENT", "AI_BRIDGE_RESTRICTED",
+  "AI_BRIDGE_HOME", "AI_BRIDGE_DEBUGGER", "AI_BRIDGE_CODEX_SANDBOX", "AI_BRIDGE_CLIENT"]);
 
 // `extraKeys`: operator-configured passthrough (channels.json "envPassthrough").
 // Messenger credentials (AI_BRIDGE_<CHANNEL>[_<ACCOUNT>]_TOKEN) are denied even when an
