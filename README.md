@@ -98,6 +98,10 @@ on the same page: [Binary install](docs/INSTALL.md#binary-install-no-nodejs).
 6. **Keep it running:** not needed with the native host — Chrome starts the server
    on demand. Otherwise copy a template from `deploy/`, fix the paths, load it.
 
+Running the relay and the agent in **Docker** on a PC while Chrome stays on the
+host, with grant/revoke from the extension: see [docs/DOCKER.md](docs/DOCKER.md)
+(`Dockerfile`, `deploy/docker/compose.yml`, `test/docker-smoke.sh`).
+
 ## Usage
 
 ```bash
@@ -311,6 +315,13 @@ Full policy: [PRIVACY.md](PRIVACY.md). Read this before installing — the exten
 - Every command is **logged** to `~/.ai-browser-bridge/bridge.log` with its request
   id, the client label and the run id, and ends in exactly one `done` / `refused` /
   `cancelled` line.
+- **Only http(s) pages on allowed hosts are ever a target.** `chrome://`, the
+  extension's own pages, `file:`, `javascript:`, `data:` and `view-source:` are
+  refused whatever the allowlist says; `listTabs` lists such tabs by id only
+  (`url: "redacted"`); every command re-reads its tab and runs only in the
+  document it validated (a page that navigated underneath fails with
+  `target changed`). `bridge status --events` shows the extension's recent
+  events, redacted to the current allowlist.
 - **You grant and revoke the browser session** from the extension's popup (or
   Options). The service worker is the only writer of that state and checks it on
   every command and before every browser operation; a revoke stops in-flight work,

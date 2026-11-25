@@ -1,0 +1,36 @@
+// Load the real extension service worker (extension/background.js, with
+// importScripts("access.js")) into a Node vm context on top of a stub `chrome`
+// (test/helpers/stub-chrome.js). Returns the context: its globals are the
+// worker's — handle(), validateTab(), BridgeAccess, attached, cdp, initDone…
+// A WebSocket stub never connects, so the worker sits idle until a test calls
+// handle() directly, exactly as sock.onmessage would.
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+
+const EXT = path.join(__dirname, "..", "..", "extension");
+
+function loadWorker(S) {
+  class FakeWebSocket {
+    constructor() { this.readyState = 0; setTimeout(() => { this.readyState = 3; if (this.onclose) this.onclose(); }, 0); }
+    send() {} close() {}
+  }
+  FakeWebSocket.OPEN = 1; FakeWebSocket.CONNECTING = 0;
+  const sandbox = {
+    chrome: S.chrome,
+    WebSocket: FakeWebSocket,
+    console: { log() {}, info() {}, warn() {}, error() {} },
+    setTimeout, clearTimeout, setInterval, clearInterval, setImmediate,
+    URL, TextEncoder, TextDecoder, Buffer,
+    crypto: require("crypto").webcrypto,
+  };
+  sandbox.self = sandbox; sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+  sandbox.importScripts = (...files) => { for (const f of files) vm.runInContext(fs.readFileSync(path.join(EXT, f), "utf8"), ctx, { filename: f }); };
+  vm.runInContext(fs.readFileSync(path.join(EXT, "background.js"), "utf8"), ctx, { filename: "background.js" });
+  return sandbox; // the vm global: handle, validateTab, BridgeAccess, attached, cdp, initDone, …
+}
+
+module.exports = { loadWorker };

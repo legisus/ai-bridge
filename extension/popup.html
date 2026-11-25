@@ -36,6 +36,9 @@
     <button id="closeTabs" class="wide">Close agent tabs</button>
   </div>
   <div id="result"></div>
+  <details style="margin-top:10px"><summary style="font-size:12.5px;cursor:pointer">Recent events</summary>
+    <div id="events" style="font-size:11.5px;font-family:ui-monospace,monospace;max-height:160px;overflow:auto;margin-top:4px"></div>
+  </details>
   <div class="hint">Granting lets the bridge drive this Chrome session (open tabs, run scripts, download). Revoking stops every running command at once. A grant survives a browser restart; an extension reload revokes it.</div>
   <script src="popup.js"></script>
 </body>

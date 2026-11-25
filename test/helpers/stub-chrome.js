@@ -48,18 +48,68 @@ function stubChrome() {
 
   const removed = [];
   const failIds = new Set();
-  const tabs = { list: [] };
+  // An event with addListener/removeListener/emit (chrome.* events).
+  const event = () => { const fns = new Set(); return { addListener: (f) => fns.add(f), removeListener: (f) => fns.delete(f), hasListener: (f) => fns.has(f), emit: (...a) => { for (const f of [...fns]) f(...a); }, size: () => fns.size }; };
+  const tabs = { list: [], captures: [], onCapture: null, onActivated: event(), onUpdated: event(), onRemoved: event() };
+  const frames = {};                 // tabId -> { url, documentId } for webNavigation.getFrame
+  const injections = [];             // scripting.executeScript / userScripts.execute calls
+  const inject = { result: null, hook: null }; // hook(call) may throw or return a result
+  const cdp = { sent: [], attached: new Set(), detached: [], attachGate: null, contexts: {}, loaderId: "L1", onSend: null, onEvent: event(), onDetach: event(), failNext: null };
   const downloads = { items: [], cancelled: [], nextId: 1 };
-  const alarms = { list: [], failCreate: false };
+  const alarms = { list: [], failCreate: false, onAlarm: event() };
   const badge = [];
-  const runtime = { id: "ext-id", reloads: 0 };
+  const runtime = { id: "ext-id", reloads: 0, onMessage: event(), onStartup: event(), onInstalled: event(), messagesToNative: [] };
+  const storageChanged = event();
+  const windows = { list: [{ id: 1 }], nextId: 2 };
+
+  // Chrome refuses to inject into a document that is gone: emulate documentIds.
+  const injectInto = async (api, call) => {
+    await tick();
+    injections.push({ api, ...call });
+    if (inject.hook) { const r = await inject.hook(call, api); if (r !== undefined) return r; }
+    const ids = call.target && call.target.documentIds;
+    if (ids) {
+      const f = frames[call.target.tabId];
+      if (!f || !ids.includes(f.documentId)) throw new Error(`Error: No frame with documentId ${ids[0]} in tab ${call.target.tabId}`);
+    }
+    return [{ result: inject.result }];
+  };
 
   const chrome = {
-    storage: { session: area("session"), local: area("local") },
+    storage: { session: area("session"), local: area("local"), onChanged: storageChanged },
     tabs: {
       remove: async (id) => { await tick(); if (failIds.has(id)) throw new Error("No tab with id"); removed.push(id); tabs.list = tabs.list.filter((t) => t.id !== id); },
-      query: async () => { await tick(); return tabs.list.map((t) => ({ ...t })); },
-      create: async (opts) => { await tick(); const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: 1, url: opts && opts.url }; tabs.list.push(t); return t; },
+      query: async (q) => { await tick(); return tabs.list.filter((t) => !q || q.windowId === undefined || t.windowId === q.windowId).map((t) => ({ ...t })); },
+      get: async (id) => { await tick(); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); return { ...t }; },
+      create: async (opts) => { await tick(); const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: opts && opts.windowId || 1, url: opts && opts.url, active: !!(opts && opts.active) }; tabs.list.push(t); return { ...t }; },
+      update: async (id, props) => { await tick(); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); Object.assign(t, props); return { ...t }; },
+      captureVisibleTab: async (windowId) => { await tick(); if (tabs.onCapture) await tabs.onCapture(windowId); const active = tabs.list.find((t) => t.windowId === windowId && t.active); tabs.captures.push(active ? active.id : null); return `data:image/png;base64,${Buffer.from(`shot-of-${active ? active.id : "none"}`).toString("base64")}`; },
+      onActivated: tabs.onActivated, onUpdated: tabs.onUpdated, onRemoved: tabs.onRemoved,
+    },
+    windows: {
+      create: async (opts) => { await tick(); const id = windows.nextId++; windows.list.push({ id }); const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: id, url: opts && opts.url, active: true }; tabs.list.push(t); return { id, tabs: [{ ...t }] }; },
+      update: async () => { await tick(); return {}; },
+    },
+    webNavigation: {
+      getFrame: async ({ tabId }) => { await tick(); const f = frames[tabId]; if (!f) return null; return { frameId: 0, parentFrameId: -1, url: f.url, documentId: f.documentId }; },
+    },
+    scripting: { executeScript: (call) => injectInto("scripting", call) },
+    userScripts: { execute: (call) => injectInto("userScripts", call) },
+    debugger: {
+      attach: async ({ tabId }) => { await tick(); if (cdp.attachGate) await cdp.attachGate; cdp.attached.add(tabId); },
+      detach: async ({ tabId }) => { await tick(); cdp.attached.delete(tabId); cdp.detached.push(tabId); },
+      sendCommand: async ({ tabId }, method, params) => {
+        await tick();
+        cdp.sent.push({ tabId, method, params });
+        if (cdp.failNext === method) { cdp.failNext = null; throw new Error(`${method} failed`); }
+        if (cdp.onSend) await cdp.onSend(tabId, method, params);
+        if (method === "Page.getFrameTree") { const f = frames[tabId] || { url: "about:blank" }; return { frameTree: { frame: { id: "F0", loaderId: cdp.loaderId, url: f.url } } }; }
+        if (method === "Runtime.enable") { for (const c of cdp.contexts[tabId] || []) cdp.onEvent.emit({ tabId }, "Runtime.executionContextCreated", { context: c }); return {}; }
+        if (method === "Runtime.evaluate") return { result: { value: `eval:${params && params.uniqueContextId}` } };
+        if (method === "Page.captureScreenshot") return { data: "QUJD" };
+        return {};
+      },
+      onEvent: cdp.onEvent, onDetach: cdp.onDetach,
     },
     downloads: {
       download: async (opts) => { await tick(); const id = downloads.nextId++; downloads.items.push({ id, state: "in_progress", byExtensionId: runtime.id, startTime: new Date().toISOString(), url: opts && opts.url }); return id; },
@@ -79,14 +129,20 @@ function stubChrome() {
       clear: async (name) => { await tick(); const n = alarms.list.length; alarms.list = alarms.list.filter((a) => a.name !== name); return alarms.list.length !== n; },
       clearAll: async () => { await tick(); alarms.list = []; return true; },
       getAll: async () => { await tick(); return alarms.list.map((a) => ({ ...a })); },
+      onAlarm: alarms.onAlarm,
     },
     action: {
       setBadgeText: async (o) => { await tick(); badge.push({ text: o.text }); },
       setBadgeBackgroundColor: async (o) => { await tick(); badge.push({ color: o.color }); },
     },
-    runtime: { id: runtime.id, reload: () => { runtime.reloads++; } },
+    runtime: {
+      id: runtime.id, reload: () => { runtime.reloads++; }, getManifest: () => ({ version: "test" }),
+      onMessage: runtime.onMessage, onStartup: runtime.onStartup, onInstalled: runtime.onInstalled,
+      connectNative: () => ({ onMessage: event(), onDisconnect: event(), disconnect() {} }),
+      get lastError() { return undefined; },
+    },
   };
-  return { chrome, mem, removed, failIds, tabs, downloads, alarms, badge, runtime };
+  return { chrome, mem, removed, failIds, tabs, frames, injections, inject, cdp, windows, downloads, alarms, badge, runtime, event };
 }
 
 module.exports = { stubChrome };

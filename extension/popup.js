@@ -38,6 +38,17 @@ async function refresh() {
   }
 }
 
+async function refreshEvents() {
+  const r = await send({ type: "events-get" });
+  const box = $("events");
+  if (!r || !r.ok) { box.textContent = ""; return; }
+  box.textContent = (r.events || []).slice(-20).reverse().map((e) => {
+    const t = new Date(e.t).toLocaleTimeString();
+    const d = e.detail ? Object.entries(e.detail).map(([k, v]) => `${k}=${k === "until" ? new Date(v).toLocaleTimeString() : v}`).join(" ") : "";
+    return `${t} ${e.kind}${e.reqId ? ` req ${e.reqId}` : ""}${e.tabId !== undefined ? ` tab ${e.tabId}` : ""}${e.origin ? ` ${e.origin}` : ""}${d ? ` ${d}` : ""}`;
+  }).join("\n");
+}
+
 async function act(msg, done) {
   $("result").textContent = "…";
   const r = await send(msg);
@@ -51,5 +62,5 @@ $("revoke").addEventListener("click", () => act({ type: "access-set", granted: f
 $("revokeClose").addEventListener("click", () => act({ type: "access-set", granted: false, closeTabs: true }, () => "access revoked, agent tabs closed"));
 $("closeTabs").addEventListener("click", () => act({ type: "close-agent-tabs" }, (r) => `closed ${(r.closed || []).length} tab(s)`));
 
-refresh();
-setInterval(refresh, 1000);
+refresh(); refreshEvents();
+setInterval(() => { refresh(); refreshEvents(); }, 1000);

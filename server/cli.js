@@ -43,6 +43,7 @@ if (argv.length === 0) {
   console.error("       bridge snapshot '{\"tabId\":N}' [--debugger]   # DOM digest: text + interactive elements with selectors");
   console.error("       bridge journal [--days N] [--job name] [--json] | --trace <runId>");
   console.error("       bridge tabs [--json] | bridge closeTabs --mine | --run <id> | --older-than <minutes>   # tabs the bridge opened");
+  console.error("       bridge status [--events]                     # extension state; --events adds its recent event log (redacted)");
   console.error("       bridge recipe propose|run|show <job> | validate|import <file>   # economy mode recipes");
   console.error("       bridge jobs [set <job> --mode regular|audit|economy --risk read|write] | reset <job>");
   console.error("       bridge claude-md [--project] [--print]   # teach Claude Code the bridge (writes CLAUDE.md)");
@@ -148,6 +149,7 @@ for (let i = 1; i < argv.length; i++) {
   else if (argv[i] === "--timeout") flags.timeout = Number(argv[++i]);
   else if (argv[i] === "--direct" || argv[i] === "--stealth") flags.direct = true;   // explicit (default anyway); --stealth = pre-0.1.10 alias
   else if (argv[i] === "--debugger" || argv[i] === "--no-stealth") flags.debugger = true; // --no-stealth = pre-0.1.10 alias
+  else if (argv[i] === "--events" && cmd === "status") params.events = true;   // bridge status --events: the extension's projected event log
   else params = JSON.parse(argv[i]);
 }
 // Confine a path to the outbox: the deepest existing ancestor must resolve (symlinks
