@@ -1,9 +1,10 @@
 # Docker-isolated agent with host-side access control — design
 
-**Status:** design, 2026-11-21, revised the same day after five rounds of the Codex
-`gpt-6-astra` review (30 + 7 + 3 + 1 + 1 findings folded in; approved as a draft
-design in round six, with the untested CLI pin pair left as an implementation gate;
-the review text is not part of the repo). Ships as the
+**Status:** design, 2026-11-21, revised the same day after nine rounds of the Codex
+`gpt-6-astra` review (53 findings folded in; the base design was approved in round
+six, the observability and tab-hygiene additions in round nine, with the untested
+CLI pin pair left as an implementation gate; the review text is not part of the
+repo). Ships as the
 `docker-isolated` branch on top of the channels chain (`feat/channels-core` →
 `fix/intent-gate-expiry`). User-facing guide: `docs/DOCKER.md`. Builds on the relay
 protocol in `server/server.js`, the extension's `handle()` in
@@ -343,8 +344,8 @@ restart with a stale value.
    detaches itself before returning.
 4. If `closeTabs`, close every tab in `agentTabs` (every grant of this browser
    session) and every `pendingTabs` entry whose id resolves later.
-5. Send `{type:"access", session, granted:false, until:null, gen}` if the socket is
-   open.
+5. Send the canonical `access` envelope (`{type:"access", session, granted:false,
+   until:null, gen, browserSession}`) if the socket is open.
 6. Badge grey, no text. Clear the `access-expiry-<gen>` alarm.
 
 ### Grant
