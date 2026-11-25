@@ -20,6 +20,10 @@ assert(JSON.stringify(Object.keys(env).sort()) === JSON.stringify(["AI_BRIDGE_AG
   "cleanEnv: keeps only PATH HOME USER LANG TMPDIR BRIDGE_PORT + run metadata");
 assert(!("AI_BRIDGE_TELEGRAM_TOKEN" in env) && !("AWS_SECRET_ACCESS_KEY" in env), "cleanEnv: secrets dropped");
 assert(cleanEnv({ PATH: "p" }).PATH === "p" && Object.keys(cleanEnv({})).length === 0, "cleanEnv: missing keys are simply absent");
+const e2 = cleanEnv({ AI_BRIDGE_HOME: "/data", AI_BRIDGE_DEBUGGER: "1", AI_BRIDGE_CODEX_SANDBOX: "container", AI_BRIDGE_CLIENT: "bridge agent", AI_BRIDGE_TELEGRAM_TOKEN: "t", AI_BRIDGE_TELEGRAM_TURO_TOKEN: "t2", PATH: "p" });
+assert(e2.AI_BRIDGE_HOME === "/data" && e2.AI_BRIDGE_DEBUGGER === "1" && e2.AI_BRIDGE_CODEX_SANDBOX === "container" && e2.AI_BRIDGE_CLIENT === "bridge agent", "cleanEnv: passes AI_BRIDGE_HOME/DEBUGGER/CODEX_SANDBOX/CLIENT");
+assert(!("AI_BRIDGE_TELEGRAM_TOKEN" in e2) && !("AI_BRIDGE_TELEGRAM_TURO_TOKEN" in e2), "cleanEnv: messenger tokens still denied");
+assert(!("AI_BRIDGE_TELEGRAM_TOKEN" in cleanEnv({ AI_BRIDGE_TELEGRAM_TOKEN: "t" }, ["AI_BRIDGE_TELEGRAM_TOKEN"])), "cleanEnv: envPassthrough cannot re-admit a token");
 const auth = cleanEnv({ CLAUDE_CODE_OAUTH_TOKEN: "o", ANTHROPIC_API_KEY: "k", AI_BRIDGE_RESTRICTED: "1", AI_BRIDGE_TELEGRAM_TOKEN: "t", MY_PROXY: "p" }, ["MY_PROXY"]);
 assert(auth.CLAUDE_CODE_OAUTH_TOKEN === "o" && auth.ANTHROPIC_API_KEY === "k" && auth.AI_BRIDGE_RESTRICTED === "1" && auth.MY_PROXY === "p" && !("AI_BRIDGE_TELEGRAM_TOKEN" in auth),
   "cleanEnv: keeps the model's own auth, the restricted marker and operator passthrough; never a messenger token");

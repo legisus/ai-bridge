@@ -84,15 +84,23 @@ on the same page: [Binary install](docs/INSTALL.md#binary-install-no-nodejs).
    extension and click *Details* → turn on **Allow User Scripts** (needed by `eval`
    in direct mode; Chrome 138+). No native host? Paste the token from
    `~/.ai-browser-bridge/token` into *Extension options* instead.
-4. **Smoke test:**
+4. **Grant access:** click the extension's toolbar icon and press **Grant** (or
+   **Grant for 1 h**). The bridge starts revoked after every install or reload;
+   the grant survives browser restarts. **Revoke** stops every running command.
+5. **Smoke test:**
    ```bash
    node server/cli.js ping
-   # {"pong":true,"version":"0.1.10"}
+   # {"pong":true,"version":"0.1.11","access":"granted",...}
    ```
    `connect failed` = server not running; `extension not connected` = token not saved
-   or wrong — re-save Options, wait 30 s, retry.
-5. **Keep it running:** not needed with the native host — Chrome starts the server
+   or wrong — re-save Options, wait 30 s, retry; `access_not_granted` /
+   `access_revoked` (exit 8) = press **Grant** in the popup.
+6. **Keep it running:** not needed with the native host — Chrome starts the server
    on demand. Otherwise copy a template from `deploy/`, fix the paths, load it.
+
+Running the relay and the agent in **Docker** on a PC while Chrome stays on the
+host, with grant/revoke from the extension: see [docs/DOCKER.md](docs/DOCKER.md)
+(`Dockerfile`, `deploy/docker/compose.yml`, `test/docker-smoke.sh`).
 
 ## Usage
 
@@ -307,6 +315,18 @@ Full policy: [PRIVACY.md](PRIVACY.md). Read this before installing — the exten
 - Every command is **logged** to `~/.ai-browser-bridge/bridge.log` with its request
   id, the client label and the run id, and ends in exactly one `done` / `refused` /
   `cancelled` line.
+- **Only http(s) pages on allowed hosts are ever a target.** `chrome://`, the
+  extension's own pages, `file:`, `javascript:`, `data:` and `view-source:` are
+  refused whatever the allowlist says; `listTabs` lists such tabs by id only
+  (`url: "redacted"`); every command re-reads its tab and runs only in the
+  document it validated (a page that navigated underneath fails with
+  `target changed`). `bridge status --events` shows the extension's recent
+  events, redacted to the current allowlist.
+- **You grant and revoke the browser session** from the extension's popup (or
+  Options). The service worker is the only writer of that state and checks it on
+  every command and before every browser operation; a revoke stops in-flight work,
+  releases the debugger, cancels bridge downloads and, with **Revoke and close agent
+  tabs**, closes the tabs the agent opened. Nothing in the relay or the CLI can grant.
 - The relay keeps a **registry of the tabs it opened** (`~/.ai-browser-bridge/tabs.json`:
   tab id, Chrome session, who, when, which run, origin only — never page content or
   full URLs). An agent run's tabs are closed when the run ends or its process dies;

@@ -1,7 +1,18 @@
 # Docker-isolated agent with host-side access control — design
 
-**Implementation status (2026-11-24):** the first slice is on the `tab-hygiene`
-branch: the server side of the wire contract (`access` normalisation, extension
+**Implementation status (2026-11-25):** three slices are implemented: `tab-hygiene`
+(PR #12), `access-switch` (PR #13, stacked on it) and `target-guard` (stacked on
+that: the privileged-origin block with document binding — `webNavigation`
+`documentId` for direct injections, `uniqueContextId` and `loaderId` for the
+debugger route, the `onActivated` guard for direct screenshots, detach on
+navigation to a bad URL — the allowlist on every target with `listTabs`
+redaction, and the 200-entry event buffer with `status {events:true}`). The
+second slice adds the extension's grant/revoke switch (serialised transition, `assertAccess` /
+`dispatch` on every command, expiry alarms, reload and startup reconciliation,
+pending tab/download ownership, popup, Options session name and manual mode) and
+the agent's access gate (`server/access-gate.js`). Still to come: the channels
+daemon's `/status` and revoked-task refusal, and the container files. The first
+slice: the server side of the wire contract (`access` normalisation, extension
 generation, identity triple, gate, `BRIDGE_BIND`), request-id correlation with
 one `finish()` path, the tab registry, run leases, `closeTabs`, `bridge tabs` /
 `bridge closeTabs`, `--keep-tabs` and the journal counters. The extension sends
@@ -258,9 +269,10 @@ New keys in `chrome.storage.local` next to `token`, `port`, `allowlist`,
 `provisionedBy`:
 
 ```
-sessionName: "chrome"                          // Options
+session:     "chrome"                          // Options (browser session name; key kept from the first slice)
 manualMode:  true | false                      // Options; true = never call the native host
 access:      { granted: bool, until: null | number, gen: number }   // written by the worker only
+notices:     [ string ]                        // popup notices (reload revoked access, unidentified tabs)
 ```
 
 Also in `chrome.storage.local` (download ids are stable across browser sessions,
@@ -268,7 +280,7 @@ so ownership can be kept):
 
 ```
 bridgeDownloads:  { [downloadId]: { gen } }    // downloads started by the bridge
-pendingDownloads: [ { nonce, gen, url, startedAt } ]   // download dispatched, id not yet known
+pendingDownloads: [ { nonce, gen, origin, startedAt } ]   // download dispatched, id not yet known (origin, not URL)
 ```
 
 Download records, including the pending ones, are in **local** storage so that a
@@ -279,8 +291,8 @@ And in `chrome.storage.session` (survives service-worker restarts, cleared by Ch
 on browser restart, extension reload, update or disable):
 
 ```
-agentTabs:    { [tabId]: { gen, url } }        // tabs opened by newTab in this browser session
-pendingTabs:  [ { nonce, gen, url, startedAt } ]   // tab dispatched, id not yet known
+agentTabs:    [ tabId ]                        // tabs opened by newTab in this browser session (ids only; the gen is "for logging only" and is not kept)
+pendingTabs:  [ { nonce, gen, origin, startedAt } ]   // tab dispatched, id not yet known (origin, not URL)
 ```
 
 They live in storage, not in worker globals, because the service worker is
@@ -652,7 +664,9 @@ does not forget them:
   `keepTabs` rule. Their tabs are listed by `bridge tabs` and closed by
   `bridge closeTabs` like direct CLI tabs.
 - `BRIDGE_DRAIN_MS` shortens the 5-s drain; it exists for the tests only and is
-  not documented in the guide.
+  not documented in the guide. Likewise `AI_BRIDGE_NO_ACCESS_GATE=1` makes the
+  agent's access gate a pass-through for the unit tests that inject a mock model
+  runner and have no relay to ping.
 - Journal: each run record gains `tabsOpened`, `tabsClosed`, `tabsRetained`,
   `keptTabs`, so `bridge journal` can show leaks per job.
 
@@ -681,7 +695,9 @@ does not forget them:
   in the container looks for the token under `$HOME` and exits 6.
 - The channels daemon reports session name and access state in `/status`, answers a
   task sent while revoked with the one-line error instead of queueing it, and treats
-  `access_revoked` from a running turn as a terminal error for that turn.
+  `access_revoked` from a running turn as a terminal error for that turn. (The
+  `/status` line and the pre-queue refusal are deferred to the channels follow-up;
+  `runTurn` itself is gated, so a revoked turn ends with `access_revoked`.)
 
 ## Container
 
