@@ -321,6 +321,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const man2 = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "extension", "manifest.json"), "utf8"));
   assert(man2.permissions.includes("webNavigation"), "manifest: webNavigation permission");
 
+  // ---- Task 2 (target guard): event ring buffer and projection ----------
+  await B.clearEvents();
+  for (let i = 0; i < 205; i++) await B.logEvent({ kind: "attach", tabId: i, origin: "https://ok.example" });
+  let ev = await B.events();
+  assert(ev.length === 200 && ev[0].tabId === 5 && ev[199].tabId === 204 && typeof ev[0].t === "number", "logEvent keeps the last 200 entries, oldest dropped");
+  await B.clearEvents();
+  await B.logEvent({ kind: "refused", reqId: "abc", tabId: 5, origin: "https://secret.example/path?x=1", detail: { reason: "not_allowed", error: "host secret.example not in allowlist", gen: 3 } });
+  await B.logEvent({ kind: "tab_opened", reqId: "def", tabId: 6, origin: "https://ok.example" });
+  await B.logEvent({ kind: "revoke", detail: { source: "popup", gen: 4, reason: "free text reason" } });
+  ev = await B.events();
+  assert(ev[0].origin === "https://secret.example" && !("error" in ev[0].detail) && ev[0].detail.reason === "not_allowed" && ev[0].detail.gen === 3, "logEvent stores the origin only and keeps just the whitelisted detail keys");
+  assert(!("reason" in ev[2].detail) && ev[2].detail.source === "popup", "logEvent drops a detail.reason that is not a fixed code");
+  const projGranted = B.projectEvents(ev, { granted: true, allowlist: ["ok.example"] });
+  const pj = JSON.stringify(projGranted);
+  assert(!/secret/.test(pj) && !/host secret/.test(pj) && Array.isArray(projGranted.events) && projGranted.events[0].origin === "redacted" && !("tabId" in projGranted.events[0]) && projGranted.events[0].reqId === "abc" && projGranted.events[0].detail.reason === "not_allowed", "projection (granted): disallowed origin redacted, tabId dropped, reqId and reason kept, no host string anywhere");
+  assert(projGranted.events[1].origin === "https://ok.example" && projGranted.events[1].tabId === 6, "projection (granted): allowed origin and tabId kept");
+  const projRevoked = B.projectEvents(ev, { granted: false, allowlist: ["ok.example"] });
+  assert(!projRevoked.events && projRevoked.counts.refused === 1 && projRevoked.counts.tab_opened === 1 && projRevoked.counts.revoke === 1 && !/example/.test(JSON.stringify(projRevoked)), "projection (not granted): counts per kind only");
+  const projAll = B.projectEvents(ev, { granted: true, allowlist: [] });
+  assert(projAll.events[0].origin === "https://secret.example", "projection with an empty allowlist keeps http(s) origins");
+  await B.logEvent({ kind: "attach", tabId: 7, origin: "chrome://extensions" });
+  const projPriv = B.projectEvents(await B.events(), { granted: true, allowlist: [] });
+  assert(projPriv.events[3].origin === "redacted", "projection redacts privileged origins even with an empty allowlist");
+  await B.logEvent({ kind: "weird", detail: { reason: "not_allowed" } });
+  assert((await B.events()).length === 4, "logEvent ignores unknown kinds");
+  await B.clearEvents();
+  await B.setAccess({ granted: true, until: Date.now() + 3600e3 });
+  await B.setAccess({ granted: false, source: "options" });
+  ev = await B.events();
+  assert(ev.some((e) => e.kind === "grant" && e.detail.source === "popup" && typeof e.detail.until === "number" && typeof e.detail.gen === "number") && ev.some((e) => e.kind === "revoke" && e.detail.source === "options"), "setAccess logs grant/revoke events with source, gen and until");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
