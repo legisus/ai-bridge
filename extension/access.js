@@ -32,6 +32,10 @@
     const { agentTabs } = await chrome.storage.session.get("agentTabs");
     return Array.isArray(agentTabs) ? agentTabs.filter(Number.isInteger) : [];
   };
+  const readPending = async (area, key) => { const v = (await chrome.storage[area].get(key))[key]; return Array.isArray(v) ? v : []; };
+  const readMap = async (key) => { const v = (await chrome.storage.local.get(key))[key]; return v && typeof v === "object" ? { ...v } : {}; };
+  let dlQueue = Promise.resolve();
+  const withDownloads = (fn) => { const p = dlQueue.then(fn, fn); dlQueue = p.catch(() => {}); return p; };
 
   // ---- access record, generation, transition ------------------------------
   // The worker is the only writer of `access`. Every grant and revoke bumps
@@ -159,6 +163,104 @@
       if (record.until === null) return { text: "ON", color: "#1e8e3e" };
       const min = Math.max(0, Math.round((record.until - now) / 60000));
       return { text: min >= 60 ? `${Math.floor(min / 60)}h` : `${min}m`, color: "#1e8e3e" };
+    },
+
+    // ---- ownership with pending entries --------------------------------------
+    // A pending entry is written BEFORE the browser call, so a worker restart
+    // or a revoke between the call and the id coming back never loses the fact
+    // that it was ours. A completion under a moved generation closes/cancels.
+    beginTab({ gen, origin }) {
+      const nonce = randomHex32();
+      return withTabs(async () => {
+        const list = await readPending("session", "pendingTabs");
+        await chrome.storage.session.set({ pendingTabs: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now() }] });
+        return nonce;
+      });
+    },
+    async completeTab(nonce, tabId) {
+      const entry = await withTabs(async () => {
+        const list = await readPending("session", "pendingTabs");
+        const e = list.find((x) => x.nonce === nonce) || null;
+        await chrome.storage.session.set({ pendingTabs: list.filter((x) => x.nonce !== nonce) });
+        return e;
+      });
+      const gen = entry ? entry.gen : -1;
+      const live = gen === accessGen && (await this.readAccess()).granted;
+      if (live && Number.isInteger(tabId)) { await this.rememberAgentTab(tabId); return true; }
+      if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); } catch {} }
+      return false;
+    },
+    beginDownload({ gen, origin }) {
+      const nonce = randomHex32();
+      return withDownloads(async () => {
+        const list = await readPending("local", "pendingDownloads");
+        await chrome.storage.local.set({ pendingDownloads: [...list, { nonce, gen, origin: String(origin || "unknown"), startedAt: Date.now() }] });
+        return nonce;
+      });
+    },
+    async completeDownload(nonce, downloadId) {
+      const entry = await withDownloads(async () => {
+        const list = await readPending("local", "pendingDownloads");
+        const e = list.find((x) => x.nonce === nonce) || null;
+        await chrome.storage.local.set({ pendingDownloads: list.filter((x) => x.nonce !== nonce) });
+        return e;
+      });
+      const gen = entry ? entry.gen : -1;
+      const live = gen === accessGen && (await this.readAccess()).granted;
+      if (live && Number.isInteger(downloadId)) {
+        await withDownloads(async () => { const m = await readMap("bridgeDownloads"); m[downloadId] = { gen }; await chrome.storage.local.set({ bridgeDownloads: m }); });
+        return true;
+      }
+      if (Number.isInteger(downloadId)) { try { await chrome.downloads.cancel(downloadId); } catch {} }
+      return false;
+    },
+    // Every bridge download of this browser session (all grants) still running
+    // is cancelled; finished ones are left alone; vanished ids are forgotten.
+    async cancelBridgeDownloads() {
+      const cancelled = [];
+      await withDownloads(async () => {
+        const m = await readMap("bridgeDownloads");
+        for (const id of Object.keys(m).map(Number)) {
+          let item = null;
+          try { [item] = await chrome.downloads.search({ id }); } catch {}
+          if (!item) { delete m[id]; continue; }
+          if (item.state === "in_progress") { try { await chrome.downloads.cancel(id); cancelled.push(id); } catch {} }
+        }
+        await chrome.storage.local.set({ bridgeDownloads: m });
+      });
+      return { cancelled };
+    },
+    // Worker start: drop records of tabs/downloads that no longer exist, adopt
+    // pending downloads by byExtensionId, drop (never guess) pending tabs.
+    async reconcileOwnership() {
+      const out = { droppedTabs: 0, droppedDownloads: 0, adoptedDownloads: 0, unidentifiedTabs: 0 };
+      await withTabs(async () => {
+        let existing = null;
+        try { existing = new Set((await chrome.tabs.query({})).map((t) => t.id)); } catch {}
+        const ids = await readTabs();
+        const kept = existing ? ids.filter((id) => existing.has(id)) : ids;
+        out.droppedTabs = ids.length - kept.length;
+        const pendingTabs = await readPending("session", "pendingTabs");
+        out.unidentifiedTabs = pendingTabs.length;
+        await chrome.storage.session.set({ agentTabs: kept, pendingTabs: [] });
+      });
+      await withDownloads(async () => {
+        const m = await readMap("bridgeDownloads");
+        let all = [];
+        try { all = await chrome.downloads.search({}); } catch {}
+        const existing = new Set(all.map((d) => d.id));
+        for (const id of Object.keys(m).map(Number)) if (!existing.has(id)) { delete m[id]; out.droppedDownloads++; }
+        const pending = await readPending("local", "pendingDownloads");
+        for (const p of pending) {
+          let items = [];
+          try { items = await chrome.downloads.search({ startedAfter: new Date(p.startedAt).toISOString(), orderBy: ["-startTime"] }); } catch {}
+          const mine = items.filter((d) => d.byExtensionId === chrome.runtime.id && !m[d.id]);
+          if (mine.length) { m[mine[mine.length - 1].id] = { gen: p.gen }; out.adoptedDownloads++; }
+        }
+        await chrome.storage.local.set({ bridgeDownloads: m, pendingDownloads: [] });
+      });
+      if (out.unidentifiedTabs) await this.setNotice(`${out.unidentifiedTabs} tab(s) the agent may have opened could not be identified`);
+      return out;
     },
 
     // Popup "Close agent tabs": every tab the bridge opened, access unchanged.

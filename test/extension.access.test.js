@@ -177,6 +177,42 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const st = await B.status();
   assert(st.granted === true && st.remainingMs > 0 && st.gen === 50 && /^[0-9a-f]{32}$/.test(st.browserSession) && Array.isArray(st.notices), "status() for the popup");
 
+  // ---- pending tabs / downloads, reconciliation (Task 3) -----------------
+  await B.setAccess({ granted: true }); let g6 = B.currentGen();
+  let n = await B.beginTab({ gen: g6, origin: "https://a.example" });
+  assert((await S.chrome.storage.session.get("pendingTabs")).pendingTabs.length === 1, "beginTab records a pending entry before creation");
+  assert((await B.completeTab(n, 300)) === true && (await B.agentTabIds()).includes(300) && (await S.chrome.storage.session.get("pendingTabs")).pendingTabs.length === 0, "completeTab adopts the tab under a live grant");
+  n = await B.beginTab({ gen: g6, origin: "https://a.example" });
+  await B.setAccess({ granted: false });
+  assert((await B.completeTab(n, 301)) === false && S.removed.includes(301) && !(await B.agentTabIds()).includes(301), "a tab whose creation completes after a revoke is closed, not adopted");
+  // downloads
+  await B.setAccess({ granted: true }); g6 = B.currentGen();
+  n = await B.beginDownload({ gen: g6, origin: "https://d.example" });
+  S.downloads.items.push({ id: 9, state: "in_progress", byExtensionId: "ext-id", startTime: new Date().toISOString() });
+  assert((await B.completeDownload(n, 9)) === true && (await S.chrome.storage.local.get("bridgeDownloads")).bridgeDownloads[9].gen === g6 && (await S.chrome.storage.local.get("pendingDownloads")).pendingDownloads.length === 0, "completeDownload records ownership in local storage");
+  n = await B.beginDownload({ gen: g6, origin: "https://d.example" });
+  S.downloads.items.push({ id: 10, state: "in_progress", byExtensionId: "ext-id", startTime: new Date().toISOString() });
+  await B.setAccess({ granted: false });
+  assert(S.downloads.cancelled.includes(9), "revoke cancels the in-progress bridge download");
+  assert((await B.completeDownload(n, 10)) === false && S.downloads.cancelled.includes(10), "a download whose id arrives after a revoke is cancelled");
+  S.downloads.items.push({ id: 11, state: "complete", byExtensionId: "ext-id", startTime: new Date().toISOString() });
+  await S.chrome.storage.local.set({ bridgeDownloads: { 11: { gen: 1 } } });
+  await B.setAccess({ granted: true }); await B.setAccess({ granted: false });
+  assert(!S.downloads.cancelled.includes(11), "a finished download is left alone");
+  // reconciliation at worker start
+  await S.chrome.storage.session.set({ agentTabs: [300, 999], pendingTabs: [{ nonce: "x", gen: 1, origin: "o", startedAt: Date.now() - 1000 }] });
+  S.tabs.list = [{ id: 300 }];
+  const started = Date.now() - 500;
+  await S.chrome.storage.local.set({ pendingDownloads: [{ nonce: "p", gen: 1, origin: "o", startedAt: started }], bridgeDownloads: { 9: { gen: 1 }, 404: { gen: 1 } } });
+  S.downloads.items.push({ id: 12, state: "in_progress", byExtensionId: "ext-id", startTime: new Date(started + 10).toISOString() });
+  S.downloads.items.push({ id: 13, state: "in_progress", byExtensionId: "other", startTime: new Date(started + 20).toISOString() });
+  const rr = await B.reconcileOwnership();
+  assert(JSON.stringify(await B.agentTabIds()) === "[300]" && rr.droppedTabs === 1, "reconcile: agent tabs that no longer exist are dropped");
+  const bd = (await S.chrome.storage.local.get("bridgeDownloads")).bridgeDownloads;
+  assert(!bd[404] && bd[12] && !bd[13] && bd[9] && rr.adoptedDownloads === 1 && rr.droppedDownloads === 1, "reconcile: pending download adopted by byExtensionId filter, foreign one ignored, stale record dropped");
+  assert(rr.unidentifiedTabs === 1 && (await S.chrome.storage.session.get("pendingTabs")).pendingTabs.length === 0 && /1 tab\(s\) the agent may have opened could not be identified/.test((await B.notices()).join()), "reconcile: pending tab dropped and counted, never guessed");
+  await B.dismissNotices();
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
