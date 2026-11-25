@@ -425,24 +425,45 @@ browser restarts. A fifth button, **Close agent tabs**, closes every tab in
 The service worker logs nothing today. It gains:
 
 - `events`: a ring buffer of the last 200 entries in `chrome.storage.session`
-  (`{t, kind, reqId?, tabId?, url?, detail?}`), written through one `logEvent()`
+  (`{t, kind, reqId?, tabId?, origin?, detail?}`), written through one `logEvent()`
   helper for: socket connect/disconnect/superseded, grant, revoke (with source:
   popup, options, alarm, reload, startup reconciliation), refused command
   (`access_revoked`, `access_not_granted`, `privileged target refused`,
   `not allowed`, `target changed`), tab opened/closed by the bridge, download
-  started/cancelled, debugger attach/detach. URLs are stored as origin only.
-  Each entry also goes to `console.info` so it shows in the worker's DevTools.
-- The popup shows the last 20 events; `status` returns the full buffer when
-  asked (`bridge status --events`, a `{events:true}` param on the `status`
-  command).
-- **Request id correlation.** Every CLI request already has an `id` on the wire;
-  the extension includes it as `reqId` in every error object it returns and in the
-  matching event, and the server prefixes each log line with it. The server log
-  line for a command becomes `<ts> <reqId> <client> <runId|-> cmd newTab {...}`,
-  where `client` is `AI_BRIDGE_CLIENT` from the CLI's environment (default: the
-  parent process name, so a launchd job can be told apart from an interactive
-  shell) and `runId` the agent run's id when there is one. Traces are unchanged
-  but gain `reqId` per line.
+  started/cancelled, debugger attach/detach. URLs are stored as origin only. Each
+  entry also goes to `console.info` so it shows in the worker's DevTools.
+- **Two views, not one.** The popup and DevTools show the full buffer; they run on
+  the PC under the user's eyes. What goes over the wire to `status {events:true}`
+  is a **projection**: while access is not granted it carries only counts per
+  `kind`; while granted it carries the entries, but `origin` is replaced by
+  `"redacted"` for any origin that is privileged or not in the *current* allowlist,
+  `tabId` is dropped for those entries, and `detail` is limited to an enumerated
+  set of fields (`reason`, `source`, `gen`, `until`). A refusal event for a
+  disallowed target therefore never tells the container what the target was, and
+  entries recorded before an allowlist change are projected with the rules of
+  now, not then.
+- **Request id correlation.** Every CLI request already has an `id` on the wire
+  and every response echoes it. The error stays a **string** (the CLI's exit-8
+  matching depends on the `access_revoked:` / `access_not_granted:` prefixes); the
+  correlation is the existing `id`, surfaced as follows. The extension records
+  `reqId: id` in the event it writes for a dispatched command. The CLI prints the
+  id with every failure, `ERROR: <string> (req <id>)`, and includes `reqId` in its
+  JSON output. The server prefixes each log line with it:
+  `<ts> <reqId> <client> <runId|-> cmd newTab {...}` and
+  `<ts> <reqId> <client> <runId|-> done ok 59ms` / `refused access_revoked` /
+  `cancelled extension disconnected`. `client` is `AI_BRIDGE_CLIENT` from the
+  CLI's environment (default: the parent process name, so a launchd job can be
+  told apart from an interactive shell).
+- **One finalization path.** The server resolves every request through a single
+  `finish(req, outcome)` that writes the log line and, when the request belongs to
+  a run, the trace line, exactly once, whether the outcome is a forwarded result,
+  a local refusal (access, `until` elapsed, extension not connected) or a
+  cancellation (extension disconnect, supersession, revoke). Today only the
+  extension-response handler traces, so a locally refused command of a run leaves
+  no trace; after this every terminal outcome does, with `reqId` and `outcome` on
+  each trace line, and `bridge journal --trace` prints them. Correlation with an
+  extension event exists only for dispatched requests; the log line says
+  `refused` for the rest, so the absence of an event is expected, not a gap.
 - Nothing in the event log is a secret: no page content, no tokens, no full URLs.
   Chrome clears it on reload and restart; the server log is the durable record.
 
@@ -452,34 +473,92 @@ Measured on the authoring machine's log before this design: 2,378 `newTab` again
 1,966 `closeTab` since the log began, 503 of the opens in their own windows; 8 of
 the last 49 traced agent runs left tabs behind, three of them runs that passed.
 Closing is a prompt rule today, and a run that fails, times out or is revoked never
-reaches it. The fix is deterministic and server-side, and applies to the host
-layout as much as to Docker:
+reaches it. The fix is server-side bookkeeping plus extension-side ownership
+verification, and applies to the host layout as much as to Docker.
 
-- The server already sees every `newTab` result with the run's `meta.runId`. It
-  keeps `runTabs: Map<runId, {tabIds:Set, windowIds:Set}>` from `newTab` results
-  (including `windowId` when `newWindow:true`) and removes ids on `closeTab`.
-- When a run ends, for any reason (pass, fail, timeout, abort, `access_revoked`,
-  supervisor crash), the supervisor sends `closeTabs {runId}` and the server closes
-  the recorded tabs and removes the recorded windows (`chrome.windows.remove`
-  through a new `closeWindow` command, so an empty window does not linger). The
-  supervisor does this in a `finally`; a CLI `bridge agent --keep-tabs` or a task
-  containing "leave the tab open" (the existing prompt escape) skips it and the
-  run's journal record says `keptTabs: n`.
-- The extension's `agentTabs` (session-scoped, from the access design) is the
-  second record, used by the popup's **Close agent tabs** and by "revoke and
-  close"; the server's `runTabs` is the first, used by run cleanup. They agree
-  because both are fed by the same `newTab` results.
-- New CLI commands: `bridge tabs` (bridge-opened tabs with age, owner client, run
-  id, origin), `bridge closeTabs --mine` (tabs opened by this client label),
-  `--run <id>`, `--older-than <minutes>` (bridge-opened tabs no bridge command has
-  touched for that long; `lastActivity` already exists in the worker). None of
-  them can close a tab the bridge did not open; `closeTab` on a user tab stays
-  subject to the allowlist as before.
+**Registry.** The server keeps one record per tab the bridge created, persisted in
+`AI_BRIDGE_HOME/tabs.json` (rewritten atomically on change) so a relay restart
+does not forget them:
+
+```
+{ tabId, browserSession, runId?, client, origin, createdAt, lastCmdAt, reqId }
+```
+
+- `browserSession` is a random id the extension draws on `chrome.runtime.onStartup`
+  (kept in session storage) and sends in every `access` message. A record whose
+  `browserSession` is not the current one is **dead**: never acted on, shown by
+  `bridge tabs` as "from an earlier Chrome session", and pruned on the next
+  reconciliation. Bare tab ids are meaningless across browser sessions (Chrome
+  guarantees uniqueness only within one), and this is the rule that stops an old
+  run's cleanup from hitting a replacement browser.
+- `client` and `runId` come from the request (`AI_BRIDGE_CLIENT`, `meta.runId`);
+  direct CLI use has a client and no run, so `--mine` and age work for launchd jobs
+  too. `lastCmdAt` is maintained by the **server**, which sees every command that
+  names a `tabId`, so it does not depend on the worker's `lastActivity` map (which
+  is in memory, is not set on creation and is deleted on debugger detach).
+- **Bookkeeping is independent of response delivery.** The server records a
+  creation as *pending* (`reqId`, run, client, origin, `createdAt`) when it
+  forwards a `newTab`, and completes the record when the extension's response
+  arrives, **whether or not the CLI that asked is still connected**. Today the
+  server drops the pending entry when the CLI socket closes and ignores the late
+  response; a tab created that way is untracked. The pending map and the response
+  handler are split so that CLI disconnect only removes the "who to answer"
+  part, never the "what was created" part. The extension mirrors the same tab in
+  its session-scoped `agentTabs` as approved earlier.
+
+**Run cleanup.**
+
+- The supervisor registers the run with a **lease**: it opens a second, long-lived
+  socket to the relay and sends `{type:"run", runId, client, keepTabs}` on it; the
+  socket stays open for the life of the run. When the supervisor sends
+  `{type:"runEnd", runId}` or the socket closes for any reason (crash, SIGKILL,
+  machine sleep that drops the connection), the server marks the run *ending*,
+  waits up to 5 s for creations still pending for that run (a `newTab` whose
+  response has not arrived), then issues cleanup. A process that dies cannot run
+  its own `finally`; the OS closing its socket is the signal that does not depend
+  on it. `keepTabs` (CLI `--keep-tabs`, or the task's existing "leave the tab open"
+  escape) makes `runEnd` and lease loss record the tabs as kept instead.
+- Cleanup closes **only individually owned tabs**: the server sends
+  `closeTabs {tabIds}` to the extension, and the extension closes the
+  intersection of that list with its own `agentTabs` for the current browser
+  session and reports what it closed. There is no window removal and no
+  `closeWindow` command: `chrome.windows.remove` would take with it any tab the
+  user opened or dragged into the agent's window. A window that becomes empty is
+  closed by Chrome itself.
+- Cleanup is **best effort while granted** and goes through both access gates
+  unchanged. If the run ended because access was revoked, the server does not
+  send `closeTabs` (it would be refused); it marks the run's tabs *retained*, the
+  run's journal record and `bridge tabs` say so, and the popup's **Close agent
+  tabs** / **Revoke and close agent tabs** are the way to close them. No cleanup
+  exception is carved out of the gates; the anti-goals stand.
+- A tab created by a `newTab` whose response arrives **after** the run was marked
+  ending is still recorded (above) and closed by a second `closeTabs` for the run;
+  the run's counts are finalised only after the drain.
+- Limits, stated in the guide: the lease covers supervisor death, not relay death
+  (if the relay process dies mid-run the registry on disk survives, and the
+  records are reconciled against the extension's `agentTabs` on the next start,
+  but the run's end is noticed only when the supervisor reconnects or the user
+  runs `bridge closeTabs`); and nothing closes while the browser is not connected.
+
+**Commands.**
+
+- `bridge tabs`: registry rows for the current browser session (age, client, run,
+  origin, `retained`/`live`), dead rows listed separately.
+- `bridge closeTabs --mine | --run <id> | --older-than <minutes>`: selects rows
+  from the registry (`--older-than` uses the server's `lastCmdAt`), sends
+  `closeTabs {tabIds}`, and the extension applies the `agentTabs` intersection
+  before closing anything. The commands can never reach a tab the bridge did not
+  open; `closeTab` on a user tab stays subject to the allowlist as before.
+- `bridge tabs` and `bridge closeTabs` join `RESTRICTED_DENY` in `server/cli.js`:
+  a model child under a restricted run cannot list other runs' tabs, select by age,
+  or close across runs. Run cleanup is done by the supervisor over the lease
+  socket, not through the child-facing CLI, so denying the commands to children
+  costs nothing.
 - No automatic idle sweep in v1: a tab left open on purpose during a long manual
   session must not vanish. `--older-than` is explicit. Revisit once `bridge tabs`
   has shown the real pattern for a month.
-- Journal: each run record gains `tabsOpened`, `tabsClosed`, `keptTabs`, so
-  `bridge journal` can show leaks per job.
+- Journal: each run record gains `tabsOpened`, `tabsClosed`, `tabsRetained`,
+  `keptTabs`, so `bridge journal` can show leaks per job.
 
 ## Agent and channel runs
 
@@ -571,17 +650,33 @@ layout as much as to Docker:
   `serverId` (server restarted) also ends the run;
   two consecutive ping timeouts end the run; `runTurn` and the classifier go through
   the same gate.
-- `test/protocol.test.js` additions: a `newTab` result with `meta.runId` is
-  recorded; `closeTabs {runId}` closes the recorded tabs and windows; a `status`
-  with `{events:true}` returns the extension's buffer; every error the simulated
-  extension returns carries `reqId`, and the server log line for a command carries
-  `reqId`, client label and run id.
+- `test/protocol.test.js` additions (tab registry and correlation): a forwarded
+  `newTab` whose CLI disconnects before the extension answers is still recorded
+  with its tab id; a run lease socket closing without `runEnd` triggers
+  `closeTabs` with exactly the run's live tab ids after the 5-s drain, and a
+  `newTab` answered during the drain is included; `runEnd` with `keepTabs` sends
+  nothing and the record says kept; a run ended by `access_revoked` sends no
+  `closeTabs` and the tabs are marked retained; a record with a stale
+  `browserSession` is never included in any `closeTabs`; `--older-than` selects
+  by the server's `lastCmdAt`, which a command on the tab refreshes; the server
+  log and trace carry `reqId`, client and run id for a forwarded result, a local
+  refusal and a cancellation, each exactly once; `status {events:true}` while
+  revoked returns counts only, and while granted returns `"redacted"` origins for
+  entries whose origin is outside the current allowlist; a `tabs.json` written
+  by a previous server process is loaded and reconciled on start.
+- `test/cli.*` additions: `ERROR: … (req <id>)` is printed on failure with exit 8
+  still recognised; `tabs` and `closeTabs` are refused under a restricted run.
 - `test/agent.test.js` additions: a run that fails on the first rung still sends
-  `closeTabs`; a run aborted by `access_revoked` sends it; `--keep-tabs` does not;
-  the journal record carries `tabsOpened`/`tabsClosed`/`keptTabs`.
+  `runEnd`; a supervisor killed with SIGKILL (child process in the test) drops the
+  lease and the server cleans up, tested separately from `AbortController`
+  cancellation; the journal record carries `tabsOpened`/`tabsClosed`/
+  `tabsRetained`/`keptTabs`.
 - Extension harness additions: `logEvent` keeps 200 entries and drops the oldest;
-  a refused command writes an event with the request's `reqId`; **Close agent
-  tabs** closes `agentTabs` and leaves `access` unchanged.
+  a refused command writes an event with the request's `reqId`; `closeTabs
+  {tabIds}` closes only the intersection with `agentTabs` and reports it, so a
+  user tab opened in the agent's window is untouched; **Close agent tabs** closes
+  `agentTabs` and leaves `access` unchanged; `browserSession` changes after a
+  simulated `onStartup`.
 - `test/channels.restricted.test.js`: `cleanEnv` passes `AI_BRIDGE_HOME`,
   `AI_BRIDGE_DEBUGGER`, `AI_BRIDGE_CODEX_SANDBOX` and still drops every
   `AI_BRIDGE_*_TOKEN`.

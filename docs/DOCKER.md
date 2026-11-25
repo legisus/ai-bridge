@@ -92,8 +92,8 @@ for each is in
 | 10 | Several browser sessions on one relay (Chrome + Edge, two profiles): registry keyed by session name, `--session` on the CLI. | Not needed for one browser; today a second extension supersedes the first. | Later |
 | 11 | `bridge token --rotate`. | Convenience; the manual procedure is below. | Later |
 | 12 | The restricted-run env filter (`server/channels/restricted.js`) passes `AI_BRIDGE_HOME`, `AI_BRIDGE_DEBUGGER` and `AI_BRIDGE_CODEX_SANDBOX` through to channel children (never messenger tokens). | Today it keeps only `BRIDGE_PORT`, so a channel run inside the container would look for the token under `/home/node/.ai-browser-bridge` and exit 6. | **Yes** |
-| 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in the popup and printed by `bridge status --events`; every error the extension returns carries the request id, and every server log line carries the request id, the client label and the run id. | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, and the server log says `cmd newTab {...}` without saying who asked. | **Yes** |
-| 14 | Tab hygiene: the server records every tab and window a run opens and closes them when the run ends, whatever the outcome (`--keep-tabs` to opt out); `bridge tabs` lists bridge-opened tabs with age and owner; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
+| 13 | Extension event log: a ring buffer of the last 200 events (connect, grant, revoke, refused command, closed tab, cancelled download, detach) kept in session storage, shown in full in the popup and in redacted form by `bridge status --events`; every CLI failure prints the request id, and every server log and trace line carries request id, client label, run id and outcome, written once per request. | Today the service worker logs nothing at all, so a refused command leaves no trace on the Chrome side, the server log says `cmd newTab {...}` without saying who asked, and a locally refused command of a run is never traced. | **Yes** |
+| 14 | Tab hygiene: the server keeps a registry of every tab the bridge opened (who, when, which run, which Chrome session) and closes a run's tabs when the run ends or its supervisor dies, with the extension confirming ownership of every tab before closing it (`--keep-tabs` to opt out); `bridge tabs` lists them; `bridge closeTabs --mine / --run <id> / --older-than <min>`; the popup gets a standalone **Close agent tabs** button. Not Docker-specific: the host layout leaks the same tabs today. | The bridge has opened 2,378 tabs and closed 1,966 since its log began (503 of them in their own windows); 8 of the last 49 agent runs left tabs behind, passing runs included, because closing is a prompt rule the model may ignore and a failed or aborted run never reaches it. | **Yes** |
 
 Nothing in the extension's command set changes. The wire protocol gains one message
 type, `access`, plus `session` and `access` fields on the results of `ping` and
@@ -493,12 +493,20 @@ bridge tabs                                                         # tabs the b
 docker compose -f deploy/docker/compose.yml --profile channels logs -f channels   # Telegram daemon (also /data/channels.log, rotated)
 ```
 
-Each server log line names the client label (`AI_BRIDGE_CLIENT`, default the
-process name), the run id when the command came from an agent run, and the request
-id. The same request id is in every error the extension returns, so an
-`access_revoked` or `target changed` seen by the CLI can be matched to the
-extension's event list and to the trace line. The extension's own `console` output
-is at `chrome://extensions` → the bridge card → **service worker**.
+Each server log line names the request id, the client label (`AI_BRIDGE_CLIENT`,
+default the process name), the run id when the command came from an agent run,
+and the outcome (`done`, `refused …`, `cancelled …`), once per request. The CLI
+prints the same request id with every failure, `ERROR: … (req <id>)`, so an
+`access_revoked` or `target changed` can be matched to the log line, to the trace
+line, and, when the command reached Chrome, to the extension's event list. A
+command the server refused without forwarding has no extension event; the log
+line says `refused`, which is the whole story.
+
+`bridge status --events` is a redacted view: while access is revoked it shows only
+how many events of each kind happened; while granted it hides the origin and tab
+of any event about a page outside the current allowlist. The full list, with
+origins, is in the popup and in the service worker's `console` at
+`chrome://extensions` → the bridge card → **service worker**, on the PC only.
 
 `bridge agent … --verbose` prints each rung's model, judge verdict and token spend
 while the run goes. A run stopped by a revoke ends with the structured reason
@@ -514,12 +522,30 @@ Tabs the bridge opens are supposed to be closed by whoever opened them. In
 practice they are not: a model may ignore the "close your window's tabs" rule, a
 run that fails, times out or is revoked never reaches it, and launchd jobs that
 drive the CLI directly have no cleanup step at all. Change #14 fixes this at the
-server: it remembers every tab and window a run opened and closes them when the
-run ends (any outcome) unless the run was started with `--keep-tabs` or the task
-says to leave a tab open. For direct CLI use, `bridge tabs` shows what is open and
-who opened it, and `bridge closeTabs --older-than 60` closes bridge-opened tabs
-untouched for an hour; nothing the user opened is ever touched. The popup gets a
-standalone **Close agent tabs** button for the same purpose, without revoking.
+server, which remembers every tab the bridge opened (who, when, which run, which
+Chrome session) and closes a run's tabs when the run ends, however it ends:
+
+- The agent holds an open connection to the relay for the life of the run. When
+  it says it is done, or when that connection drops because the agent process
+  crashed or was killed, the relay closes the run's tabs. `bridge agent
+  --keep-tabs`, or a task that says to leave a tab open, keeps them.
+- Only tabs the bridge itself opened are ever closed, one by one, and the
+  extension checks each one against its own record before closing. Windows are
+  never closed as a whole, so a tab you opened or dragged into the agent's window
+  stays; Chrome closes a window on its own when its last tab goes.
+- If the run ended because you revoked access, nothing can be closed from the
+  container side (that is the point of revoking). Those tabs are listed as
+  *retained* by `bridge tabs`; close them with **Close agent tabs** or **Revoke
+  and close agent tabs** in the popup.
+- After Chrome restarts, earlier records are dead: Chrome reuses tab numbers, so
+  the bridge never acts on a tab id from a previous Chrome session.
+- For direct CLI use, `bridge tabs` shows what is open and who opened it, and
+  `bridge closeTabs --older-than 60` closes bridge-opened tabs no bridge command
+  has touched for an hour. There is no automatic sweep.
+
+Limits: if the relay itself dies mid-run, its registry on disk survives but the
+run's end is only noticed when the agent reconnects or you run `bridge
+closeTabs`; and nothing closes while Chrome is not connected.
 
 ## Troubleshooting
 
