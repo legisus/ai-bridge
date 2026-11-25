@@ -87,6 +87,14 @@ Two layers:
 | G5 | document changed under a direct eval | `bridge eval` with code that navigates the page, then a second `bridge eval` racing it | the second fails `target changed` or runs in the new document only after re-validation; never in the old one |
 | G6 | status --events redaction | revoke, `bridge status --events` → counts only; grant, refuse a command on a disallowed host, `bridge status --events` | the refused event shows `origin: "redacted"` and `reason: not_allowed`; the popup's "Recent events" shows the real origin |
 
+## Docker (needs Docker; scripts, not npm test)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| D1 | smoke job | `bash test/docker-smoke.sh` | `SMOKE OK (claude 2.1.317, codex 0.171.0, linux/…)` — last run 2026-11-25 on the authoring Mac (Colima, arm64) |
+| D2 | round trip with the real extension | `bash test/docker-roundtrip.sh` (stops the host relay for ~1 min) | `ROUNDTRIP OK (extension access: granted|revoked)`; the container log shows `extension connected` and the access line |
+| D3 | fail closed inside the container | round trip while the popup shows revoked | `listTabs` from inside the container is refused with `access_revoked` |
+
 ## Tab hygiene — manual rows (need a real Chrome)
 
 | # | behaviour | how | expected |

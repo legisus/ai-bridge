@@ -21,8 +21,9 @@ on the authoring Mac with Colima (arm64): image builds, listening line,
 healthcheck, token mode, `/work` write, read-only root, both pinned CLIs
 (`claude` 2.1.317, `codex` 0.171.0) and a `codex exec` one-shot under the compose
 restrictions all pass; the pin pair is therefore confirmed on arm64, and the PC
-(x86_64) builds the same files. The
-Dockerfile and compose file below are the target, not something that works today.
+(x86_64) builds the same files. What is still unverified: the round trip with a
+real extension (scripted, not yet run), x86_64, an authenticated `claude` run
+inside the container, and the channels profile at runtime.
 
 This branch stacks on the channels chain (`feat/channels-core` →
 `fix/intent-gate-expiry`, PRs #5–#9): the Telegram daemon, the run journal and
@@ -194,12 +195,11 @@ CMD ["node", "/app/server/server.js"]
 - `AI_BRIDGE_CODEX_SANDBOX=container` tells the agent's Codex rung to run `codex`
   with its own sandbox off (the container is the sandbox) instead of
   `--sandbox workspace-write`, which needs kernel features the hardened container
-  drops. Whether the pinned Codex works under this compose file is one of the things
-  the first real run has to establish.
+  drops. The smoke job runs a `codex exec` one-shot under exactly this compose file
+  and checks a file the shell command created.
 - The pinned pair (`claude` 2.1.317, `codex` 0.171.0) is the pair installed on the
-  machine this guide was written on; it is **untested** in this container and under
-  this compose file. The first build fixes the pair that passes the Docker smoke job
-  and records it here; after that, bump only with the smoke job.
+  machine this guide was written on, and the pair the Docker smoke job passed with
+  on 2026-11-25 (linux/arm64). Bump only with the smoke job.
 
 ### .dockerignore (repo root)
 
@@ -305,7 +305,7 @@ get committed.
 
 1. **Clone the branch on the PC** (the extension folder has to live here):
    ```
-   git clone -b docker-isolated https://github.com/legisus/ai-bridge.git
+   git clone -b docker-container https://github.com/legisus/ai-bridge.git   # the branch with the container files; `main` once the chain is merged
    cd ai-bridge
    ```
 2. **Secrets.** `cp deploy/docker/.env.example deploy/docker/.env` and fill in
@@ -650,7 +650,10 @@ stops the host relay, publishes the container on `127.0.0.1:8765` with the host'
 existing token copied into `/data/token` (so the extension reconnects by itself
 within its 24-s alarm), reads the access handshake from the container log and
 `bridge ping` on both sides, then stops the container and restores the host
-relay. Run it yourself: it interrupts the host bridge for about a minute.
+relay. The image build and the volume preparation happen before the host relay is
+stopped, so the interruption is the handoff plus the extension's reconnect: well
+under a minute. Run it yourself; it reports `ROUNDTRIP OK` only when the
+restoration also succeeded.
 
 ## Troubleshooting
 
