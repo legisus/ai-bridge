@@ -59,6 +59,23 @@ Two layers:
 - **Allowlist enforcement**: set a host allowlist in Options, then `eval` on a
   non-listed domain must return `host "..." not in allowlist`.
 
+## Access switch — manual rows (need a real Chrome)
+
+| # | behaviour | how | expected |
+|---|-----------|-----|----------|
+| A1 | revoke during `waitFor` | `bridge waitFor '{"tabId":N,"selector":"#never","timeoutMs":60000}'`, then **Revoke** | the command fails with `access_revoked` within one poll tick (~200 ms) |
+| A2 | revoke during `type` | `bridge type '{"tabId":N,"text":"<200 chars>","delay":50}'`, **Revoke** mid-way | typing stops mid-string; the CLI exits 8 |
+| A3 | revoke while an attach is in flight | `bridge eval … --debugger` on a fresh tab, **Revoke** at once | no "is debugging" banner stays, the command fails `access_revoked` |
+| A4 | queued direct screenshot after revoke | two parallel `bridge screenshot` (direct) then **Revoke** | the second capture is discarded with `access_revoked`, no image written |
+| A5 | expiry alarm after a worker restart | **Grant for 1 h**, go to chrome://serviceworker-internals and stop the worker, wait for T | the badge turns grey at T and the next command is refused |
+| A6 | late alarm does not revoke a renewed grant | **Grant for 1 h**, then **Grant** (indefinite) | at the old T nothing happens; access stays granted |
+| A7 | grant from the popup without a reload | revoked state, **Grant**, `bridge newTab …` | the tab opens; no reload needed |
+| A8 | changing the token in Options revokes | paste a different token, **Save** | access state shows revoked, the extension reconnects with the new token; Manual mode is on |
+| A9 | manual mode ignores the native host | Manual mode on, native host registered, reload the extension | the token in Options is not overwritten |
+| A10 | download in progress cancelled on revoke, finished one not | `bridge download` of a large file, **Revoke** while it runs; then a small finished download, **Revoke** | the large one shows as cancelled in chrome://downloads; the finished one stays |
+| A11 | "revoke and close" after a worker restart | `bridge newTab`, stop the worker (A5), **Revoke and close agent tabs** | the tab closes (agentTabs lives in session storage, not in the worker) |
+| A12 | extension reload revokes with a notice | **Grant**, `bridge reloadExtension` | the popup shows revoked and the "reloaded" notice; `bridge tabs` lists the old tabs as from an earlier session |
+
 ## Tab hygiene — manual rows (need a real Chrome)
 
 | # | behaviour | how | expected |

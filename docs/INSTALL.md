@@ -102,11 +102,18 @@ rename or delete the clone afterwards. `git pull` updates it in place; run
 4. Click **Save**. The extension connects immediately and, after that, retries
    every ~24 seconds on its own.
 
+**5c. Grant access.** Click the extension's toolbar icon and press **Grant** (or
+**Grant for 1 h** for a timed grant). After every install, update or reload the
+bridge starts **revoked**: `ping` works, everything else is refused with
+`access_revoked` until you grant. The grant survives browser restarts. **Revoke**
+stops every running command at once; **Revoke and close agent tabs** also closes
+the tabs the agent opened.
+
 ## 6. Smoke test
 
 ```bash
 node server/cli.js ping
-# {"pong":true,"version":"0.1.10"}
+# {"pong":true,"version":"0.1.11","session":"chrome","access":"granted",...}
 ```
 
 If you get an error instead:
@@ -116,6 +123,7 @@ If you get an error instead:
 | `connect failed` | The server is not running. | Go back to step 2. |
 | `extension not connected` | Token not saved, wrong, or the service worker is asleep. | With the native host: press the reload icon on the extension card, wait 5 s, retry. Manual: re-check Options and press *Save*, wait 30 s, retry. |
 | `no token at …` | The server never ran on this machine, so no token exists. | Run the server once (step 2), or register the host and reload the extension. |
+| `access_not_granted` / `access_revoked` (exit 8) | You have not granted the browser session yet, or you revoked it. | Press **Grant** in the extension's popup (step 5c). |
 | `User Scripts API is not enabled` | `eval` ran but the toggle from step 5 is off. | Details → **Allow User Scripts**, then retry. |
 
 ## 7. Keep the server running
