@@ -461,6 +461,41 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(mid.agentTabs.includes(606) && mid.pendingTabs.length === 0, "mid-completion the tab is already owned (pending moved atomically)");
   S.mem.resume(); await cp;
 
+  // ---- auto-grant re-check fixes --------------------------------------------
+  // (A) a late completion whose removal fails keeps ownership (the reload verifier must still see the tab)
+  await S.chrome.storage.session.set({ agentTabs: [], pendingTabs: [] });
+  g9 = B.currentGen();
+  let lateN = await B.beginTab({ gen: g9, origin: "o" });
+  await B.setAccess({ granted: false }); // the completion below is dead on arrival
+  S.failIds.add(707);
+  assert((await B.completeTab(lateN, 707)) === false && (await B.agentTabIds()).includes(707), "late completion: removal failed transiently → tab closed later, ownership kept");
+  S.failIds.delete(707); await B.forgetAgentTab(707);
+  lateN = await B.beginTab({ gen: g9, origin: "o" });
+  S.goneIds.add(708);
+  assert((await B.completeTab(lateN, 708)) === false && !(await B.agentTabIds()).includes(708), "late completion: tab already gone → forgotten");
+  await B.reconcileAuto();
+  // (B) download completion moves pending → ownership in one write
+  g9 = B.currentGen();
+  const dn = await B.beginDownload({ gen: g9, origin: "o" });
+  S.downloads.items.push({ id: 808, state: "in_progress", byExtensionId: "ext-id", startTime: new Date().toISOString() });
+  S.mem.pauseNext("local", "set", { skip: 1 });
+  const cdp2 = B.completeDownload(dn, 808);
+  await sleep(10);
+  const midD = await S.chrome.storage.local.get(["bridgeDownloads", "pendingDownloads"]);
+  assert(midD.bridgeDownloads && midD.bridgeDownloads[808] && midD.pendingDownloads.length === 0, "mid-completion the download is already owned (pending moved atomically)");
+  S.mem.resume(); assert((await cdp2) === true, "…and the live completion is adopted");
+  // (C) a policy read failure is a denial latch that ordinary access reads cannot clear
+  g9 = B.currentGen(); await B.assertAccess(g9);
+  S.mem.failNext("local");
+  await B.reconcileAuto();
+  err = await B.assertAccess(g9).then(() => null, (e) => e.message);
+  assert(/^access_revoked:/.test(err), "after a failed policy read, assertAccess is denied too");
+  err = await B.dispatch(g9, () => "ran").then((v) => v, (e) => e.message);
+  assert(/^access_revoked:/.test(err), "…and dispatch stays denied after the read");
+  await B.reconcileAuto();
+  await B.assertAccess(B.currentGen());
+  assert((await B.dispatch(B.currentGen(), () => "ran")) === "ran", "a successful reconcile clears the latch");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");

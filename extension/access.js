@@ -52,6 +52,7 @@
   let hooks = { onRevoke: async () => {}, send: () => {}, badge: () => {}, sessionName: async () => "chrome", log: () => {} };
   let accessGen = 0;
   let reloading = false;                  // a reload's revoke/cleanup is in progress: no auto re-grant
+  let policyDenied = false;               // the auto-grant policy could not be read: deny until a reconciliation succeeds
   let transition = Promise.resolve();     // the in-flight grant/revoke, awaited by every check
   let transitionQueue = Promise.resolve(); // serialises transitions
   let lastRecord = { granted: false, until: null, gen: 0, exists: false };
@@ -109,12 +110,13 @@
           // until a later reconciliation succeeds.
           if (reloading) return { ...lastRecord, skipped: true, reloading: true };
           const on = await BridgeAccess.autoGrantEnabled();
-          if (on === null) { lastRecord = { granted: false, until: null, gen: accessGen, exists: true, error: true }; return { ...lastRecord, skipped: true, error: "storage read failed" }; }
-          if (!on) return { ...lastRecord, skipped: true };
+          if (on === null) { policyDenied = true; lastRecord = { granted: false, until: null, gen: accessGen, exists: true, error: true }; return { ...lastRecord, skipped: true, error: "storage read failed" }; }
           let cur; try { cur = normalizeRecord((await chrome.storage.local.get("access")).access); } catch { cur = null; }
+          if (cur === null) { policyDenied = true; lastRecord = { granted: false, until: null, gen: accessGen, exists: true, error: true }; return { ...lastRecord, skipped: true, error: "storage read failed" }; }
+          policyDenied = false; // the policy and the record were readable: the latch clears whatever the policy says
+          if (!on) return { ...lastRecord, skipped: true };
           if (reloading) return { ...lastRecord, skipped: true, reloading: true };
           if (cur && cur.granted && cur.until === null && (accessGen === 0 || cur.gen === accessGen)) { if (accessGen === 0) accessGen = cur.gen; lastRecord = cur; return { ...cur, skipped: true }; }
-          if (cur === null) { lastRecord = { granted: false, until: null, gen: accessGen, exists: true, error: true }; return { ...lastRecord, skipped: true, error: "storage read failed" }; }
         }
         const gen = ++accessGen;
         let release;
@@ -165,6 +167,7 @@
       await transition;
       const a = await this.readAccess();
       if (gen !== accessGen) throw new Error(ACCESS_REVOKED(name));
+      if (policyDenied) throw new Error(ACCESS_REVOKED(name)); // the policy could not be read: denied until a reconciliation succeeds
       if (!a.exists) throw new Error(ACCESS_NOT_GRANTED(name));
       if (!a.granted) throw new Error(ACCESS_REVOKED(name));
     },
@@ -172,7 +175,7 @@
     // The last check and the browser call happen in the same synchronous
     // continuation: no await between them.
     dispatch(gen, thunk) {
-      if (gen !== accessGen || !lastRecord.granted || (lastRecord.until !== null && Date.now() >= lastRecord.until)) {
+      if (gen !== accessGen || policyDenied || !lastRecord.granted || (lastRecord.until !== null && Date.now() >= lastRecord.until)) {
         return session().then((name) => { throw new Error(ACCESS_REVOKED(name)); });
       }
       try { return Promise.resolve(thunk()); } catch (e) { return Promise.reject(e); }
@@ -363,8 +366,15 @@
       if (Number.isInteger(tabId) && (await liveNow())) {
         if (gen === accessGen && lastRecord.granted) { this.logEvent({ kind: "tab_opened", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; }
       }
-      if (Number.isInteger(tabId)) await this.forgetAgentTab(tabId);
-      if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); this.logEvent({ kind: "tab_closed", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {} }
+      // Dead on arrival: close it; ownership is dropped only once the tab is
+      // gone (closed here, or already gone), so a reload's verification still
+      // sees a tab that could not be closed right now.
+      if (Number.isInteger(tabId)) {
+        let gone = false;
+        try { await chrome.tabs.remove(tabId); gone = true; this.logEvent({ kind: "tab_closed", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); }
+        catch (e) { gone = /No tab with id/i.test(String(e && e.message)); }
+        if (gone) await this.forgetAgentTab(tabId);
+      }
       return false;
     },
     beginDownload({ gen, origin, reqId }) {
@@ -376,19 +386,26 @@
       });
     },
     async completeDownload(nonce, downloadId) {
+      // The pending entry becomes ownership in ONE write (never untracked in
+      // between); a completion judged dead afterwards cancels the download and
+      // keeps the record until the cancel succeeded.
       const entry = await withDownloads(async () => {
         const list = await readPending("local", "pendingDownloads");
         const e = list.find((x) => x.nonce === nonce) || null;
-        await chrome.storage.local.set({ pendingDownloads: list.filter((x) => x.nonce !== nonce) });
+        const m = await readMap("bridgeDownloads");
+        if (Number.isInteger(downloadId)) m[downloadId] = { gen: e ? e.gen : -1 };
+        await chrome.storage.local.set({ pendingDownloads: list.filter((x) => x.nonce !== nonce), bridgeDownloads: m });
         return e;
       });
       const gen = entry ? entry.gen : -1;
       const liveNow = async () => { await transition; const a = await this.readAccess(); return gen === accessGen && a.granted && (a.until === null || Date.now() < a.until); };
       if (Number.isInteger(downloadId)) {
-        // Record ownership first (so a revoke's sweep can find it), then decide.
-        await withDownloads(async () => { const m = await readMap("bridgeDownloads"); m[downloadId] = { gen }; await chrome.storage.local.set({ bridgeDownloads: m }); });
         if ((await liveNow()) && gen === accessGen) { this.logEvent({ kind: "download_started", origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; }
-        try { await chrome.downloads.cancel(downloadId); this.logEvent({ kind: "download_cancelled", origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {}
+        try {
+          await chrome.downloads.cancel(downloadId);
+          this.logEvent({ kind: "download_cancelled", origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {});
+          await withDownloads(async () => { const m = await readMap("bridgeDownloads"); delete m[downloadId]; await chrome.storage.local.set({ bridgeDownloads: m }); });
+        } catch { /* cancel failed: the record stays for the revoke sweep / reload verifier */ }
       }
       return false;
     },
