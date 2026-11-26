@@ -103,11 +103,18 @@
           if (!raw || typeof raw !== "object" || raw.gen !== ifGen || raw.granted !== true || ifGen !== accessGen) return { ...lastRecord, skipped: true };
         }
         if (unlessIndefinite) {
-          // Auto-grant reconciliation: an indefinite grant that is already in
-          // place is left alone (no generation churn on every worker wake).
+          // Auto-grant reconciliation, decided INSIDE the serialised transition:
+          // the policy is read here (a flip queued before us has landed), a
+          // reload that began meanwhile wins, and an unreadable policy denies
+          // until a later reconciliation succeeds.
+          if (reloading) return { ...lastRecord, skipped: true, reloading: true };
+          const on = await BridgeAccess.autoGrantEnabled();
+          if (on === null) { lastRecord = { granted: false, until: null, gen: accessGen, exists: true, error: true }; return { ...lastRecord, skipped: true, error: "storage read failed" }; }
+          if (!on) return { ...lastRecord, skipped: true };
           let cur; try { cur = normalizeRecord((await chrome.storage.local.get("access")).access); } catch { cur = null; }
+          if (reloading) return { ...lastRecord, skipped: true, reloading: true };
           if (cur && cur.granted && cur.until === null && (accessGen === 0 || cur.gen === accessGen)) { if (accessGen === 0) accessGen = cur.gen; lastRecord = cur; return { ...cur, skipped: true }; }
-          if (cur === null) return { granted: false, until: null, gen: accessGen, error: "storage read failed", skipped: true }; // fail closed
+          if (cur === null) { lastRecord = { granted: false, until: null, gen: accessGen, exists: true, error: true }; return { ...lastRecord, skipped: true, error: "storage read failed" }; }
         }
         const gen = ++accessGen;
         let release;
@@ -271,11 +278,10 @@
     async autoGrantEnabled() {
       try { const { autoGrant } = await chrome.storage.local.get({ autoGrant: true }); return autoGrant !== false; } catch { return null; }
     },
-    async reconcileAuto({ source = "auto" } = {}) {
-      if (reloading) return { ...lastRecord, skipped: true, reloading: true }; // never re-grant while a reload cleans up
-      const on = await this.autoGrantEnabled();
-      if (on === null) return { granted: false, until: null, gen: accessGen, skipped: true, error: "storage read failed" }; // nothing granted by this call
-      if (!on) return { ...lastRecord, skipped: true };
+    // The decision (reloading? policy on? already indefinite?) is made inside
+    // the queued transition, see setAccess(unlessIndefinite).
+    reconcileAuto({ source = "auto" } = {}) {
+      if (reloading) return Promise.resolve({ ...lastRecord, skipped: true, reloading: true }); // never re-grant while a reload cleans up
       return this.setAccess({ granted: true, until: null, source, unlessIndefinite: true });
     },
     async setAutoGrant(on) {
@@ -341,19 +347,23 @@
       });
     },
     async completeTab(nonce, tabId) {
+      // The pending entry becomes ownership in ONE write, so the tab is never
+      // untracked in between; a completion judged dead afterwards closes it
+      // and drops the ownership again.
       const entry = await withTabs(async () => {
         const list = await readPending("session", "pendingTabs");
         const e = list.find((x) => x.nonce === nonce) || null;
-        await chrome.storage.session.set({ pendingTabs: list.filter((x) => x.nonce !== nonce) });
+        const ids = await readTabs();
+        const own = Number.isInteger(tabId) && !ids.includes(tabId) ? [...ids, tabId] : ids;
+        await chrome.storage.session.set({ pendingTabs: list.filter((x) => x.nonce !== nonce), agentTabs: own });
         return e;
       });
       const gen = entry ? entry.gen : -1;
       const liveNow = async () => { await transition; const a = await this.readAccess(); return gen === accessGen && a.granted && (a.until === null || Date.now() < a.until); };
       if (Number.isInteger(tabId) && (await liveNow())) {
-        await this.rememberAgentTab(tabId);
-        if (gen === accessGen && lastRecord.granted) { this.logEvent({ kind: "tab_opened", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; } // the write landed under the same generation
-        await this.forgetAgentTab(tabId);
+        if (gen === accessGen && lastRecord.granted) { this.logEvent({ kind: "tab_opened", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId }).catch(() => {}); return true; }
       }
+      if (Number.isInteger(tabId)) await this.forgetAgentTab(tabId);
       if (Number.isInteger(tabId)) { try { await chrome.tabs.remove(tabId); this.logEvent({ kind: "tab_closed", tabId, origin: entry && entry.origin, reqId: entry && entry.reqId, detail: { reason: "access_revoked" } }).catch(() => {}); } catch {} }
       return false;
     },
@@ -389,8 +399,9 @@
       await withDownloads(async () => {
         const m = await readMap("bridgeDownloads");
         for (const id of Object.keys(m).map(Number)) {
-          let item = null;
-          try { [item] = await chrome.downloads.search({ id }); } catch {}
+          let items = null;
+          try { items = await chrome.downloads.search({ id }); } catch { continue; } // lookup failed: keep the record, decide next time
+          const item = items && items[0];
           if (!item) { delete m[id]; continue; }
           if (item.state === "in_progress") { try { await chrome.downloads.cancel(id); cancelled.push(id); BridgeAccess.logEvent({ kind: "download_cancelled", detail: { reason: "access_revoked" } }).catch(() => {}); } catch {} }
         }

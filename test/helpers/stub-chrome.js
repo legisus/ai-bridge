@@ -51,12 +51,12 @@ function stubChrome() {
   const goneIds = new Set(); // ids Chrome no longer knows ("No tab with id")
   // An event with addListener/removeListener/emit (chrome.* events).
   const event = () => { const fns = new Set(); return { addListener: (f) => fns.add(f), removeListener: (f) => fns.delete(f), hasListener: (f) => fns.has(f), emit: (...a) => { for (const f of [...fns]) f(...a); }, size: () => fns.size }; };
-  const tabs = { list: [], captures: [], onCapture: null, onActivated: event(), onUpdated: event(), onRemoved: event() };
+  const tabs = { list: [], captures: [], onCapture: null, getFail: null, onActivated: event(), onUpdated: event(), onRemoved: event() };
   const frames = {};                 // tabId -> { url, documentId } for webNavigation.getFrame
   const injections = [];             // scripting.executeScript / userScripts.execute calls
   const inject = { result: null, hook: null }; // hook(call) may throw or return a result
   const cdp = { sent: [], attached: new Set(), detached: [], attachGate: null, contexts: {}, loaderId: "L1", onSend: null, onEvent: event(), onDetach: event(), failNext: null };
-  const downloads = { items: [], cancelled: [], nextId: 1 };
+  const downloads = { items: [], cancelled: [], nextId: 1, searchFail: null };
   const alarms = { list: [], failCreate: false, onAlarm: event() };
   const badge = [];
   const runtime = { id: "ext-id", reloads: 0, onMessage: event(), onStartup: event(), onInstalled: event(), messagesToNative: [] };
@@ -81,7 +81,7 @@ function stubChrome() {
     tabs: {
       remove: async (id) => { await tick(); if (goneIds.has(id)) throw new Error(`No tab with id: ${id}.`); if (failIds.has(id)) throw new Error("Tabs cannot be edited right now (user may be dragging a tab)."); removed.push(id); tabs.list = tabs.list.filter((t) => t.id !== id); },
       query: async (q) => { await tick(); return tabs.list.filter((t) => !q || q.windowId === undefined || t.windowId === q.windowId).map((t) => ({ ...t })); },
-      get: async (id) => { await tick(); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); return { ...t }; },
+      get: async (id) => { await tick(); if (tabs.getFail === id) throw new Error("The tab was closed."); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); return { ...t }; },
       create: async (opts) => { await tick(); const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: opts && opts.windowId || 1, url: opts && opts.url, active: !!(opts && opts.active) }; tabs.list.push(t); return { ...t }; },
       update: async (id, props) => { await tick(); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); Object.assign(t, props); return { ...t }; },
       captureVisibleTab: async (windowId) => { await tick(); if (tabs.onCapture) await tabs.onCapture(windowId); const active = tabs.list.find((t) => t.windowId === windowId && t.active); tabs.captures.push(active ? active.id : null); return `data:image/png;base64,${Buffer.from(`shot-of-${active ? active.id : "none"}`).toString("base64")}`; },
@@ -116,6 +116,7 @@ function stubChrome() {
       download: async (opts) => { await tick(); const id = downloads.nextId++; downloads.items.push({ id, state: "in_progress", byExtensionId: runtime.id, startTime: new Date().toISOString(), url: opts && opts.url }); return id; },
       search: async (q = {}) => {
         await tick();
+        if (downloads.searchFail !== null && q.id === downloads.searchFail) throw new Error("downloads unavailable");
         let items = downloads.items.slice();
         if (q.id !== undefined) items = items.filter((i) => i.id === q.id);
         if (q.state) items = items.filter((i) => i.state === q.state);

@@ -415,6 +415,52 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await B.init();
   assert((await B.readAccess()).granted === true, "ON: worker init grants");
 
+  // ---- auto-grant review fixes ------------------------------------------------
+  // (1) the policy decision lives inside the transition: a reload that begins while the policy read is in flight wins
+  await B.setAutoGrant(true); await B.setAccess({ granted: false, source: "options" });
+  S.mem.pauseNext("local", "get"); // the policy read inside the queued reconcile
+  let rp = B.reconcileAuto();
+  await sleep(5);
+  B.beginReload();
+  S.mem.resume();
+  const rrl = await rp;
+  assert(rrl.skipped === true && (await B.readAccess()).granted === false, "a reconcile overtaken by a reload grants nothing");
+  B.endReload();
+  // (1b) a reconcile overtaken by switching OFF ends revoked
+  S.mem.pauseNext("local", "get");
+  rp = B.reconcileAuto();
+  await sleep(5);
+  const offP = B.setAutoGrant(false);
+  await sleep(5);
+  S.mem.resume();
+  await rp; await offP;
+  assert((await B.readAccess()).granted === false && (await B.autoGrantEnabled()) === false, "a reconcile overtaken by switching OFF ends revoked");
+  await B.setAutoGrant(true);
+  // (5) an unreadable policy denies dispatch until a reconcile succeeds
+  let g9 = B.currentGen(); await B.assertAccess(g9);
+  S.mem.failNext("local");
+  await B.reconcileAuto();
+  err = await B.dispatch(g9, () => "ran").then((v) => v, (e) => e.message);
+  assert(/^access_revoked:/.test(err), "after a failed policy read, dispatch refuses");
+  await B.reconcileAuto();
+  assert((await B.dispatch(B.currentGen(), () => "ran")) === "ran", "a later successful reconcile restores dispatch");
+  // (3) cancelBridgeDownloads keeps ownership when the download lookup fails
+  await S.chrome.storage.local.set({ bridgeDownloads: { 77: { gen: 1 } } });
+  S.downloads.searchFail = 77;
+  await B.cancelBridgeDownloads();
+  assert((await S.chrome.storage.local.get("bridgeDownloads")).bridgeDownloads[77], "a download whose lookup failed stays owned");
+  S.downloads.searchFail = null;
+  // (2) completion moves the pending entry straight into ownership (never untracked in between)
+  await S.chrome.storage.session.set({ agentTabs: [], pendingTabs: [] });
+  g9 = B.currentGen();
+  const nn = await B.beginTab({ gen: g9, origin: "o" });
+  S.mem.pauseNext("session", "set", { skip: 1 }); // after the atomic move, before anything else writes
+  const cp = B.completeTab(nn, 606);
+  await sleep(10);
+  const mid = await S.chrome.storage.session.get(["agentTabs", "pendingTabs"]);
+  assert(mid.agentTabs.includes(606) && mid.pendingTabs.length === 0, "mid-completion the tab is already owned (pending moved atomically)");
+  S.mem.resume(); await cp;
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
@@ -447,7 +493,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const lines = code.split("\n").filter((l) => re.test(l) && !/BridgeAccess\.dispatch/.test(l));
     assert(lines.length === 0, `no bare ${re.source} outside dispatch (${lines.length} found)`);
   }
-  assert(/case "reloadExtension":[\s\S]*?await BridgeAccess\.setAccess\(\{ granted: false, closeTabs: true, source: "reload" \}\)[\s\S]*?chrome\.runtime\.reload\(\)/.test(src), "reloadExtension revokes and closes agent tabs before reloading");
+  assert(/case "reloadExtension":[\s\S]*?await BridgeAccess\.setAccess\(\{ granted: false, closeTabs: false, source: "reload" \}\)[\s\S]*?closeAgentTabs\(\)[\s\S]*?chrome\.runtime\.reload\(\)/.test(src), "reloadExtension revokes first, drains, closes agent tabs, verifies, then reloads");
   assert(/chrome\.runtime\.onInstalled\.addListener\([\s\S]*?BridgeAccess\.onInstalled\(\)/.test(src), "onInstalled → revoked");
   assert(/chrome\.runtime\.onMessage\.addListener/.test(src) && /sender\.id === chrome\.runtime\.id/.test(src) && /startsWith\("chrome-extension:\/\/"\)/.test(src) && /unauthorised sender/.test(src), "runtime.onMessage validates the sender");
   for (const t of ["access-set", "access-get", "close-agent-tabs", "dismiss-notices"]) assert(src.includes(`"${t}"`), `onMessage handles ${t}`);
