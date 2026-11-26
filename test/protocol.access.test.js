@@ -83,18 +83,34 @@ const errorOf = (r) => (/^ERROR: (.*?)(?: \(req [0-9a-f]+\))?$/m.exec(r.stderr) 
     r = await held;
     assert(r.code === 0 && r.json.pong === true && r.json.access === "revoked", "pending ping survives a revoke");
 
+    // reloadExtension is the one command that revokes on purpose: the revoke it triggers must not cancel its own reply
+    let heldReload = null;
+    ext = await fakeExtension(relay, { handler: (cmd, p, id) => { if (cmd === "reloadExtension") { heldReload = id; return undefined; } return { pong: true }; } });
+    await sleep(100);
+    const reloadP = cli(relay, ["reloadExtension", "--timeout", "3000"]);
+    await ext.waitFor("reloadExtension");
+    ext.sendAccess({ granted: false, until: null, gen: 7 }); await sleep(50);
+    ext.respond(heldReload, { ok: true, result: { ok: true, reloading: true } });
+    r = await reloadP;
+    assert(r.code === 0 && r.json.reloading === true, "a pending reloadExtension survives the revoke it causes and gets its reply");
+    ext.sendAccess({ granted: true, until: null, gen: 8 }); await sleep(50);
+
     // supersession: pending request on the old socket is cancelled, access resets, old socket's access is ignored
     const old = ext;
+    const genBefore = (await cli(relay, ["ping", "--timeout", "3000"])).json.extGen;
+    let heldPing2 = null;
+    old.handlerOverride = (cmd, p, id) => { if (cmd === "ping") { heldPing2 = id; return undefined; } return { pong: true }; };
     held = cli(relay, ["ping", "--timeout", "3000"]);
     await old.waitFor("ping");
-    await fakeExtension(relay, { access: false }); // gen 4
+    await fakeExtension(relay, { access: false }); // gen + 1
     r = await held;
     assert(r.code === 1 && errorOf(r) === "extension disconnected", "pending request of the superseded socket gets extension disconnected");
     try { old.sendAccess({ granted: true, until: null, gen: 9 }); } catch {}
     await sleep(100);
     r = await cli(relay, ["ping", "--timeout", "3000"]);
-    assert(r.json.access === "not_granted" && r.json.extGen === 4 && r.json.accessGen === 0, "new extension socket resets access to not_granted and bumps extGen; old socket's access ignored");
-    assert(/extension superseded \(gen 3 → 4\)/.test(fs.readFileSync(relay.logFile, "utf8")), "supersession logged");
+    assert(r.json.access === "not_granted" && r.json.extGen === genBefore + 1 && r.json.accessGen === 0, "new extension socket resets access to not_granted and bumps extGen; old socket's access ignored");
+    assert(new RegExp(`extension superseded \\(gen ${genBefore} → ${genBefore + 1}\\)`).test(fs.readFileSync(relay.logFile, "utf8")), "supersession logged");
+    void heldPing2;
     assert(r.json.serverId === serverId, "serverId stable within one server process");
 
     // serverId differs between processes

@@ -129,6 +129,81 @@ async function fresh({ allowlist = [] } = {}) {
     void S;
   }
 
+  // (9) auto-grant: a fresh worker is granted without a click; install/update keeps it; token change recovers
+  {
+    const S = stubChrome(); const W = loadWorker(S); await W.initDone;
+    const a = await W.BridgeAccess.readAccess();
+    assert(a.granted === true && a.until === null, "fresh worker with autoGrant ON starts granted");
+    S.chrome.runtime.onInstalled.emit({ reason: "update" }); await sleep(30);
+    assert((await W.BridgeAccess.readAccess()).granted === true && (await W.BridgeAccess.notices()).length === 0, "onInstalled keeps access and shows no reload notice");
+    const g0 = W.BridgeAccess.currentGen();
+    S.chrome.storage.onChanged.emit({ token: { oldValue: "a", newValue: "b" } }, "local"); await sleep(60);
+    const after = await W.BridgeAccess.readAccess();
+    assert(after.granted === true && W.BridgeAccess.currentGen() > g0, "a token change revokes (new generation) and auto-grant restores access");
+    // manual access-set is refused while auto-grant is on
+    let reply = null;
+    S.chrome.runtime.onMessage.emit({ type: "access-set", granted: false }, { id: "ext-id", url: "chrome-extension://ext-id/popup.html" }, (r) => { reply = r; });
+    await sleep(30);
+    assert(reply && reply.ok === false && /auto-grant is on/.test(reply.error) && (await W.BridgeAccess.readAccess()).granted === true, "access-set is refused while auto-grant is on");
+    // turning it off via storage revokes; manual works again
+    await S.chrome.storage.local.set({ autoGrant: false });
+    S.chrome.storage.onChanged.emit({ autoGrant: { oldValue: true, newValue: false } }, "local"); await sleep(60);
+    assert((await W.BridgeAccess.readAccess()).granted === false, "autoGrant OFF revokes");
+  }
+  // (10) reloadExtension waits for pending creations and refuses when cleanup is incomplete
+  {
+    const { S, W, gen } = await fresh();
+    S.failIds.add(1001); // the agent tab cannot be closed
+    const t = await W.handle("newTab", { url: "https://ok.example/a" }, gen, "r20");
+    S.tabs.list.push({ id: t.id, windowId: 1, active: false, url: "https://ok.example/a" }); S.frames[t.id] = { url: "https://ok.example/a", documentId: "d-a" };
+    S.failIds.add(t.id);
+    const err = await msgOf(W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "r21"));
+    assert(/reload refused: cleanup incomplete/.test(err) && S.runtime.reloads === 0, "reloadExtension refuses when an agent tab could not be closed");
+    S.failIds.delete(t.id);
+    const ok = await W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "r22");
+    await sleep(80);
+    assert(ok && ok.reloading === true && S.runtime.reloads === 1 && S.removed.includes(t.id), "reloadExtension closes the agent tab, then reloads");
+  }
+
+  // (11) reload refuses when cleanup cannot be verified, and when creations do not drain
+  {
+    const { S, W, gen } = await fresh();
+    const t = await W.handle("newTab", { url: "https://ok.example/a" }, gen, "r30");
+    S.tabs.list.push({ id: t.id, windowId: 1, active: false, url: "https://ok.example/a" });
+    S.tabs.getFail = t.id; // tabs.get throws something other than "No tab with id" for this tab
+    S.failIds.add(t.id);
+    let err = await msgOf(W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "r31"));
+    assert(/reload refused/.test(err) && S.runtime.reloads === 0, "a tab whose verification lookup fails counts as not cleaned");
+    S.tabs.getFail = null; S.failIds.delete(t.id);
+    await S.chrome.storage.local.set({ bridgeDownloads: { 91: { gen: 1 } } });
+    S.downloads.items.push({ id: 91, state: "in_progress", byExtensionId: "ext-id", startTime: new Date().toISOString() });
+    S.downloads.searchFail = 91;
+    err = await msgOf(W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "r32"));
+    assert(/reload refused/.test(err) && S.runtime.reloads === 0 && (await S.chrome.storage.local.get("bridgeDownloads")).bridgeDownloads[91], "a download whose lookup fails blocks the reload and stays owned");
+    S.downloads.searchFail = null; S.downloads.items = S.downloads.items.filter((d) => d.id !== 91); await S.chrome.storage.local.set({ bridgeDownloads: {} });
+    // a creation that never completes: the drain times out and the reload is refused
+    await S.chrome.storage.session.set({ pendingTabs: [{ nonce: "stuck", gen: W.BridgeAccess.currentGen(), origin: "o", startedAt: Date.now() }] });
+    W.__reloadDrainMs = 300;
+    err = await msgOf(W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "r33"));
+    assert(/reload refused/.test(err) && /pending/.test(err) && S.runtime.reloads === 0, "pending creations that do not drain refuse the reload");
+    await S.chrome.storage.session.set({ pendingTabs: [] });
+    assert((await W.BridgeAccess.readAccess()).granted === true, "after a refused reload access is back (auto-grant)");
+  }
+  // (12) saving Auto-grant together with a token change still replaces the socket and reconnects
+  {
+    const S = stubChrome(); const W = loadWorker(S); await W.initDone;
+    await S.chrome.storage.local.set({ token: "b", port: 8765 }); // a provisioned extension: connect() opens a socket
+    const before = W.__sockets.length;
+    S.chrome.storage.onChanged.emit({ token: { oldValue: "a", newValue: "b" }, autoGrant: { oldValue: true, newValue: true } }, "local"); await sleep(80);
+    assert(W.__sockets.length > before && (await W.BridgeAccess.readAccess()).granted === true, "token change in the same save as the policy: revoke, reconcile, reconnect");
+    // an unreadable policy refuses manual grants (fail closed)
+    let reply = null;
+    S.mem.failNext("local");
+    S.chrome.runtime.onMessage.emit({ type: "access-set", granted: true, until: null }, { id: "ext-id", url: "chrome-extension://ext-id/popup.html" }, (r) => { reply = r; });
+    await sleep(30);
+    assert(reply && reply.ok === false, "manual access-set is refused when the policy cannot be read");
+  }
+
   console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll worker tests passed.");
   process.exit(failures ? 1 : 0);
 })().catch((e) => { console.error("harness error", e); process.exit(1); });

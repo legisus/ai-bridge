@@ -13,8 +13,9 @@ const vm = require("vm");
 const EXT = path.join(__dirname, "..", "..", "extension");
 
 function loadWorker(S) {
+  const sockets = [];
   class FakeWebSocket {
-    constructor() { this.readyState = 0; setTimeout(() => { this.readyState = 3; if (this.onclose) this.onclose(); }, 0); }
+    constructor() { sockets.push(this); this.readyState = 0; setTimeout(() => { this.readyState = 3; if (this.onclose) this.onclose(); }, 0); }
     send() {} close() {}
   }
   FakeWebSocket.OPEN = 1; FakeWebSocket.CONNECTING = 0;
@@ -27,10 +28,16 @@ function loadWorker(S) {
     crypto: require("crypto").webcrypto,
   };
   sandbox.self = sandbox; sandbox.globalThis = sandbox;
+  sandbox.__sockets = sockets; // every WebSocket the worker opened
   const ctx = vm.createContext(sandbox);
   sandbox.importScripts = (...files) => { for (const f of files) vm.runInContext(fs.readFileSync(path.join(EXT, f), "utf8"), ctx, { filename: f }); };
   vm.runInContext(fs.readFileSync(path.join(EXT, "background.js"), "utf8"), ctx, { filename: "background.js" });
-  return sandbox; // the vm global: handle, validateTab, BridgeAccess, attached, cdp, initDone, …
+  // Top-level const/let bindings of the worker script are not properties of
+  // the vm global; read the ones the tests need from the context itself.
+  for (const name of ["initDone", "attached", "attaching", "cdp"]) {
+    try { sandbox[name] = vm.runInContext(name, ctx); } catch {}
+  }
+  return sandbox; // the vm global: handle, validateTab, BridgeAccess, … plus the bindings above
 }
 
 module.exports = { loadWorker };

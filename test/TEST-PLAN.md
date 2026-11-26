@@ -63,6 +63,9 @@ Two layers:
 
 | # | behaviour | how | expected |
 |---|-----------|-----|----------|
+| A0 | auto-grant: reload keeps access | `Auto-grant` on; `bridge reloadExtension`; `bridge ping` | within a few seconds `"access":"granted"` with a new `extGen`, no click — verified 2026-11-26 |
+| A0b | auto-grant: disable is the stop switch | with a tab attached (`--debugger`), disable the extension at chrome://extensions | banner gone, `bridge ping` → `extension not connected`; re-enable → `"access":"granted"` again |
+| A0c | manual mode | turn `Auto-grant` off in Options | access shows revoked; Grant/Revoke buttons appear; rows A1–A12 apply |
 | A1 | revoke during `waitFor` | `bridge waitFor '{"tabId":N,"selector":"#never","timeoutMs":60000}'`, then **Revoke** | the command fails with `access_revoked` within one poll tick (~200 ms) |
 | A2 | revoke during `type` | `bridge type '{"tabId":N,"text":"<200 chars>","delay":50}'`, **Revoke** mid-way | typing stops mid-string; the CLI exits 8 |
 | A3 | revoke while an attach is in flight | `bridge eval … --debugger` on a fresh tab, **Revoke** at once | no "is debugging" banner stays, the command fails `access_revoked` |
@@ -99,7 +102,8 @@ Two layers:
 
 | # | behaviour | how | expected |
 |---|-----------|-----|----------|
-| T1 | reload the extension with agent tabs open | `bridge newTab`, then `bridge reloadExtension`, then `bridge tabs` | the tab is listed under "from an earlier Chrome session"; `bridge closeTabs --mine` does not touch it |
+| T1 | reload from chrome://extensions with agent tabs open | `bridge newTab`, then press the reload icon on the extension card, then `bridge tabs` | the tab is listed under "from an earlier Chrome session"; `bridge closeTabs --mine` does not touch it |
+| T1b | `bridge reloadExtension` with agent tabs open | `bridge newTab`, then `bridge reloadExtension` | the agent tab is closed BEFORE the reload (cleanup contract); `bridge tabs` shows nothing for it |
 | T2 | a run killed with Ctrl-C closes its tabs | `bridge agent "open example.com and wait"`, Ctrl-C while it runs | within ~5 s the run's tabs are gone; `bridge journal` shows `tabsClosed` for the run |
 | T3 | a user tab in the agent's window survives | run opens a tab with `newWindow:true`; drag one of your tabs into that window; end the run | your tab stays, the agent's tab closes, the window stays open |
 | T4 | restart the relay mid-session | `bridge newTab`, restart `server.js`, `bridge tabs` | the tab is still listed as live (registry reloaded, reconciled against the extension) |

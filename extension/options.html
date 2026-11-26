@@ -20,8 +20,9 @@
   <div class="hint" id="ident"></div>
 
   <label>Access to this Chrome session</label>
-  <div class="hint">After install the bridge is <b>revoked</b>: nothing runs until you grant it here or in the toolbar popup. A grant survives browser restarts; an extension reload revokes it. Revoking stops every running command.</div>
-  <div style="margin-top:6px">
+  <label style="margin-top:6px"><input id="autoGrant" type="checkbox" style="width:auto;margin-right:6px;vertical-align:middle"> Auto-grant (always on)</label>
+  <div class="hint">On (default): the bridge may drive this Chrome whenever the extension is enabled, with no Grant click, also after reloads and updates. To stop it, disable the extension at <code>chrome://extensions</code> — note that disabling detaches the debugger and disconnects the relay but <b>does not cancel downloads</b> or close the agent's tabs (use <i>Close agent tabs</i> in the popup first). Off: the bridge starts <b>revoked</b> after install or reload and you grant it here or in the popup; a grant survives browser restarts; Revoke stops every running command.</div>
+  <div id="manualAccess" style="margin-top:6px">
     <span id="accessState" style="font-weight:600">—</span>
     <button id="grant" type="button" style="margin:0 0 0 12px;padding:4px 12px">Grant</button>
     <button id="revoke" type="button" style="margin:0 0 0 6px;padding:4px 12px">Revoke</button>
