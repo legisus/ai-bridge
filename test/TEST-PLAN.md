@@ -110,7 +110,9 @@ Two layers:
 
 ## Last run
 
-`integration.sh` — **15/15 PASS** (2026-07-07, extension v0.1.0, Chrome on macOS).
-`protocol.test.js` — **4/4 PASS**.
+`integration.sh` — **22/22 PASS** (2026-11-26, extension v0.1.11, Chrome on macOS; fixture on
+https://example.com since only http(s) pages are targets; `pdf`/`screenshot` with `--debugger`).
+`npm test` — all scripts pass (relay, access, tab registry, run leases, extension access + worker harness, agent gate).
+Live agent run 2026-11-26 (`bridge agent`, example.com): pre-flight granted, lease registered and ended, verdict pass.
 
 Re-run both after any change to `background.js`, `server.js`, or `cli.js`.

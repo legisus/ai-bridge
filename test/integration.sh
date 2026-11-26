@@ -21,8 +21,11 @@ check "ping (health)" "$PONG" "true"
 [ "$PONG" = "true" ] || { echo "extension not connected — aborting"; exit 2; }
 
 # 1) newTab (background) — replaces: make new tab/window ----------------
-TID=$(b newTab '{"url":"about:blank"}' | node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))')
-[ -n "$TID" ] && ok "newTab (background about:blank) → id $TID" || { bad "newTab" "no id"; exit 2; }
+# Only http(s) pages are valid targets (about:blank, data: and chrome:// are
+# refused by the target guard), so the fixture is injected into example.com.
+TID=$(b newTab '{"url":"https://example.com/"}' | node -e 'process.stdin.on("data",d=>console.log(JSON.parse(d).id))')
+[ -n "$TID" ] && ok "newTab (background https://example.com) → id $TID" || { bad "newTab" "no id"; exit 2; }
+sleep 2
 
 # inject a self-contained fixture into the blank page via eval
 cat > /tmp/fixture.js <<'EOF'
@@ -76,18 +79,18 @@ NAVHOST=$(b eval "{\"tabId\":$TID,\"code\":\"location.hostname\"}" | tr -d '"')
 check "navigate (URL change)" "$NAVHOST" "example.com"
 
 # 8) pdf — replaces: chrome --headless --print-to-pdf ------------------
-b pdf "{\"tabId\":$TID}" --out /tmp/bridge-test.pdf >/dev/null
+b pdf "{\"tabId\":$TID}" --debugger --out /tmp/bridge-test.pdf >/dev/null   # CDP-only: pre-approved for the test
 HEAD=$(head -c 4 /tmp/bridge-test.pdf 2>/dev/null)
 check "pdf (print-to-PDF, %PDF header)" "$HEAD" "%PDF"
 
 # 9) screenshot — replaces: screencapture -----------------------------
-b screenshot "{\"tabId\":$TID}" --out /tmp/bridge-test.png >/dev/null
+b screenshot "{\"tabId\":$TID}" --debugger --out /tmp/bridge-test.png >/dev/null   # background tab: debugger route
 PNG=$(node -e 'const b=require("fs").readFileSync("/tmp/bridge-test.png");console.log(b[0]===0x89&&b[1]===0x50?"png":"no")' 2>/dev/null)
 check "screenshot (PNG magic bytes)" "$PNG" "png"
 
 # 10) download — replaces: fetch attachment → base64 → file ------------
 rm -f ~/Downloads/bridge-dl*.txt 2>/dev/null
-DL=$(b download '{"url":"data:text/plain,bridge-download-ok","filename":"bridge-dl.txt"}' | node -e 'process.stdin.on("data",d=>{try{console.log(JSON.parse(d).path?"ok":"no")}catch{console.log("no")}})')
+DL=$(b download '{"url":"https://example.com/","filename":"bridge-dl.html"}' | node -e 'process.stdin.on("data",d=>{try{console.log(JSON.parse(d).path?"ok":"no")}catch{console.log("no")}})')
 check "download (authenticated download to disk)" "$DL" "ok"
 rm -f ~/Downloads/bridge-dl*.txt 2>/dev/null
 
@@ -108,7 +111,7 @@ check "closeTab (tab removed)" "$GONE" "gone"
 # Open a fresh tab, then fire N concurrent eval commands at it. Before the
 # per-tab attach lock (v0.1.2) one of these failed with "Another debugger is
 # already attached". All N must now return their own value.
-CTAB=$(b newTab '{"url":"about:blank"}' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
+CTAB=$(b newTab '{"url":"https://example.com/"}' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
 CRES=$(mktemp)
 for n in 1 2 3 4 5 6; do
   ( b eval "{\"tabId\":$CTAB,\"code\":\"$n*7\"}" 2>&1 | tr -d '"' >> "$CRES" ) &
@@ -120,7 +123,7 @@ check "concurrency (6 CLIs, same tab first-touch, no attach race)" "$OKC" "clean
 b closeTab "{\"tabId\":$CTAB}" >/dev/null
 
 # 15-19) v0.1.3 commands on a fresh fixture tab ------------------------
-NTAB=$(b newTab '{"url":"about:blank"}' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
+NTAB=$(b newTab '{"url":"https://example.com/"}' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
 cat > /tmp/fixture2.js <<'EOF'
 (function(){
   document.title = "V13";
