@@ -41,7 +41,7 @@
   const EVENT_LIMIT = 200;
   const EVENT_KINDS = new Set(["connect", "disconnect", "superseded", "grant", "revoke", "refused", "tab_opened", "tab_closed", "download_started", "download_cancelled", "attach", "detach"]);
   const REASONS = new Set(["access_revoked", "access_not_granted", "privileged_target", "not_allowed", "target_changed", "extension_disconnected"]);
-  const SOURCES = new Set(["popup", "options", "alarm", "reload", "startup", "token-change"]);
+  const SOURCES = new Set(["popup", "options", "alarm", "reload", "startup", "token-change", "auto"]);
 
   // ---- access record, generation, transition ------------------------------
   // The worker is the only writer of `access`. Every grant and revoke bumps
@@ -51,6 +51,7 @@
   const ACCESS_NOT_GRANTED = (session) => `access_not_granted: access not granted yet (session "${session}")`;
   let hooks = { onRevoke: async () => {}, send: () => {}, badge: () => {}, sessionName: async () => "chrome", log: () => {} };
   let accessGen = 0;
+  let reloading = false;                  // a reload's revoke/cleanup is in progress: no auto re-grant
   let transition = Promise.resolve();     // the in-flight grant/revoke, awaited by every check
   let transitionQueue = Promise.resolve(); // serialises transitions
   let lastRecord = { granted: false, until: null, gen: 0, exists: false };
@@ -93,13 +94,20 @@
     // and is granted (the expiry alarm); otherwise return the current record
     // untouched with `skipped: true`. The condition is evaluated inside the
     // serialised queue, so a renewal that landed first wins.
-    setAccess({ granted, until = null, closeTabs = false, source = "popup", ifGen } = {}) {
+    setAccess({ granted, until = null, closeTabs = false, source = "popup", ifGen, unlessIndefinite = false } = {}) {
       const now = Date.now();
       const ok = granted === true && (until === null || (typeof until === "number" && Number.isFinite(until) && until > now));
       const run = async () => {
         if (ifGen !== undefined) {
           let raw; try { raw = (await chrome.storage.local.get("access")).access; } catch { raw = null; }
           if (!raw || typeof raw !== "object" || raw.gen !== ifGen || raw.granted !== true || ifGen !== accessGen) return { ...lastRecord, skipped: true };
+        }
+        if (unlessIndefinite) {
+          // Auto-grant reconciliation: an indefinite grant that is already in
+          // place is left alone (no generation churn on every worker wake).
+          let cur; try { cur = normalizeRecord((await chrome.storage.local.get("access")).access); } catch { cur = null; }
+          if (cur && cur.granted && cur.until === null && (accessGen === 0 || cur.gen === accessGen)) { if (accessGen === 0) accessGen = cur.gen; lastRecord = cur; return { ...cur, skipped: true }; }
+          if (cur === null) return { granted: false, until: null, gen: accessGen, error: "storage read failed", skipped: true }; // fail closed
         }
         const gen = ++accessGen;
         let release;
@@ -255,8 +263,34 @@
       const rec = await this.setAccess({ granted: false, source: "alarm", ifGen: Number(m[1]) });
       return !rec.skipped;
     },
-    // After any reload, update or install: revoked, and the user is told why.
+    // ---- auto-grant (always on) -------------------------------------------------
+    // The user's policy (Options, default ON): the bridge is granted whenever the
+    // extension runs; the extension's own enable/disable toggle is the stop
+    // switch. Reconciliation is one serialised, idempotent transition.
+    // true/false, or null when the setting cannot be read (callers fail closed).
+    async autoGrantEnabled() {
+      try { const { autoGrant } = await chrome.storage.local.get({ autoGrant: true }); return autoGrant !== false; } catch { return null; }
+    },
+    async reconcileAuto({ source = "auto" } = {}) {
+      if (reloading) return { ...lastRecord, skipped: true, reloading: true }; // never re-grant while a reload cleans up
+      const on = await this.autoGrantEnabled();
+      if (on === null) return { granted: false, until: null, gen: accessGen, skipped: true, error: "storage read failed" }; // nothing granted by this call
+      if (!on) return { ...lastRecord, skipped: true };
+      return this.setAccess({ granted: true, until: null, source, unlessIndefinite: true });
+    },
+    async setAutoGrant(on) {
+      await chrome.storage.local.set({ autoGrant: on !== false });
+      if (on !== false) { await this.dismissNotices(); return this.reconcileAuto({ source: "auto" }); }
+      return this.setAccess({ granted: false, source: "options" });
+    },
+    beginReload() { reloading = true; },
+    endReload() { reloading = false; },
+
+    // After any reload, update or install: with auto-grant ON the new worker is
+    // granted again (the reload itself revoked and cleaned up first); with it
+    // OFF the bridge starts revoked and the user is told why.
     async onInstalled() {
+      if (await this.autoGrantEnabled()) { await this.dismissNotices(); return this.reconcileAuto(); }
       await this.setAccess({ granted: false, source: "reload" });
       await this.setNotice("access was revoked because the extension was reloaded; tabs opened before the reload are no longer tracked");
     },
@@ -279,6 +313,7 @@
         const have = (await chrome.alarms.getAll().catch(() => [])).some((x) => x.name === `access-expiry-${a.gen}`);
         if (!have) await chrome.alarms.create(`access-expiry-${a.gen}`, { when: a.until }).catch((e) => hooks.log(`alarm recreate failed: ${e && e.message}`));
       }
+      await this.reconcileAuto({ source: "auto" }); // the always-on policy, when enabled
     },
 
     // ---- notices (popup) ----------------------------------------------------
@@ -447,6 +482,7 @@
       await guard();
       for (const id of tabIds) {
         if (!Number.isInteger(id) || !own.includes(id)) { skipped.push(id); continue; }
+        let gone = true;
         try {
           if (gen === undefined) await chrome.tabs.remove(id);
           else await this.dispatch(gen, () => chrome.tabs.remove(id));
@@ -454,8 +490,9 @@
         } catch (e) {
           if (gen !== undefined && /^access_/.test(String(e && e.message))) throw e;
           skipped.push(id);
+          gone = /No tab with id/i.test(String(e && e.message)); // already closed by the user → forget; any other failure keeps ownership
         }
-        await this.forgetAgentTab(id);
+        if (gone) await this.forgetAgentTab(id);
       }
       return { closed, skipped };
     },

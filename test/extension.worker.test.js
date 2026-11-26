@@ -129,6 +129,42 @@ async function fresh({ allowlist = [] } = {}) {
     void S;
   }
 
+  // (9) auto-grant: a fresh worker is granted without a click; install/update keeps it; token change recovers
+  {
+    const S = stubChrome(); const W = loadWorker(S); await W.initDone;
+    const a = await W.BridgeAccess.readAccess();
+    assert(a.granted === true && a.until === null, "fresh worker with autoGrant ON starts granted");
+    S.chrome.runtime.onInstalled.emit({ reason: "update" }); await sleep(30);
+    assert((await W.BridgeAccess.readAccess()).granted === true && (await W.BridgeAccess.notices()).length === 0, "onInstalled keeps access and shows no reload notice");
+    const g0 = W.BridgeAccess.currentGen();
+    S.chrome.storage.onChanged.emit({ token: { oldValue: "a", newValue: "b" } }, "local"); await sleep(60);
+    const after = await W.BridgeAccess.readAccess();
+    assert(after.granted === true && W.BridgeAccess.currentGen() > g0, "a token change revokes (new generation) and auto-grant restores access");
+    // manual access-set is refused while auto-grant is on
+    let reply = null;
+    S.chrome.runtime.onMessage.emit({ type: "access-set", granted: false }, { id: "ext-id", url: "chrome-extension://ext-id/popup.html" }, (r) => { reply = r; });
+    await sleep(30);
+    assert(reply && reply.ok === false && /auto-grant is on/.test(reply.error) && (await W.BridgeAccess.readAccess()).granted === true, "access-set is refused while auto-grant is on");
+    // turning it off via storage revokes; manual works again
+    await S.chrome.storage.local.set({ autoGrant: false });
+    S.chrome.storage.onChanged.emit({ autoGrant: { oldValue: true, newValue: false } }, "local"); await sleep(60);
+    assert((await W.BridgeAccess.readAccess()).granted === false, "autoGrant OFF revokes");
+  }
+  // (10) reloadExtension waits for pending creations and refuses when cleanup is incomplete
+  {
+    const { S, W, gen } = await fresh();
+    S.failIds.add(1001); // the agent tab cannot be closed
+    const t = await W.handle("newTab", { url: "https://ok.example/a" }, gen, "r20");
+    S.tabs.list.push({ id: t.id, windowId: 1, active: false, url: "https://ok.example/a" }); S.frames[t.id] = { url: "https://ok.example/a", documentId: "d-a" };
+    S.failIds.add(t.id);
+    const err = await msgOf(W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "r21"));
+    assert(/reload refused: cleanup incomplete/.test(err) && S.runtime.reloads === 0, "reloadExtension refuses when an agent tab could not be closed");
+    S.failIds.delete(t.id);
+    const ok = await W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "r22");
+    await sleep(80);
+    assert(ok && ok.reloading === true && S.runtime.reloads === 1 && S.removed.includes(t.id), "reloadExtension closes the agent tab, then reloads");
+  }
+
   console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll worker tests passed.");
   process.exit(failures ? 1 : 0);
 })().catch((e) => { console.error("harness error", e); process.exit(1); });

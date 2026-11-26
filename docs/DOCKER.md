@@ -376,7 +376,16 @@ get committed.
 
 ## Access: grant and revoke
 
-The extension's toolbar popup is the switch. It shows the browser session's name,
+**Default: always on.** Since 2026-11-26 the extension grants the bridge access
+whenever it is enabled (`Auto-grant` in Options, on by default), including after
+reloads and updates, so nothing on the PC needs a click. The stop switch is the
+extension's own toggle on `chrome://extensions`: disabling it detaches the
+debugger from every tab and disconnects the relay at once. It does **not** cancel
+downloads in progress, close the agent's tabs or stop page code already injected;
+press **Close agent tabs** in the popup first when you want the pages gone. Turn
+`Auto-grant` off to get the manual Grant/Revoke behaviour described below.
+
+The extension's toolbar popup is the switch when auto-grant is off. It shows the browser session's name,
 whether the server is connected, and the access state. The popup only *asks* the
 service worker to change state; the worker is the single writer of the access
 record, so the popup, the Options page and the expiry alarm can never race.

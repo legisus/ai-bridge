@@ -4,6 +4,7 @@ const send = (msg) => chrome.runtime.sendMessage(msg).catch((e) => ({ ok: false,
 async function refreshAccess() {
   const st = await send({ type: "access-get" });
   if (!st || !st.ok) { $("accessState").textContent = "unavailable"; return; }
+  $("manualAccess").style.display = st.autoGrant !== false ? "none" : "";
   $("accessState").textContent = st.granted ? (st.until === null ? "granted" : `granted, ${Math.max(0, Math.round(st.remainingMs / 60000))} min left`) : (st.gen === 0 ? "not granted yet" : "revoked");
   $("accessState").style.color = st.granted ? "#1e8e3e" : "#9e9e9e";
 }
@@ -13,8 +14,9 @@ refreshAccess();
 setInterval(refreshAccess, 2000);
 
 let storedToken = "";
-chrome.storage.local.get({ token: "", port: 8765, allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "", provisionedAt: 0, session: "chrome", manualMode: false }).then((cfg) => {
+chrome.storage.local.get({ token: "", port: 8765, allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "", provisionedAt: 0, session: "chrome", manualMode: false, autoGrant: true }).then((cfg) => {
   storedToken = cfg.token;
+  $("autoGrant").checked = cfg.autoGrant !== false;
   $("session").value = cfg.session || "chrome";
   $("manualMode").checked = !!cfg.manualMode;
   const src = cfg.provisionedBy === "native-host" ? `token received from the native host ${cfg.provisionedAt ? "at " + new Date(cfg.provisionedAt).toLocaleString() : ""}` : (cfg.token ? "token entered manually" : "not provisioned yet");
@@ -42,6 +44,7 @@ $("save").addEventListener("click", async () => {
     idleDetachMs: Math.max(0, Number($("idleDetach").value) || 0) * 1000,
     session,
     manualMode,
+    autoGrant: $("autoGrant").checked, // the worker reconciles access on this change
     provisionedBy: "manual",
   });
   storedToken = token;

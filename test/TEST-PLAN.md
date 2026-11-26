@@ -63,6 +63,9 @@ Two layers:
 
 | # | behaviour | how | expected |
 |---|-----------|-----|----------|
+| A0 | auto-grant: reload keeps access | `Auto-grant` on; `bridge reloadExtension`; `bridge ping` | within a few seconds `"access":"granted"` with a new `extGen`, no click — verified 2026-11-26 |
+| A0b | auto-grant: disable is the stop switch | with a tab attached (`--debugger`), disable the extension at chrome://extensions | banner gone, `bridge ping` → `extension not connected`; re-enable → `"access":"granted"` again |
+| A0c | manual mode | turn `Auto-grant` off in Options | access shows revoked; Grant/Revoke buttons appear; rows A1–A12 apply |
 | A1 | revoke during `waitFor` | `bridge waitFor '{"tabId":N,"selector":"#never","timeoutMs":60000}'`, then **Revoke** | the command fails with `access_revoked` within one poll tick (~200 ms) |
 | A2 | revoke during `type` | `bridge type '{"tabId":N,"text":"<200 chars>","delay":50}'`, **Revoke** mid-way | typing stops mid-string; the CLI exits 8 |
 | A3 | revoke while an attach is in flight | `bridge eval … --debugger` on a fresh tab, **Revoke** at once | no "is debugging" banner stays, the command fails `access_revoked` |

@@ -25,7 +25,7 @@
 
 importScripts("access.js"); // BridgeAccess: access record + transition, browserSession, agentTabs, downloads
 
-const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "", session: "chrome", manualMode: false };
+const DEFAULTS = { port: 8765, token: "", allowlist: [], indicator: true, idleDetachMs: 120000, provisionedBy: "", session: "chrome", manualMode: false, autoGrant: true };
 const PASS_ALWAYS = new Set(["ping", "status"]); // touch no tab: served whatever the access state
 const TYPE_CHUNK = 20; // direct-mode `type` runs from the worker in chunks, with an access check between chunks
 
@@ -186,11 +186,18 @@ async function connect() {
 // in-flight commands fail on the generation bump and the debugger is released,
 // then reconnect. The new relay starts not_granted; the user grants again.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !(changes.token || changes.port)) return;
+  if (area !== "local") return;
+  if (changes.autoGrant) {
+    // The always-on policy flipped in Options: grant now, or revoke now.
+    (async () => { if (changes.autoGrant.newValue === false) await BridgeAccess.setAccess({ granted: false, source: "options" }); else await BridgeAccess.reconcileAuto(); await refreshBadge(); })();
+    return;
+  }
+  if (!(changes.token || changes.port)) return;
   (async () => {
     await BridgeAccess.setAccess({ granted: false, source: "token-change" });
     try { ws && ws.close(); } catch {}
     ws = null;
+    await BridgeAccess.reconcileAuto(); // always-on: the new relay sees a granted session right after auth
     connect();
   })();
 });
@@ -200,10 +207,19 @@ chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "reconnect") { connect(); idleDetachSweep(); refreshBadge(); return; }
   if (/^access-expiry-/.test(a.name)) BridgeAccess.onAlarm(a.name);
 });
-chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onStartup.addListener(() => { initDone.then(() => BridgeAccess.reconcileAuto()).then(connect, connect); });
 // After any reload, update or install: revoked, with a notice in the popup.
 chrome.runtime.onInstalled.addListener(() => { initDone.then(() => BridgeAccess.onInstalled()).then(connect, connect); });
 connect();
+
+// Bridge downloads of this browser session still running (reload guard).
+async function inProgressBridgeDownloads() {
+  const { bridgeDownloads } = await chrome.storage.local.get("bridgeDownloads");
+  const ids = Object.keys(bridgeDownloads || {}).map(Number);
+  const out = [];
+  for (const id of ids) { try { const [it] = await chrome.downloads.search({ id }); if (it && it.state === "in_progress") out.push(id); } catch {} }
+  return out;
+}
 
 // Error strings that mean "refused" (an event with a fixed code); command
 // failures of other kinds are not refusals and are not logged.
@@ -225,6 +241,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg && msg.type) {
       case "access-set": {
+        if (await BridgeAccess.autoGrantEnabled()) return { ok: false, error: "auto-grant is on; disable it in Options to manage access by hand (to stop the bridge, disable the extension at chrome://extensions)" };
         const req = BridgeAccess.parseAccessSet(msg);
         if (req.error) return { ok: false, error: req.error };
         const rec = await BridgeAccess.setAccess({ ...req, source: msg.source || "popup" });
@@ -232,7 +249,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case "access-get": {
         const st = await BridgeAccess.status();
-        return { ok: true, ...st, connected: !!(ws && ws.readyState === WebSocket.OPEN), session: (await config()).session };
+        const cfg = await config();
+        return { ok: true, ...st, connected: !!(ws && ws.readyState === WebSocket.OPEN), session: cfg.session, autoGrant: cfg.autoGrant !== false };
       }
       case "close-agent-tabs": return { ok: true, ...(await BridgeAccess.closeAgentTabs()) };
       case "events-get": return { ok: true, events: await BridgeAccess.events() };
@@ -772,15 +790,36 @@ async function handle(cmd, p, gen, reqId) {
   if (p && p.tabId != null) lastActivity.set(p.tabId, Date.now());
   const allowlist = PASS_ALWAYS.has(cmd) || cmd === "reloadExtension" || cmd === "closeTabs" || cmd === "detach" || cmd === "detachAll" ? null : await allowlistOf();
   switch (cmd) {
-    case "reloadExtension":
+    case "reloadExtension": {
       // Reload this extension so an updated extension/ folder takes effect
       // (same as the reload icon on chrome://extensions). The reload clears
-      // session storage (tab records), so the full revoke runs first: agent
-      // tabs closed, bridge downloads cancelled, debugger released. The socket
-      // drops; the new service worker reconnects within a second, revoked.
-      await BridgeAccess.setAccess({ granted: false, closeTabs: true, source: "reload" });
+      // session storage (tab records), so the full revoke runs first — agent
+      // tabs closed, bridge downloads cancelled, debugger released — and the
+      // reload happens only once that cleanup is verified: pending creations
+      // drained, no agent tab left, no bridge download still running. With
+      // auto-grant on, the new worker grants itself again; nothing of the old
+      // run survives untracked. On failure the reload is refused.
+      BridgeAccess.beginReload();
+      try {
+        for (let i = 0; i < 100; i++) { // ≤ 5 s for creations whose id has not come back yet
+          const [{ pendingTabs }, { pendingDownloads }] = await Promise.all([chrome.storage.session.get("pendingTabs"), chrome.storage.local.get("pendingDownloads")]);
+          if (!(pendingTabs || []).length && !(pendingDownloads || []).length) break;
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        const owned = await BridgeAccess.agentTabIds();
+        await BridgeAccess.setAccess({ granted: false, closeTabs: true, source: "reload" });
+        const left = [];
+        for (const id of owned) { try { await chrome.tabs.get(id); left.push(id); } catch { /* closed */ } }
+        const running = await inProgressBridgeDownloads();
+        if (left.length || running.length) {
+          BridgeAccess.endReload();
+          await BridgeAccess.reconcileAuto();
+          throw new Error(`reload refused: cleanup incomplete (${left.length} agent tab(s) still open, ${running.length} download(s) still running)`);
+        }
+      } catch (e) { BridgeAccess.endReload(); throw e; }
       setTimeout(() => chrome.runtime.reload(), 50);
       return { ok: true, reloading: true };
+    }
 
     case "ping":
       return { pong: true, version: chrome.runtime.getManifest().version };

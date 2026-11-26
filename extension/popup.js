@@ -24,6 +24,12 @@ async function refresh() {
     a.className = "off";
   }
   $("tabs").textContent = String((st.agentTabs || []).length);
+  // Auto-grant (default): access is always on while the extension is enabled;
+  // the manual buttons are hidden and the extension toggle is the stop switch.
+  const auto = st.autoGrant !== false;
+  for (const id of ["grant", "grant1h", "revoke", "revokeClose"]) $(id).style.display = auto ? "none" : "";
+  $("autoHint").style.display = auto ? "" : "none";
+  if (auto) { a.textContent = st.granted ? "always on (auto-grant)" : "always on — reconnecting…"; a.className = st.granted ? "on" : "off"; }
   $("grant").disabled = st.granted && st.until === null;
   $("revoke").disabled = !st.granted;
   const n = $("notices");

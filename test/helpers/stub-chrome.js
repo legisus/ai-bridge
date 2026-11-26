@@ -47,7 +47,8 @@ function stubChrome() {
   mem.failNext = (areaName) => fails.add(areaName);
 
   const removed = [];
-  const failIds = new Set();
+  const failIds = new Set(); // ids whose removal fails for a transient reason (tab stays)
+  const goneIds = new Set(); // ids Chrome no longer knows ("No tab with id")
   // An event with addListener/removeListener/emit (chrome.* events).
   const event = () => { const fns = new Set(); return { addListener: (f) => fns.add(f), removeListener: (f) => fns.delete(f), hasListener: (f) => fns.has(f), emit: (...a) => { for (const f of [...fns]) f(...a); }, size: () => fns.size }; };
   const tabs = { list: [], captures: [], onCapture: null, onActivated: event(), onUpdated: event(), onRemoved: event() };
@@ -78,7 +79,7 @@ function stubChrome() {
   const chrome = {
     storage: { session: area("session"), local: area("local"), onChanged: storageChanged },
     tabs: {
-      remove: async (id) => { await tick(); if (failIds.has(id)) throw new Error("No tab with id"); removed.push(id); tabs.list = tabs.list.filter((t) => t.id !== id); },
+      remove: async (id) => { await tick(); if (goneIds.has(id)) throw new Error(`No tab with id: ${id}.`); if (failIds.has(id)) throw new Error("Tabs cannot be edited right now (user may be dragging a tab)."); removed.push(id); tabs.list = tabs.list.filter((t) => t.id !== id); },
       query: async (q) => { await tick(); return tabs.list.filter((t) => !q || q.windowId === undefined || t.windowId === q.windowId).map((t) => ({ ...t })); },
       get: async (id) => { await tick(); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); return { ...t }; },
       create: async (opts) => { await tick(); const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: opts && opts.windowId || 1, url: opts && opts.url, active: !!(opts && opts.active) }; tabs.list.push(t); return { ...t }; },
@@ -142,7 +143,7 @@ function stubChrome() {
       get lastError() { return undefined; },
     },
   };
-  return { chrome, mem, removed, failIds, tabs, frames, injections, inject, cdp, windows, downloads, alarms, badge, runtime, event };
+  return { chrome, mem, removed, failIds, goneIds, tabs, frames, injections, inject, cdp, windows, downloads, alarms, badge, runtime, event };
 }
 
 module.exports = { stubChrome };

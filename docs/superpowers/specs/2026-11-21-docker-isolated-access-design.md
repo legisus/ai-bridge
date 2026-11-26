@@ -1,6 +1,7 @@
 # Docker-isolated agent with host-side access control — design
 
-**Implementation status (2026-11-25):** three slices are implemented: `tab-hygiene`
+**Implementation status (2026-11-26):** auto-grant (always on, default) added after the
+user's decision, see "Auto-grant". Three slices were implemented before it: `tab-hygiene`
 (PR #12), `access-switch` (PR #13, stacked on it) and `target-guard` (stacked on
 that: the privileged-origin block with document binding — `webNavigation`
 `documentId` for direct injections, `uniqueContextId` and `loaderId` for the
@@ -332,6 +333,30 @@ cannot prove is ours" is the deliberate choice.
 
 `readAccess()` normalises: anything not matching the shape is `{granted:false}`. A
 timed grant is live only while `Date.now() < until`.
+
+### Auto-grant (the default since 2026-11-26)
+
+The user decided, after running the switch for a day, that the bridge should be
+**granted whenever the extension is enabled** and that the extension's own
+enable/disable toggle on `chrome://extensions` is the stop switch (Astra assessed
+the change: PROCEED WITH CHANGES; its recommendations are what follows). `autoGrant`
+(Options, default ON) is a policy, not a default record: one serialised,
+idempotent reconciliation (`reconcileAuto`) runs at worker init, `onInstalled`,
+`onStartup`, after a token/port change and when the setting flips; it grants
+indefinitely with source `auto` only when the record is not already an indefinite
+grant (no generation churn), replaces timed grants, and fails closed when storage
+cannot be read. With auto-grant ON the popup and Options hide Grant/Revoke and the
+timed grant and explain the toggle; **Close agent tabs** stays. `reloadExtension`
+still revokes, closes the agent's tabs and cancels its downloads **before** the
+reload, now waiting for pending creations and verifying the cleanup (a tab that
+could not be closed makes it refuse with `reload refused: cleanup incomplete`), and
+no auto re-grant happens during that cleanup; the new worker grants itself again.
+Everything below (the transition, `assertAccess`/`dispatch`, the target guard,
+the registry, the leases, the agent gate's poll) is unchanged and is what runs when
+auto-grant is **OFF**. Limits of the toggle, stated in the guide: disabling the
+extension detaches the debugger and disconnects the relay, but does not cancel
+downloads in progress, close the agent's tabs, or stop page code already
+injected; "Close agent tabs" first when that matters.
 
 ### Single writer, revocation generation
 

@@ -30,7 +30,12 @@ function loadWorker(S) {
   const ctx = vm.createContext(sandbox);
   sandbox.importScripts = (...files) => { for (const f of files) vm.runInContext(fs.readFileSync(path.join(EXT, f), "utf8"), ctx, { filename: f }); };
   vm.runInContext(fs.readFileSync(path.join(EXT, "background.js"), "utf8"), ctx, { filename: "background.js" });
-  return sandbox; // the vm global: handle, validateTab, BridgeAccess, attached, cdp, initDone, …
+  // Top-level const/let bindings of the worker script are not properties of
+  // the vm global; read the ones the tests need from the context itself.
+  for (const name of ["initDone", "attached", "attaching", "cdp"]) {
+    try { sandbox[name] = vm.runInContext(name, ctx); } catch {}
+  }
+  return sandbox; // the vm global: handle, validateTab, BridgeAccess, … plus the bindings above
 }
 
 module.exports = { loadWorker };

@@ -233,7 +233,9 @@ wss.on("connection", (sock) => {
           : `access revoked (session "${a.session}")`);
       }
       // The extension will refuse them anyway; do not make the CLI wait for that.
-      if (next !== "granted") cancelPending(ext.gen, (r) => !PASS_ALWAYS.has(r.cmd), ACCESS_REVOKED(a.session));
+      // reloadExtension revokes on purpose before reloading: its own reply must
+      // still arrive (ok, or "reload refused: …").
+      if (next !== "granted") cancelPending(ext.gen, (r) => !PASS_ALWAYS.has(r.cmd) && r.cmd !== "reloadExtension", ACCESS_REVOKED(a.session));
       if (a.browserSession) {
         if (registry.browserSession !== a.browserSession) registry.setBrowserSession(a.browserSession);
         // Reconcile the registry against what the extension still owns.

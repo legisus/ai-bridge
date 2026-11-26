@@ -112,9 +112,10 @@ function fakeExtension(relay, { browserSession = randomHex32(), session = "chrom
       if (msg.type !== "command") return;
       ext.received.push(msg);
       if (hold && hold(msg.cmd, msg.params || {})) return;
-      let result = handler ? handler(msg.cmd, msg.params || {}, msg.id) : undefined;
-      if (result === undefined && !handler) result = defaultHandler(msg.cmd, msg.params || {});
-      else if (result === undefined && handler) result = undefined;
+      const h = ext.handlerOverride || handler;
+      let result = h ? h(msg.cmd, msg.params || {}, msg.id) : undefined;
+      if (result === undefined && !h) result = defaultHandler(msg.cmd, msg.params || {});
+      else if (result === undefined && h) result = undefined;
       if (result === undefined) return; // held; the test answers via respond()
       if (result && result.__error) return ext.respond(msg.id, { ok: false, error: result.__error });
       ext.respond(msg.id, { ok: true, result });

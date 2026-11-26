@@ -84,9 +84,10 @@ on the same page: [Binary install](docs/INSTALL.md#binary-install-no-nodejs).
    extension and click *Details* → turn on **Allow User Scripts** (needed by `eval`
    in direct mode; Chrome 138+). No native host? Paste the token from
    `~/.ai-browser-bridge/token` into *Extension options* instead.
-4. **Grant access:** click the extension's toolbar icon and press **Grant** (or
-   **Grant for 1 h**). The bridge starts revoked after every install or reload;
-   the grant survives browser restarts. **Revoke** stops every running command.
+4. **Access:** on by default (`Auto-grant`): the bridge may drive this Chrome
+   whenever the extension is enabled. To stop it, disable the extension at
+   `chrome://extensions`. Turn `Auto-grant` off in Options to grant and revoke by
+   hand from the popup instead.
 5. **Smoke test:**
    ```bash
    node server/cli.js ping
@@ -322,11 +323,13 @@ Full policy: [PRIVACY.md](PRIVACY.md). Read this before installing — the exten
   document it validated (a page that navigated underneath fails with
   `target changed`). `bridge status --events` shows the extension's recent
   events, redacted to the current allowlist.
-- **You grant and revoke the browser session** from the extension's popup (or
-  Options). The service worker is the only writer of that state and checks it on
-  every command and before every browser operation; a revoke stops in-flight work,
-  releases the debugger, cancels bridge downloads and, with **Revoke and close agent
-  tabs**, closes the tabs the agent opened. Nothing in the relay or the CLI can grant.
+- **The extension decides whether the bridge may drive Chrome.** By default access is
+  on while the extension is enabled (`Auto-grant`); disabling the extension stops
+  it. With `Auto-grant` off you grant and revoke from the popup, and a revoke stops
+  in-flight work, releases the debugger, cancels bridge downloads and, with **Revoke
+  and close agent tabs**, closes the tabs the agent opened. Either way the service
+  worker is the only writer of that state and checks it before every browser
+  operation; nothing in the relay or the CLI can grant.
 - The relay keeps a **registry of the tabs it opened** (`~/.ai-browser-bridge/tabs.json`:
   tab id, Chrome session, who, when, which run, origin only — never page content or
   full URLs). An agent run's tabs are closed when the run ends or its process dies;

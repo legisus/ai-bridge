@@ -61,16 +61,25 @@ Each was reviewed by Codex `gpt-6-astra` before it was ready.
   `claude` 2.1.317 and `codex` 0.171.0) and `test/docker-roundtrip.sh` (the real
   extension talking to the containerised relay).
 
+**Always on by default** (added 2026-11-26 after a day of use)
+- `Auto-grant` (Options, default ON): the bridge is granted whenever the extension
+  is enabled, also after reloads and updates; no Grant click, on the Mac and in the
+  Docker layout alike. The stop switch is the extension's toggle on
+  `chrome://extensions`. It detaches the debugger and disconnects the relay; it does
+  not cancel running downloads or close the agent's tabs (use **Close agent tabs**
+  first). Turn `Auto-grant` off for the manual Grant/Revoke behaviour. The enforcement
+  underneath is unchanged.
+
 ### How to use it
 
-1. **Update and grant.** Pull, restart the relay, reload the extension at
-   `chrome://extensions`, click the extension icon, press **Grant**. `bridge ping`
-   now shows `"access":"granted"`. Until you grant, every command except `ping`
-   and `status` is refused with exit 8.
-2. **Stop the agent at any time.** Press **Revoke** (or **Revoke and close agent
-   tabs**). Running commands fail within one step; a running `bridge agent` ends
-   with `access_revoked`. Press **Grant** again when you want it back; **Grant for
-   1 h** for unattended runs.
+1. **Update.** Pull, restart the relay, reload the extension at
+   `chrome://extensions`. `bridge ping` shows `"access":"granted"` on its own
+   (auto-grant). If you turned auto-grant off: press **Grant** in the popup; until
+   then every command except `ping` and `status` is refused with exit 8.
+2. **Stop the agent at any time.** Disable the extension at `chrome://extensions`
+   (press **Close agent tabs** in the popup first if you want its pages gone).
+   With auto-grant off, **Revoke** does the same from the popup and also cancels
+   downloads and can close the agent's tabs.
 3. **See what the bridge opened.** `bridge tabs`; close with
    `bridge closeTabs --mine`, `--run <id>` or `--older-than 60`.
 4. **Debug a failure.** Take the `(req <id>)` from the error, `grep` it in
@@ -84,8 +93,8 @@ Each was reviewed by Codex `gpt-6-astra` before it was ready.
 ### Upgrade notes
 
 - The relay refuses everything except `ping`/`status` until an extension that
-  sends the access message connects and the user has granted: after updating the
-  server, reload the extension and grant once.
+  sends the access message connects and access is granted: after updating the
+  server, reload the extension; with auto-grant (default) that is all.
 - `closeTab` on a tab the bridge did not open is now subject to the allowlist and
   the privileged-origin block; `listTabs` redacts tabs outside the allowlist;
   `navigate` on a non-blank privileged tab is refused.

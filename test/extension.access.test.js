@@ -29,9 +29,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(JSON.stringify(await B.agentTabIds()) === "[10,11]", "agentTabs de-duplicated");
   let r = await B.closeOwnedTabs([10, 99, "x"]);
   assert(JSON.stringify(r.closed) === "[10]" && JSON.stringify(r.skipped) === '[99,"x"]' && JSON.stringify(S.removed) === "[10]" && JSON.stringify(await B.agentTabIds()) === "[11]", "closeTabs closes only owned ids, reports the rest skipped");
-  S.failIds.add(11);
+  S.goneIds.add(11);
   r = await B.closeOwnedTabs([11]);
-  assert(r.closed.length === 0 && JSON.stringify(r.skipped) === "[11]" && (await B.agentTabIds()).length === 0, "remove rejection → skipped and forgotten");
+  assert(r.closed.length === 0 && JSON.stringify(r.skipped) === "[11]" && (await B.agentTabIds()).length === 0, "a tab Chrome no longer knows → skipped and forgotten");
+  await B.rememberAgentTab(13); S.failIds.add(13);
+  r = await B.closeOwnedTabs([13]);
+  assert(JSON.stringify(r.skipped) === "[13]" && (await B.agentTabIds()).includes(13), "a tab that could not be closed right now → skipped but still owned");
+  S.failIds.delete(13); await B.forgetAgentTab(13);
   await B.rememberAgentTab(12); await B.forgetAgentTab(12);
   assert((await B.agentTabIds()).length === 0, "forgetAgentTab");
   r = await B.closeOwnedTabs("nope");
@@ -130,6 +134,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/^access_revoked:/.test(err), "storage failure → access_revoked");
 
   // ---- alarms, hooks, reload, startup, popup helpers (Task 2) -----------
+  await S.chrome.storage.local.set({ autoGrant: false }); // these sections exercise the manual (OFF) behaviour; the auto-grant section below re-enables it
   await B.setAccess({ granted: true, until: Date.now() + 3600e3 });
   let gg = B.currentGen();
   assert(S.alarms.list.some((x) => x.name === `access-expiry-${gg}`) && S.alarms.list.length === 1, "timed grant creates access-expiry-<gen>");
@@ -370,6 +375,46 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const cli3 = fs.readFileSync(path.join(__dirname, "..", "server", "cli.js"), "utf8");
   assert(/--events/.test(cli3) && /params\.events = true/.test(cli3), "CLI: bridge status --events");
 
+  // ---- auto-grant (always on) ------------------------------------------------
+  B.configure({ sessionName: async () => "chrome", onRevoke: async () => {}, send: () => {}, badge: () => {} });
+  await S.chrome.storage.local.remove("autoGrant"); // back to the default (the sections above forced OFF)
+  assert((await B.autoGrantEnabled()) === true, "autoGrant defaults to ON");
+  await S.chrome.storage.local.remove("access");
+  let ag = await B.reconcileAuto({ source: "auto" });
+  assert(ag.granted === true && ag.until === null && (await B.readAccess()).granted === true, "auto: missing record → indefinite grant");
+  const gAuto = B.currentGen();
+  ag = await B.reconcileAuto();
+  assert(ag.granted === true && B.currentGen() === gAuto && ag.skipped === true, "auto: an indefinite grant is left alone (no generation churn)");
+  await B.setAccess({ granted: false, source: "options" });
+  ag = await B.reconcileAuto();
+  assert(ag.granted === true && B.currentGen() === gAuto + 2, "auto: a revoked record is re-granted");
+  await B.setAccess({ granted: true, until: Date.now() + 3600e3 });
+  ag = await B.reconcileAuto();
+  assert(ag.granted === true && ag.until === null && S.alarms.list.filter((a) => /^access-expiry-/.test(a.name)).length === 0, "auto: a timed grant becomes indefinite and its alarm is cleared");
+  await S.chrome.storage.local.set({ access: { granted: true, until: Date.now() - 1, gen: B.currentGen() } });
+  ag = await B.reconcileAuto();
+  assert(ag.granted === true && ag.until === null, "auto: an expired grant is re-granted");
+  await B.clearEvents(); await B.setAccess({ granted: false }); await B.reconcileAuto();
+  assert((await B.events()).some((e) => e.kind === "grant" && e.detail.source === "auto"), "auto: the grant event carries source auto");
+  S.mem.failNext("local");
+  ag = await B.reconcileAuto();
+  assert(ag.granted === false, "auto: a storage failure during reconciliation fails closed");
+  // OFF: today's behaviour
+  await B.setAutoGrant(false);
+  assert((await B.autoGrantEnabled()) === false && (await B.readAccess()).granted === false, "turning auto-grant OFF revokes at once");
+  ag = await B.reconcileAuto();
+  assert(ag.granted === false && (await B.readAccess()).granted === false, "OFF: reconcile grants nothing");
+  await B.onInstalled();
+  assert((await B.readAccess()).granted === false && /reloaded/.test((await B.notices()).join()), "OFF: install/reload starts revoked with the notice");
+  await B.setAutoGrant(true);
+  assert((await B.readAccess()).granted === true && (await B.notices()).length === 0, "turning auto-grant ON grants and clears the reload notice");
+  await B.setAccess({ granted: false });
+  await B.onInstalled();
+  assert((await B.readAccess()).granted === true && (await B.notices()).length === 0, "ON: install/reload comes back granted, no notice");
+  await S.chrome.storage.local.set({ access: { granted: false, until: null, gen: B.currentGen() } });
+  await B.init();
+  assert((await B.readAccess()).granted === true, "ON: worker init grants");
+
   // ---- background.js wiring (source level) -------------------------------
   const src = fs.readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
   assert(/^importScripts\("access\.js"\);/m.test(src), "background.js imports access.js");
@@ -378,6 +423,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/rememberAgentTab\(|completeTab\(/.test(src) && /forgetAgentTab\(/.test(src), "background.js records opened/closed tabs");
   assert(/accessMessage\(/.test(src) && /msg\.type === "auth"/.test(src), "background.js sends the access message after auth");
   assert(/session: "chrome"/.test(src), "DEFAULTS has the session name");
+  assert(/autoGrant: true/.test(src) && /BridgeAccess\.reconcileAuto\(/.test(src) && /auto-grant is on/.test(src), "worker: autoGrant default ON, reconciles, rejects manual access-set while ON");
+  assert(/changes\.autoGrant/.test(src), "worker: a setting change reconciles");
+  const popSrc = fs.readFileSync(path.join(__dirname, "..", "extension", "popup.js"), "utf8");
+  const optSrc2 = fs.readFileSync(path.join(__dirname, "..", "extension", "options.html"), "utf8");
+  assert(/autoGrant/.test(popSrc) && /always on/i.test(popSrc) && /chrome:\/\/extensions/.test(fs.readFileSync(path.join(__dirname, "..", "extension", "popup.html"), "utf8")), "popup: always-on copy and the toggle hint");
+  assert(/Auto-grant/.test(optSrc2) && /does not cancel downloads/i.test(optSrc2), "Options: Auto-grant checkbox with the toggle's limits");
   const closeTabCase = /case "closeTab": \{([\s\S]*?)return \{ ok: true \};/.exec(src);
   assert(closeTabCase && /validateTab\(p\.tabId, gen, \{ allowlist \}\)/.test(closeTabCase[1]) && closeTabCase[1].indexOf("validateTab") < closeTabCase[1].indexOf("chrome.tabs.remove"), "closeTab validates a non-agent tab (privileged block + allowlist) before removing it");
 
