@@ -103,6 +103,11 @@ Running the relay and the agent in **Docker** on a PC while Chrome stays on the
 host, with grant/revoke from the extension: see [docs/DOCKER.md](docs/DOCKER.md)
 (`Dockerfile`, `deploy/docker/compose.yml`, `test/docker-smoke.sh`).
 
+The other way round — **Google Chrome itself in Docker** (its own sessions, its own
+screen), with the jobs and the CLI on the Mac: see
+[docs/DOCKER-CHROME.md](docs/DOCKER-CHROME.md) (`deploy/docker-chrome/`,
+`bin/bridge-docker`, `test/docker-chrome-smoke.sh`).
+
 ## Usage
 
 ```bash
@@ -111,6 +116,7 @@ bridge() { node /path/to/ai-bridge/server/cli.js "$@"; }
 bridge listTabs
 bridge newTab   '{"url":"https://example.com"}'               # opens in background
 bridge newTab   '{"url":"https://example.com","newWindow":true}'  # own unfocused window (isolates activateTab)
+bridge newTab   '{"url":"https://example.com","incognito":true}'  # own incognito window: a clean session (needs "Allow in incognito" on the extension)
 bridge eval     '{"tabId":123,"code":"document.title"}'
 bridge eval     '{"tabId":123}' --file scrape.js              # long scripts from a file
 bridge click    '{"tabId":123,"x":420,"y":310}'               # trusted click at CSS px

@@ -7,3 +7,5 @@ deploy/docker/.env*
 !deploy/docker/.env.example
 deploy/docker/work*/
 deploy/docker/channels*.json
+__pycache__/
+*.pyc

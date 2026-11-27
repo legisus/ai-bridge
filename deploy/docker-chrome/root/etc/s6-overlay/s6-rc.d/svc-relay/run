@@ -1,0 +1,13 @@
+#!/usr/bin/with-contenv bash
+# The ai-bridge relay, next to Chrome. It runs as the image user (abc = the Mac
+# user's ids through PUID/PGID), so the token and the traces it writes under
+# /data keep the owner the Mac-side CLI expects.
+export HOME=/config AI_BRIDGE_HOME=/data BRIDGE_BIND=0.0.0.0 BRIDGE_PORT=8765
+# /data is a bind mount from the Mac: it must exist and be writable by the image
+# user, or the relay could neither read its token nor write its traces.
+if ! s6-setuidgid abc sh -c 'test -d /data && test -w /data && { test ! -e /data/token || test -r /data/token; }'; then
+  echo "[svc-relay] /data is missing, not writable or its token is unreadable for uid $(id -u abc) (PUID) — fix the BRIDGE_DATA_DIR mount; retrying in 30 s" >&2
+  sleep 30
+  exit 1
+fi
+exec s6-setuidgid abc node /opt/ai-bridge/server/server.js

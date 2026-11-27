@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — Chrome in Docker (branch `docker-chrome`)
+
+The opposite of the 0.1.11 Docker layout: the **browser** lives in the container, the
+jobs and the CLI stay on the Mac. Guide: `docs/DOCKER-CHROME.md`; design:
+`docs/superpowers/specs/2026-11-26-docker-chrome-design.md`.
+
+- `deploy/docker-chrome/`: an image with Google Chrome (Google's `.deb`, no Chromium:
+  the base is the browser-less Selkies image and the build fails on any other browser),
+  Node 22, the relay and the extension; `chrome-start.sh` keeps Chrome running with its
+  own sandbox and provisions the extension after every start (`provision.py`: Developer
+  mode, load unpacked over DevTools, "Allow in incognito" + "Allow User Scripts", token
+  and session name `docker-chrome`, wait for `access granted`).
+- `bin/bridge-docker`: `build`, `up`, `down`, `status`, `restart-chrome`, `provision`,
+  `screen`, `logs`, `cli`; `--staging` runs on port 8766 with its own state next to a live
+  host relay. Guards: mounts under `$HOME` only, one container per Chrome profile, never
+  on a port or state directory a host relay owns. Chrome is stopped through DevTools
+  `Browser.close`, the only stop that leaves the cookie store on disk.
+- **`newTab {"incognito": true}`** opens the URL in an incognito window of its own (a
+  clean session next to the profile's cookies); `listTabs` marks incognito tabs. Refused
+  unless "Allow in incognito" is on. With that toggle on, an ordinary `newTab` always
+  goes to a regular window. With it off (the default) `newTab` behaves as before.
+- Tests: incognito cases in `test/extension.worker.test.js`,
+  `test/docker-chrome.files.test.js` (in `npm test`), `npm run test:docker-chrome`
+  (adds the provisioning tests, needs `python3`), `test/docker-chrome-smoke.sh` (needs
+  Docker).
+- `.dockerignore` no longer excludes `extension/` (the new image copies it; the 0.1.11
+  image still copies `server/` only).
+
 ## 0.1.11 — access switch, target guard, tab hygiene, Docker (PRs #12–#15, November 2026)
 
 Four stacked pull requests implement the Docker-isolated design (`docs/DOCKER.md`,
