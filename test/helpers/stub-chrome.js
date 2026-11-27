@@ -51,7 +51,7 @@ function stubChrome() {
   const goneIds = new Set(); // ids Chrome no longer knows ("No tab with id")
   // An event with addListener/removeListener/emit (chrome.* events).
   const event = () => { const fns = new Set(); return { addListener: (f) => fns.add(f), removeListener: (f) => fns.delete(f), hasListener: (f) => fns.has(f), emit: (...a) => { for (const f of [...fns]) f(...a); }, size: () => fns.size }; };
-  const tabs = { list: [], captures: [], onCapture: null, getFail: null, onActivated: event(), onUpdated: event(), onRemoved: event() };
+  const tabs = { list: [], created: [], captures: [], onCapture: null, getFail: null, onActivated: event(), onUpdated: event(), onRemoved: event() };
   const frames = {};                 // tabId -> { url, documentId } for webNavigation.getFrame
   const injections = [];             // scripting.executeScript / userScripts.execute calls
   const inject = { result: null, hook: null }; // hook(call) may throw or return a result
@@ -61,7 +61,7 @@ function stubChrome() {
   const badge = [];
   const runtime = { id: "ext-id", reloads: 0, onMessage: event(), onStartup: event(), onInstalled: event(), messagesToNative: [] };
   const storageChanged = event();
-  const windows = { list: [{ id: 1 }], nextId: 2 };
+  const windows = { list: [{ id: 1 }], nextId: 2, created: [], incognitoAllowed: false, onCreate: null, onIncognitoQuery: null, tabsOf: null, getAllFail: false }; // incognitoAllowed:false = Chrome's default for an extension
 
   // Chrome refuses to inject into a document that is gone: emulate documentIds.
   const injectInto = async (api, call) => {
@@ -82,15 +82,27 @@ function stubChrome() {
       remove: async (id) => { await tick(); if (goneIds.has(id)) throw new Error(`No tab with id: ${id}.`); if (failIds.has(id)) throw new Error("Tabs cannot be edited right now (user may be dragging a tab)."); removed.push(id); tabs.list = tabs.list.filter((t) => t.id !== id); },
       query: async (q) => { await tick(); return tabs.list.filter((t) => !q || q.windowId === undefined || t.windowId === q.windowId).map((t) => ({ ...t })); },
       get: async (id) => { await tick(); if (tabs.getFail === id) throw new Error("The tab was closed."); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); return { ...t }; },
-      create: async (opts) => { await tick(); const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: opts && opts.windowId || 1, url: opts && opts.url, active: !!(opts && opts.active) }; tabs.list.push(t); return { ...t }; },
+      create: async (opts) => { await tick(); tabs.created.push({ ...opts }); const windowId = opts && opts.windowId || 1; const inc = !!(windows.list.find((w) => w.id === windowId) || {}).incognito; const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId, url: opts && opts.url, active: !!(opts && opts.active), ...(inc ? { incognito: true } : {}) }; tabs.list.push(t); return { ...t }; },
       update: async (id, props) => { await tick(); const t = tabs.list.find((x) => x.id === id); if (!t) throw new Error(`No tab with id: ${id}.`); Object.assign(t, props); return { ...t }; },
       captureVisibleTab: async (windowId) => { await tick(); if (tabs.onCapture) await tabs.onCapture(windowId); const active = tabs.list.find((t) => t.windowId === windowId && t.active); tabs.captures.push(active ? active.id : null); return `data:image/png;base64,${Buffer.from(`shot-of-${active ? active.id : "none"}`).toString("base64")}`; },
       onActivated: tabs.onActivated, onUpdated: tabs.onUpdated, onRemoved: tabs.onRemoved,
     },
     windows: {
-      create: async (opts) => { await tick(); const id = windows.nextId++; windows.list.push({ id }); const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: id, url: opts && opts.url, active: true }; tabs.list.push(t); return { id, tabs: [{ ...t }] }; },
+create: async (opts) => {
+        await tick();
+        if (windows.onCreate) await windows.onCreate(opts);            // may throw (creation failure) or revoke mid-flight
+        windows.created.push({ ...opts });
+        const id = windows.nextId++; const incognito = !!(opts && opts.incognito);
+        windows.list.push({ id, incognito, type: "normal", focused: false });
+        const t = { id: tabs.nextId = (tabs.nextId || 1000) + 1, windowId: id, url: opts && opts.url, active: true, ...(incognito ? { incognito: true } : {}) };
+        tabs.list.push(t);
+        const made = windows.tabsOf ? windows.tabsOf(t) : [{ ...t }];   // a test may return no tab, or someone else's
+        return { id, incognito, tabs: made };
+      },
+      getAll: async () => { await tick(); if (windows.getAllFail) throw new Error("windows unavailable"); return windows.list.map((w) => ({ type: "normal", incognito: false, focused: false, ...w })); },
       update: async () => { await tick(); return {}; },
     },
+    extension: { isAllowedIncognitoAccess: async () => { await tick(); if (windows.onIncognitoQuery) await windows.onIncognitoQuery(); return windows.incognitoAllowed; } },
     webNavigation: {
       getFrame: async ({ tabId }) => { await tick(); const f = frames[tabId]; if (!f) return null; return { frameId: 0, parentFrameId: -1, url: f.url, documentId: f.documentId }; },
     },

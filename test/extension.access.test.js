@@ -320,6 +320,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(red[0].url === "https://ok.example/x" && red[0].title === "T" && red[0].windowId === 1, "redactTabs: allowed tab in full");
   assert(red[1].url === "redacted" && !("title" in red[1]) && red[1].id === 2 && red[1].active === false, "redactTabs: privileged tab redacted, no title");
   assert(red[2].url === "redacted" && !("title" in red[2]) && red[2].agent === true, "redactTabs: disallowed tab redacted, marked agent");
+  red = B.redactTabs([{ id: 7, windowId: 3, active: true, url: "https://ok.example/p", title: "P", incognito: true }, { id: 8, windowId: 3, active: false, url: "chrome://newtab/", incognito: true }, tabs[0]], ["ok.example"], []);
+  assert(red[0].incognito === true && red[0].url === "https://ok.example/p" && red[1].incognito === true && red[1].url === "redacted" && !("incognito" in red[2]), "redactTabs: incognito tabs are marked (also when redacted); normal tabs carry no flag");
   red = B.redactTabs(tabs, [], []);
   assert(red[2].url === "https://no.example" && red[1].url === "redacted", "redactTabs: empty allowlist still redacts privileged tabs");
   assert(B.blankUrl("about:blank") && B.blankUrl("chrome://newtab/") && B.blankUrl("") && B.blankUrl(undefined) && !B.blankUrl("chrome://extensions"), "blankUrl");

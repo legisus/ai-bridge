@@ -40,7 +40,7 @@
   const withEvents = (fn) => { const p = evQueue.then(fn, fn); evQueue = p.catch(() => {}); return p; };
   const EVENT_LIMIT = 200;
   const EVENT_KINDS = new Set(["connect", "disconnect", "superseded", "grant", "revoke", "refused", "tab_opened", "tab_closed", "download_started", "download_cancelled", "attach", "detach"]);
-  const REASONS = new Set(["access_revoked", "access_not_granted", "privileged_target", "not_allowed", "target_changed", "extension_disconnected"]);
+  const REASONS = new Set(["access_revoked", "access_not_granted", "privileged_target", "not_allowed", "target_changed", "extension_disconnected", "tab_unidentified"]);
   const SOURCES = new Set(["popup", "options", "alarm", "reload", "startup", "token-change", "auto"]);
 
   // ---- access record, generation, transition ------------------------------
@@ -257,6 +257,7 @@
         const ok = this.isHttpUrl(t.url) && this.hostAllowed(new URL(t.url).hostname, allowlist);
         const base = { id: t.id, windowId: t.windowId, active: t.active };
         if (agentTabIds.includes(t.id)) base.agent = true;
+        if (t.incognito) base.incognito = true;
         return ok ? { ...base, url: t.url, title: t.title } : { ...base, url: "redacted" };
       });
     },
