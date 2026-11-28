@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 // Source-level guards for deploy/docker-chrome (docs/DOCKER-CHROME.md): what the
-// files must never say. The running container is covered by
-// test/docker-chrome-smoke.sh (needs Docker; not part of `npm test`).
+// files must and must never SAY. These are structural checks — they match text
+// in the sources. They prove that a flag, a bound or a guard is written down,
+// not that it works: behaviour is tested by test/docker-chrome.helper.test.sh
+// (the helper against a stand-in docker), test/docker-chrome-loop.sh (the Chrome
+// loop and the stop script as processes, in containers) and
+// test/docker-chrome-smoke.sh (the real thing; both need Docker and are not part
+// of `npm test`).
 const fs = require("fs");
 const path = require("path");
 const root = path.join(__dirname, "..");
@@ -16,6 +21,7 @@ const compose = read("deploy/docker-chrome/compose.yml");
 const helper = read("bin/bridge-docker");
 const relay = read("deploy/docker-chrome/root/etc/s6-overlay/s6-rc.d/svc-relay/run");
 const provision = read("deploy/docker-chrome/provision.py");
+const stop = read("deploy/docker-chrome/chrome-stop.sh");
 
 // image: Google Chrome on a browser-less base, never Chromium
 assert(/^ARG BASE_IMAGE=ghcr\.io\/linuxserver\/baseimage-selkies@sha256:[0-9a-f]{64}$/m.test(dockerfile), "base image is the browser-less Selkies base, pinned by a full digest");
@@ -36,13 +42,19 @@ for (const good of ['--user-data-dir="$PROFILE"', '--remote-debugging-port="$DEB
 }
 assert(/PROFILE="\$\{CHROME_PROFILE_DIR:-\/config\/profile\}"/.test(start), "the profile directory is explicit and not Chrome's default (the debug port needs that)");
 assert(/pgrep -x chrome/.test(start) && !/pkill -f|pkill[^\n]*chrome/.test(code(start)) && !/pkill/.test(code(helper)), "Chrome is matched by process name; nothing pkills Chrome by pattern");
-assert(/\.chrome-profile\.lock/.test(start) && /dirname "\$PROFILE"/.test(start), "the Chrome loop's lock lives on the profile volume (one Chrome per profile across containers)");
-assert(/curl -fsS -m 2 /.test(start) && /kill -KILL "\$CHROME_PID"/.test(start) && /timeout -k 5 180 /.test(start), "every wait in the Chrome loop is bounded (CDP probe, provisioning run, stop escalation)");
-assert(/canon\(\) \{ \(cd "\$1" 2>\/dev\/null && pwd -P\)/.test(helper) && /lock_up\n    prepare_dirs\n    guard_up/.test(helper), "bridge-docker compares canonical paths and serializes `up`");
+assert(/\.chrome-profile\.lock/.test(start) && /dirname "\$PROFILE"/.test(start), "structure: the Chrome loop's lock file is on the profile volume");
+assert(!/9>&-\s*&\s*\n\s*CHROME_PID=/.test(start) && !/"\$START_URL"[^\n]*9>&-/.test(start), "structure: the Chrome start line does not close the lock descriptor (the browser keeps the profile lock for its own lifetime)");
+assert(/curl -fsS -m 2 /.test(start) && /kill -KILL "\$CHROME_PID"/.test(start) && /timeout -k 5 180 /.test(start), "structure: the Chrome loop's waits carry a bound in the source (CDP probe timeout, provisioning timeout, KILL after TERM) — the behaviour is in test/docker-chrome-loop.sh");
+assert(/canon\(\) \{ \(cd "\$1" 2>\/dev\/null && pwd -P\)/.test(helper) && /create_locked\(\) \{\n[^\n]*\n  prepare_dirs\n  guard_up/.test(helper), "structure: bridge-docker compares canonical paths; checks and creation are one function");
+assert(/with_up_lock "\$BASH" "\$SELF"[^\n]*__create/.test(helper) && /lockf -k -t/.test(helper) && /flock -w/.test(helper) && !/rm -rf "\$UP_LOCK"/.test(helper) && !/mkdir "\$UP_LOCK"/.test(helper), "structure: `up` runs checks + creation under an OS-held lock (lockf/flock); no lock directory, no stale-lock removal");
+assert(/ps -a -q chrome/.test(helper) && /docker port "\$mine"/.test(helper), "structure: the project's own container is looked up in any state, and its ports are asked from Docker");
+assert(/ps eww -o command=/.test(helper) && /AI_BRIDGE_HOME=/.test(helper) && !/&& pgrep -f "server\/server\\\.js" > \/dev\/null/.test(helper), "structure: a host relay's state directory is read from that process's environment (a server.js process alone is not a refusal)");
 assert(/must be mode 700/.test(helper) && /with mode 600/.test(helper), "bridge-docker refuses a state directory or token that others can read");
-assert(/provision\.py/.test(start) && /while kill -0 "\$pid"/.test(start), "provisioning runs after every Chrome start and is retried while that Chrome lives");
-assert(/flock -n 9/.test(start), "one Chrome loop per container");
-assert(/provision\.py --quit/.test(start) && /provision\.py --quit/.test(helper) && /cdp\.call\("Browser\.close"\)/.test(provision) && !/pkill/.test(code(helper)), "Chrome is stopped through DevTools Browser.close (cookies are written out); SIGTERM to the browser process is only the fallback");
+assert(/provision\.py/.test(start) && /while kill -0 "\$pid"/.test(start), "structure: provisioning follows every Chrome start, in a retry loop tied to that Chrome's pid");
+assert(/flock -n 9/.test(start) && /until flock -n 9/.test(start), "structure: the loop takes the profile lock without blocking, and waits (never starts Chrome) while it is held");
+assert(/provision\.py --quit/.test(start) && /provision\.py --quit/.test(stop) && /chrome-stop\.sh/.test(helper) && /cdp\.call\("Browser\.close"\)/.test(provision) && !/pkill/.test(code(helper)) && !/pkill/.test(code(stop)), "structure: Chrome is stopped through DevTools Browser.close first; SIGTERM to the browser pid is the fallback (statuses: test/docker-chrome-loop.sh)");
+assert(!/stop_chrome[^\n]*\|\| true/.test(helper) && !/stop_chrome[^\n]*\|\| echo/.test(helper) && /NOT removed/.test(helper) && /NOT replaced/.test(helper), "structure: no stop_chrome result is discarded; a failed stop keeps the container");
+assert(/TEMP_TARGETS/.test(provision) && /cleanup NOT verified/.test(provision), "structure: provision.py keeps the ids of its temporary tabs and reports a cleanup it could not verify");
 
 // compose: loopback only, the debug port unpublished, no user override
 const ports = [...compose.matchAll(/^\s*-\s*"([^"]+)"\s*(?:#.*)?$/gm)].map((m) => m[1]).filter((p) => /:\d+$/.test(p));

@@ -118,6 +118,13 @@ def evaluate(cdp, session, expression):
     return (r.get("result") or {}).get("value")
 
 
+# Throwaway tabs that were created and are not yet known to be closed. A close
+# goes through the connection that created the tab; when that connection is
+# dead the close cannot happen there, so the ids stay here and
+# cleanup_temp_targets() closes them through a fresh connection.
+TEMP_TARGETS = []
+
+
 class Page:
     """A throwaway tab on `url`, closed on exit."""
 
@@ -126,6 +133,7 @@ class Page:
 
     def __enter__(self):
         self.target = self.cdp.call("Target.createTarget", url=self.url, background=True)["targetId"]
+        TEMP_TARGETS.append(self.target)
         try:
             self.session = self.cdp.call("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         except BaseException:
@@ -140,8 +148,41 @@ class Page:
         try:
             self.cdp.call("Target.closeTarget", targetId=self.target)
         except Exception:
-            pass
+            return False                      # not closed as far as we know: the id stays in TEMP_TARGETS
+        if self.target in TEMP_TARGETS:
+            TEMP_TARGETS.remove(self.target)
         return False
+
+
+def cleanup_temp_targets(connect, attempts=3, sleep=time.sleep):
+    """Close the throwaway tabs whose close did not go through (a dead
+    connection, a refused call), over a FRESH connection, and check against the
+    browser's own target list that they are gone. Bounded: `attempts`
+    connections, each with the transport's timeouts. Returns the ids that could
+    not be verified as closed (empty = nothing left behind)."""
+    pending = list(TEMP_TARGETS)
+    for i in range(attempts):
+        if not pending:
+            break
+        if i:
+            sleep(1)                          # a close is applied asynchronously; a browser may be restarting
+        conn = None
+        try:
+            conn = connect()
+            for target in pending:
+                try:
+                    conn.call("Target.closeTarget", targetId=target)
+                except ProvisionError:
+                    pass                      # already gone, or refused: the listing below decides
+            present = set(t.get("targetId") for t in conn.call("Target.getTargets").get("targetInfos", []))
+            pending = [t for t in pending if t in present]
+        except Exception:
+            pass                              # no connection, or it died too: try again, then report
+        finally:
+            if conn is not None and hasattr(conn, "close"):
+                conn.close()
+    del TEMP_TARGETS[:]
+    return pending
 
 
 # ---------- steps ----------
@@ -351,7 +392,19 @@ def open_extension_context(cdp, ext_id, wait=15, sleep=time.sleep):
         raise ProvisionError("no extension context for chrome.storage (options page: %s; %s)" % (last, e))
 
 
-def provision(cdp, token, ping=relay_ping, sleep=time.sleep, out=print):
+def provision(cdp, token, ping=relay_ping, sleep=time.sleep, out=print, connect=None):
+    """The whole run. Whatever happens in it, the throwaway tabs it opened are
+    closed — through a fresh connection when the run's own one could not — and
+    a tab whose removal could not be verified is reported, never silently left."""
+    try:
+        return run_steps(cdp, token, ping=ping, sleep=sleep, out=out)
+    finally:
+        left = cleanup_temp_targets(connect or Cdp, sleep=sleep)
+        if left:
+            out("cleanup NOT verified: %d temporary tab(s) may still be open in Chrome (target %s)" % (len(left), ", ".join(left)))
+
+
+def run_steps(cdp, token, ping=relay_ping, sleep=time.sleep, out=print):
     with Page(cdp, "chrome://extensions/") as manager:
         turned_on = ensure_developer_mode(manager, sleep=sleep)
         ext_id = loaded_extension(manager)

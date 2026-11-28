@@ -55,18 +55,10 @@ host_processes() {
   for l in ${HOST_WATCH_LABELS:-}; do out="$out $l:$(launchctl list 2>/dev/null | awk -v l="$l" '$3==l {print $1}')"; done
   echo "$out"
 }
-teardown_done=0
-leftovers() { docker ps -aq --filter "name=^ai-bridge-chrome-$RUN" 2>/dev/null; }
-teardown() {
-  [ "$teardown_done" = 1 ] && return 0; teardown_done=1
-  if [ "${KEEP:-0}" = 1 ]; then echo "KEEP=1: $BRIDGE_DOCKER_PROJECT left running (relay 127.0.0.1:$BRIDGE_PUBLISH_PORT, screen http://127.0.0.1:$SCREEN_PUBLISH_PORT, files $BRIDGE_DOCKER_HOME)"; return 0; fi
-  BD down > /dev/null 2>&1 || true
-  # Only this run's own containers (name prefix ai-bridge-chrome-$RUN) are ever removed here.
-  leftovers | while read -r c; do docker rm -f "$c" > /dev/null 2>&1; done
-  # The scratch directories go only once no container of this run is left;
-  # otherwise they stay for a look.
-  if [ -z "$(leftovers)" ]; then rm -rf "$BRIDGE_DOCKER_HOME"; else echo "teardown: containers still present ($(leftovers | paste -sd, -)); files kept in $BRIDGE_DOCKER_HOME"; fi
-}
+# Teardown: only this run's containers and files; the files go only when Docker
+# has confirmed that the containers are gone (test/helpers/smoke-teardown.sh).
+SMOKE_EXTRA_IMAGES=""
+. "$REPO/test/helpers/smoke-teardown.sh"
 trap teardown EXIT
 
 HOST_BEFORE="$(host_identity)"; HOSTP_BEFORE="$(host_processes)"
@@ -100,6 +92,11 @@ HANG="$(docker run --rm --entrypoint bash -e CHROME_BIN=/tmp/fake-chrome -e CHRO
   sleep 1; timeout 22 /usr/local/bin/chrome-start.sh; echo "loop exit $?"; pgrep -c -x sleep; cat /config/chrome-start.log' 2>&1)"
 if grep -q "debug port never opened within 4 s; stopping it" <<< "$HANG" && [ "$(grep -c "before its debug port opened" <<< "$HANG")" -ge 2 ]; then pass "a Chrome that never opens its debug port is stopped at the deadline and restarted (no endless wait)"; else fail "pre-CDP hang handling: $(tail -n 6 <<< "$HANG" | tr '\n' '|')"; fi
 
+# ---- 1c) the loop and the stop script as processes, with a stand-in browser ----
+# (supervisor death, a stop during provisioning, clean / forced / failed stops)
+if LOOP_OUT="$(CHROME_IMAGE="$CHROME_IMAGE" bash "$REPO/test/docker-chrome-loop.sh" 2>&1)"; then pass "loop and stop-script behaviour ($(grep -c '^PASS' <<< "$LOOP_OUT") cases, test/docker-chrome-loop.sh)"; else fail "loop and stop-script behaviour (test/docker-chrome-loop.sh)"; fi
+grep -E '^(PASS|FAIL|      )' <<< "$LOOP_OUT" | sed 's/^/      /'
+
 # ---- 2) up ------------------------------------------------------------------
 if BD up > "/tmp/docker-chrome-smoke-up.$$" 2>&1; then pass "bridge-docker up: relay reports session docker-chrome, access granted"; else fail "bridge-docker up"; tail -15 "/tmp/docker-chrome-smoke-up.$$"; BD logs chrome 2>&1 | tail -20; exit 1; fi
 rm -f "/tmp/docker-chrome-smoke-up.$$"
@@ -119,6 +116,7 @@ if [ "$EXE" = /opt/google/chrome/chrome ]; then pass "the running browser execut
 CMDLINE="$(docker exec -u abc "$CID" sh -c 'tr "\0" " " < /proc/$(pgrep -o -x chrome)/cmdline')"
 check "Chrome runs without --no-sandbox / --test-type / --headless" '! grep -qE -- "--no-sandbox|--test-type|--headless|--disable-setuid-sandbox" <<< "$CMDLINE"'
 check "Chrome runs on the explicit profile directory with the loopback debug port" 'grep -q -- "--user-data-dir=/config/profile " <<< "$CMDLINE" && grep -q -- "--remote-debugging-port=9222" <<< "$CMDLINE"'
+check "the real Chrome process holds the profile lock itself (it outlives the loop that started it)" '[ "$(docker exec -u abc "$CID" sh -c "readlink /proc/\$(cat /tmp/chrome.pid)/fd/9")" = /config/.chrome-profile.lock ]'
 VER="$(docker exec "$CID" curl -fsS http://127.0.0.1:9222/json/version)"
 check "CDP /json/version: Browser is Chrome/<version>" '[[ "$(jget Browser <<< "$VER")" == Chrome/* ]]'
 SANDBOX="$(docker exec -u abc "$CID" /lsiopy/bin/python3 -I -c '
@@ -213,10 +211,17 @@ else
 fi
 
 # ---- 7) container restart -----------------------------------------------------
+BS3="$(jget browserSession < "$BRIDGE_DATA_DIR/tabs.json" 2>/dev/null)"
+STALE2="$(B newTab '{"url":"https://example.com/?left-open-2"}' | jget id)"   # owned by this browser session; the whole container is about to restart under it
 docker restart "$CID" > /dev/null 2>&1
 sleep 5
 if wait_ready 150; then
   P4="$(B ping)"
+  BS4="$(jget browserSession < "$BRIDGE_DATA_DIR/tabs.json" 2>/dev/null)"
+  if [ -n "$BS3" ] && [ -n "$BS4" ] && [ "$BS3" != "$BS4" ]; then pass "after a container restart: a fresh browserSession in the relay's registry"; else fail "browserSession before/after a container restart: '$BS3' / '$BS4'"; fi
+  OWN="$(B status | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("agentTabs") or []))')"
+  REG="$(B tabs --json 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(len(d["current"]), int(sys.argv[1]) in [t["tabId"] for t in d["current"]])' "$STALE2" 2>&1)"
+  if [ -n "$STALE2" ] && [ "$OWN" = 0 ] && [ "$REG" = "0 False" ]; then pass "after a container restart: no ownership carried over (the extension owns no tab; the registry has no current tab)"; else fail "stale ownership after a container restart: tab=$STALE2 agentTabs=$OWN registry(current count, old tab still current)=$REG"; fi
   check "after a container restart: green again with a new relay (new serverId)" '[ -n "$(jget serverId <<< "$P4")" ] && [ "$(jget serverId <<< "$P4")" != "$SERVER1" ]'
   check "after a container restart: the token is the same file content" '[ "$(shasum -a 256 "$BRIDGE_DATA_DIR/token" | cut -d" " -f1)" = "$TOKEN_SUM1" ]'
   functional "after container restart"
@@ -245,6 +250,27 @@ else
   fail "bridge-docker up after down"; BD logs chrome 2>&1 | tail -15
 fi
 
+# ---- 8b) replacement: `up` with another image right after a cookie was set ------
+# The advertised rebuild-and-up path. Compose replaces the container; the helper
+# must have closed Chrome cleanly BEFORE that, or this cookie is lost.
+REPL_IMAGE="ai-bridge-chrome-$RUN:replace"
+if printf 'FROM %s\nLABEL ai-bridge.smoke.replace=%s\n' "$CHROME_IMAGE" "$RUN" | docker build -q -t "$REPL_IMAGE" - > /dev/null 2>&1; then
+  SMOKE_EXTRA_IMAGES="$REPL_IMAGE"
+  B eval "{\"tabId\":$(B newTab '{"url":"https://example.com"}' | jget id),\"code\":\"document.cookie='replace=$RUN; max-age=3600; path=/'; 1\"}" > /dev/null 2>&1
+  OLD_CID="$CID"
+  OUT="$(CHROME_IMAGE="$REPL_IMAGE" BD up 2>&1)"; RC=$?
+  CID="$(C)"
+  check "up with a new image: Chrome is closed cleanly first, then the container is replaced" '[ "$RC" = 0 ] && grep -q "closing Chrome before it is replaced" <<< "$OUT" && grep -q "Chrome closed cleanly" <<< "$OUT" && [ -n "$CID" ] && [ "$CID" != "$OLD_CID" ] && [ "$(docker inspect "$CID" --format "{{.Config.Image}}")" = "$REPL_IMAGE" ]'
+  T="$(B newTab '{"url":"https://example.com"}' | jget id)"; sleep 3
+  OUT="$(B eval "{\"tabId\":$T,\"code\":\"(document.cookie.match(/replace=([^;]+)/)||[])[1]\"}" 2>&1)"
+  if [ "$OUT" = "\"$RUN\"" ]; then pass "replaced: a cookie set immediately before the replacement is still there"; else fail "replaced: cookie set before the replacement: $OUT"; fi
+  B closeTab "{\"tabId\":$T}" > /dev/null 2>&1
+  OUT="$(CHROME_IMAGE="$REPL_IMAGE" BD up 2>&1)"; RC=$?
+  check "up again with nothing changed: the container and its Chrome are left alone" '[ "$RC" = 0 ] && ! grep -q "closing Chrome" <<< "$OUT" && [ "$(C)" = "$CID" ]'
+else
+  fail "could not build the replacement image $REPL_IMAGE"
+fi
+
 # ---- 9) the guards (nothing below may start a container) -----------------------
 N_BEFORE="$(docker ps -aq | wc -l | tr -d ' ')"
 P2="$(free_port)"; S2="$(free_port)"
@@ -263,7 +289,7 @@ if [ "$HOST_BEFORE" != none ]; then
   # the LIVE state directory under an alias, with its own ports and profile: refused while the host relay runs (nothing is written to it)
   for ALIAS in "$HOME/.ai-browser-bridge/" "$HOME/./.ai-browser-bridge"; do
     OUT="$(BRIDGE_DOCKER_PROJECT="${BRIDGE_DOCKER_PROJECT}-d" BRIDGE_PUBLISH_PORT="$P2" SCREEN_PUBLISH_PORT="$S2" CHROME_CONFIG_DIR="$BRIDGE_DOCKER_HOME/config-d" CHROME_DOWNLOADS_DIR="$BRIDGE_DOCKER_HOME/downloads-d" BRIDGE_DATA_DIR="$ALIAS" "$HELPER" --staging up 2>&1)"
-    check "the host relay's state directory is refused under the alias ${ALIAS#$HOME/}" 'grep -q "a host relay is running on ~/.ai-browser-bridge" <<< "$OUT"'
+    check "the host relay's state directory is refused under the alias ${ALIAS#$HOME/}" 'grep -q "a host relay is running on .*/\.ai-browser-bridge (pid" <<< "$OUT"'
   done
 fi
 mkdir -m 755 "$BRIDGE_DOCKER_HOME/data-open"
@@ -276,7 +302,16 @@ check "none of the refused starts created a container" '[ "$(docker ps -aq | wc 
 RIVAL="$(docker run -d --name "ai-bridge-chrome-$RUN-rival" --security-opt seccomp=unconfined --shm-size 1g -e PUID="$(id -u)" -e PGID="$(id -g)" -v "$CHROME_CONFIG_DIR:/config" -v "$BRIDGE_DOCKER_HOME/data-rival:/data" "$CHROME_IMAGE" 2>/dev/null)"
 for _ in $(seq 1 30); do grep -q "in use by another chrome-start loop" "$CHROME_CONFIG_DIR/chrome-start.log" 2>/dev/null && break; sleep 2; done
 check "a second container on the same profile volume does not start Chrome (profile lock)" 'grep -q "in use by another chrome-start loop" "$CHROME_CONFIG_DIR/chrome-start.log" && [ "$(docker exec "$RIVAL" pgrep -c -x chrome)" = 0 ] && [ "$(docker exec -u abc "$CID" sh -c "pgrep -x chrome -a | grep -vc -- --type=")" = 1 ] && B ping | grep -q "\"access\":\"granted\""'
+# …and the same when the loop that started the Chrome is dead while its Chrome
+# lives on: the rival cannot see that Chrome (another pid namespace); only the
+# lock, held by the browser itself, keeps it off the profile.
+docker exec -u abc "$CID" sh -c 'kill -KILL "$(cat /tmp/chrome-start.pid)"'
+sleep 14                                  # the rival asks for the lock every 5 s
+check "the loop is killed, its Chrome lives on: the Chrome still holds the profile lock" '[ "$(docker exec "$CID" pgrep -c -f "chrome-start.sh")" = 0 ] && [ "$(docker exec -u abc "$CID" sh -c "pgrep -x chrome -a | grep -vc -- --type=")" = 1 ] && [ "$(docker exec -u abc "$CID" sh -c "readlink /proc/\$(cat /tmp/chrome.pid)/fd/9")" = /config/.chrome-profile.lock ]'
+check "…so the second container still starts no Chrome and the Singleton links are untouched" '[ "$(docker exec "$RIVAL" pgrep -c -x chrome)" = 0 ] && ! grep -q "free again" "$CHROME_CONFIG_DIR/chrome-start.log" && docker exec "$CID" test -L /config/profile/SingletonLock && B ping | grep -q "\"access\":\"granted\""'
 docker rm -f "$RIVAL" > /dev/null 2>&1
+OUT="$(BD down 2>&1)"; RC=$?
+check "down with a dead loop: the orphaned Chrome is still closed cleanly (status 0), the container is gone" '[ "$RC" = 0 ] && grep -q "Chrome closed cleanly" <<< "$OUT" && [ -z "$(C)" ]'
 # two `up`s at the same moment on one fresh profile: exactly one may win
 ( BRIDGE_DOCKER_PROJECT="ai-bridge-chrome-$RUN-r1" BRIDGE_PUBLISH_PORT="$(free_port)" SCREEN_PUBLISH_PORT="$(free_port)" CHROME_CONFIG_DIR="$BRIDGE_DOCKER_HOME/config-race" BRIDGE_DATA_DIR="$BRIDGE_DOCKER_HOME/data-r1" "$HELPER" --staging up > "$BRIDGE_DOCKER_HOME/race1.log" 2>&1; echo "rc=$?" >> "$BRIDGE_DOCKER_HOME/race1.log" ) &
 ( BRIDGE_DOCKER_PROJECT="ai-bridge-chrome-$RUN-r2" BRIDGE_PUBLISH_PORT="$(free_port)" SCREEN_PUBLISH_PORT="$(free_port)" CHROME_CONFIG_DIR="$BRIDGE_DOCKER_HOME/config-race" BRIDGE_DATA_DIR="$BRIDGE_DOCKER_HOME/data-r2" "$HELPER" --staging up > "$BRIDGE_DOCKER_HOME/race2.log" 2>&1; echo "rc=$?" >> "$BRIDGE_DOCKER_HOME/race2.log" ) &
@@ -287,8 +322,8 @@ for r in r1 r2; do BRIDGE_DOCKER_PROJECT="ai-bridge-chrome-$RUN-$r" CHROME_CONFI
 
 # ---- 10) teardown first, then: the Mac is exactly as it was --------------------
 if [ "${KEEP:-0}" != 1 ]; then
-  teardown
-  check "teardown: no container of this run, no files, both ports released" '[ -z "$(leftovers)" ] && [ ! -e "$BRIDGE_DOCKER_HOME" ] && ! nc -z -w 1 127.0.0.1 "$BRIDGE_PUBLISH_PORT" && ! nc -z -w 1 127.0.0.1 "$SCREEN_PUBLISH_PORT"'
+  teardown; TEARDOWN_RC=$?
+  check "teardown: Docker confirms no container of this run, no files, both ports released" '[ "$TEARDOWN_RC" = 0 ] && LEFT="$(leftovers)" && [ -z "$LEFT" ] && [ ! -e "$BRIDGE_DOCKER_HOME" ] && ! nc -z -w 1 127.0.0.1 "$BRIDGE_PUBLISH_PORT" && ! nc -z -w 1 127.0.0.1 "$SCREEN_PUBLISH_PORT"'
 else
   teardown
 fi

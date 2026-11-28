@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# A stand-in `docker` for test/docker-chrome.helper.test.sh: just the calls
+# bin/bridge-docker and the smoke job's teardown make, against a directory of
+# pretend containers ($FAKE_DOCKER/containers/<id>/{name,project,state,image,hash,mounts,ports}).
+# Every call is appended to $FAKE_DOCKER/log. Nothing here talks to a real Docker.
+set -u
+S="${FAKE_DOCKER:?FAKE_DOCKER is not set}"
+mkdir -p "$S/containers"
+echo "$*" >> "$S/log"
+knob() { cat "$S/$1" 2>/dev/null || echo "${2:-}"; }        # a test's switch: a file in $S
+containers() { ls "$S/containers" 2>/dev/null; }
+field() { cat "$S/containers/$1/$2" 2>/dev/null; }
+full_id() { local c; for c in $(containers); do case "$c" in "$1"*) echo "$c"; return 0;; esac; done; return 1; }
+
+case "${1:-}" in
+  info) exit "$(knob info-rc 0)" ;;
+  image)                                   # image inspect <tag> [--format …]
+    [ -n "$(knob "image-$3" "$(knob image-id sha256:image-one)")" ] || exit 1
+    knob "image-$3" "$(knob image-id sha256:image-one)" ;;
+  compose)
+    shift; project=""
+    while [ $# -gt 0 ]; do case "$1" in -f) shift 2;; -p) project="$2"; shift 2;; *) break;; esac; done
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      ps)
+        all=no; for a in "$@"; do case "$a" in -a|--all) all=yes;; esac; done
+        for c in $(containers); do
+          [ "$(field "$c" project)" = "$project" ] || continue
+          if [ "$all" = yes ] || [ "$(field "$c" state)" = running ]; then echo "$c"; fi
+        done ;;
+      config) echo "chrome $(knob config-hash hash-one)" ;;
+      up)
+        # the window in which a second, unserialized `up` would also have passed its checks
+        sleep "$(knob up-sleep 0)"
+        for c in $(containers); do [ "$(field "$c" project)" = "$project" ] && rm -rf "$S/containers/$c"; done
+        id="$(printf '%s' "$project$$" | shasum -a 256 | cut -c1-64)"
+        d="$S/containers/$id"; mkdir -p "$d"
+        echo "$project-chrome-1" > "$d/name"; echo "$project" > "$d/project"; echo running > "$d/state"
+        knob "image-$CHROME_IMAGE" "$(knob image-id sha256:image-one)" > "$d/image"; knob config-hash hash-one > "$d/hash"
+        printf '%s\n%s\n%s\n' "$CHROME_CONFIG_DIR" "$CHROME_DOWNLOADS_DIR" "$BRIDGE_DATA_DIR" > "$d/mounts"
+        printf '8765/tcp -> 127.0.0.1:%s\n3000/tcp -> 127.0.0.1:%s\n' "$BRIDGE_PUBLISH_PORT" "$SCREEN_PUBLISH_PORT" > "$d/ports" ;;
+      down) for c in $(containers); do [ "$(field "$c" project)" = "$project" ] && rm -rf "$S/containers/$c"; done; exit 0 ;;
+      *) echo "fake-docker: compose $sub?" >&2; exit 64 ;;
+    esac ;;
+  ps)                                      # ps -a --format …  |  ps -aq --filter name=^prefix
+    rc="$(knob ps-rc 0)"; [ "$rc" = 0 ] || { echo "Cannot connect to the Docker daemon" >&2; exit "$rc"; }
+    case "$*" in
+      *--filter*) prefix="$(sed -n 's/.*name=^\([^ ]*\).*/\1/p' <<< "$*")"
+        for c in $(containers); do case "$(field "$c" name)" in "$prefix"*) echo "${c:0:12}";; esac; done ;;
+      *) for c in $(containers); do echo "${c:0:12} $(field "$c" name) $(field "$c" state)"; done ;;
+    esac ;;
+  inspect)
+    c="$(full_id "$2")" || exit 1
+    case "$*" in
+      *Mounts*) field "$c" mounts ;;
+      *config-hash*) field "$c" hash ;;
+      *.Image*) field "$c" image ;;
+      *) exit 64 ;;
+    esac ;;
+  port) c="$(full_id "$2")" || exit 1; [ "$(field "$c" state)" != running ] || field "$c" ports ;;
+  exec)                                    # the only exec the tests reach: the Chrome stop script on stdin
+    cat > "$S/last-exec-stdin"
+    exit "$(knob stop-rc 0)" ;;
+  rm) c="$(full_id "$3")" && [ "$(knob rm-works yes)" = yes ] && rm -rf "$S/containers/$c"; exit 0 ;;
+  *) echo "fake-docker: $1?" >&2; exit 64 ;;
+esac

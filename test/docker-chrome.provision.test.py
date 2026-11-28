@@ -53,7 +53,7 @@ class FakeChrome:
             return {}
         if method == "Target.getTargets":
             sw = [{"type": "service_worker", "url": "chrome-extension://%s/background.js" % EXT, "targetId": "SW"}] if (self.worker and self.loaded and self.enabled) else []
-            return {"targetInfos": sw}
+            return {"targetInfos": sw + [{"type": "page", "url": u, "targetId": t} for t, u in self.open.items()]}
         if method == "Runtime.evaluate":
             url = "worker" if session == "S-SW" else self.open[session[2:]]
             return {"result": {"value": self.js(url, params["expression"])}}
@@ -83,10 +83,18 @@ class FakeChrome:
         raise AssertionError("unexpected page script: " + expr[:60])
 
 
-def run(chrome, pong=None):
-    lines = []
+FRESH_CONNECTS = []   # every fresh connection the cleanup asked for, across the whole file
+
+
+def no_fresh_connection():
+    FRESH_CONNECTS.append("unexpected")
+    raise ConnectionError("this case must not need a fresh connection")
+
+
+def run(chrome, pong=None, connect=no_fresh_connection, lines=None):
+    lines = [] if lines is None else lines
     pong = pong if pong is not None else {"pong": True, "session": "docker-chrome", "access": "granted", "extGen": 1}
-    P.provision(chrome, TOKEN, ping=lambda: pong, sleep=lambda s: None, out=lines.append)
+    P.provision(chrome, TOKEN, ping=lambda: pong, sleep=lambda s: None, out=lines.append, connect=connect)
     return lines
 
 
@@ -172,16 +180,77 @@ except P.ProvisionError:
 
 
 class SocketDies(FakeChrome):
+    """The connection dies during an evaluation and STAYS dead, as a closed
+    socket does: every later call on it fails too, the close of the tab
+    included. The browser itself (its open tabs) lives on."""
+    dead = False
+
+    def call(self, method, session=None, **params):
+        if self.dead:
+            self.calls.append(method + " (dead socket)")
+            raise ConnectionError("websocket closed")
+        return super().call(method, session=session, **params)
+
     def js(self, url, expr):
         if "location.protocol" in expr:
+            self.dead = True
             raise ConnectionError("websocket closed")     # not a ProvisionError: the transport itself
         return super().js(url, expr)
 
+
+class FreshConnection:
+    """A new DevTools connection to the same (fake) browser."""
+
+    def __init__(self, browser):
+        self.browser, self.closed = browser, False
+
+    def call(self, method, session=None, **params):
+        return FakeChrome.call(self.browser, method, session=session, **params)
+
+    def close(self):
+        self.closed = True
+
+
 c9 = SocketDies()
+fresh = []
+out9 = []
 try:
-    run(c9); check(False, "a transport error while waiting for the options page fails the run")
+    run(c9, connect=lambda: fresh.append(FreshConnection(c9)) or fresh[-1], lines=out9); check(False, "a connection that dies while waiting for the options page fails the run")
 except ConnectionError:
-    check(c9.open == {}, "a transport error while waiting for the options page: the tab is closed before the error goes up")
+    check("Target.closeTarget (dead socket)" in c9.calls and len(c9.open) == 0, "a dead connection: the close on it fails, and the tab is closed through a fresh connection")
+    check(len(fresh) == 1 and fresh[0].closed and not any("NOT verified" in l for l in out9), "…with one fresh connection, closed again, and nothing to report")
+check(P.TEMP_TARGETS == [], "the list of temporary tabs is empty after the run")
+
+# the browser cannot be reached again at all: bounded attempts, and the tab is REPORTED
+c10 = SocketDies()
+attempts = []
+out10 = []
+def refused():
+    attempts.append(1)
+    raise ConnectionError("connection refused")
+try:
+    run(c10, connect=refused, lines=out10); check(False, "a dead connection and no way back fails the run")
+except ConnectionError:
+    left = list(c10.open)
+    check(len(left) == 1 and len(attempts) == 3, "no fresh connection either: three attempts, then it stops (bounded)")
+    check(any("cleanup NOT verified" in l and left[0] in l for l in out10), "…and the tab that may still be open is reported with its target id")
+check(P.TEMP_TARGETS == [], "the list of temporary tabs does not leak into the next run")
+
+# a close that is refused on a live connection is also verified against the target list
+class CloseRefused(FakeChrome):
+    def call(self, method, session=None, **params):
+        if method == "Target.closeTarget" and not getattr(self, "relent", False):
+            self.calls.append(method); raise P.ProvisionError("Target.closeTarget: refused")
+        return super().call(method, session=session, **params)
+
+c11 = CloseRefused()
+out11 = []
+def relenting():
+    c11.relent = True
+    return FreshConnection(c11)
+run(c11, connect=relenting, lines=out11)
+check(c11.open == {} and not any("NOT verified" in l for l in out11), "a close that did not go through on a live connection is repeated and verified afterwards")
+check(FRESH_CONNECTS == [], "a run whose own closes all succeed never opens a second connection")
 
 print("\n%d TEST(S) FAILED" % failures if failures else "\nAll provision tests passed.")
 sys.exit(1 if failures else 0)

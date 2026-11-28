@@ -27,6 +27,20 @@ jobs and the CLI stay on the Mac. Guide: `docs/DOCKER-CHROME.md`; design:
   Docker).
 - `.dockerignore` no longer excludes `extension/` (the new image copies it; the 0.1.11
   image still copies `server/` only).
+- Review fixes: `up` reads which state directory a host relay works in from that
+  process (a relay on another directory no longer blocks production), recovers the
+  project's own stopped container, and runs its checks and the creation under an
+  OS-held lock (no stale lock to recover). The browser process itself holds the profile
+  lock, so it survives the death of its start loop. Every stop goes through
+  `deploy/docker-chrome/chrome-stop.sh` and is reported as clean (0), forced (3) or failed
+  (1): `up` closes Chrome before it replaces a container, `down` keeps the container when
+  Chrome cannot be stopped (`down --force` overrides), `restart-chrome` no longer claims
+  success after a failure. Provisioning closes temporary tabs over a fresh connection
+  when its own one died, and reports what it could not verify. The smoke teardown keeps
+  its files when Docker cannot list containers. The switch-over and rollback pause and
+  resume the launchd jobs around a verified layout; variant A is the chosen layout. New
+  tests: `test/docker-chrome.helper.test.sh` (in `npm run test:docker-chrome`),
+  `test/docker-chrome-loop.sh` (needs Docker).
 
 ## 0.1.11 — access switch, target guard, tab hygiene, Docker (PRs #12–#15, November 2026)
 

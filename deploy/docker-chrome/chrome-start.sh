@@ -31,11 +31,20 @@ log() {
 # volume: a second container (or a second autostart run in this one) does not
 # get it, never removes the first one's Singleton links and never starts a
 # second Chrome on the same profile.
+#
+# The lock is held for the life of the BROWSER, not only of this loop: Chrome
+# inherits descriptor 9 (see the start below), and a lock of this kind stays
+# held while any process has the descriptor open. If this loop dies and its
+# Chrome lives on, the profile is still taken — another container cannot see
+# that Chrome (its own pid namespace), so the lock is the only thing that
+# tells it. A loop that does not get the lock waits for it; it starts Chrome
+# only once the previous owner AND its browser are gone.
 mkdir -p "$PROFILE"
 exec 9> "$(dirname "$PROFILE")/.chrome-profile.lock"
 if ! flock -n 9; then
-  log "$(hostname): the Chrome profile $PROFILE is in use by another chrome-start loop (another container?) — not starting Chrome here"
-  exit 0
+  log "$(hostname): the Chrome profile $PROFILE is in use by another chrome-start loop or by a Chrome that outlived one (another container?) — not starting Chrome here; waiting for the profile"
+  until flock -n 9; do sleep "${CHROME_LOCK_POLL:-5}"; done
+  log "$(hostname): the Chrome profile $PROFILE is free again; taking it"
 fi
 
 provision_until_ok() { # $1 = Chrome pid; retried while this Chrome lives
@@ -100,8 +109,8 @@ while true; do
     --ozone-platform=wayland --password-store=basic --no-first-run --start-maximized \
     --disable-backgrounding-occluded-windows --disable-renderer-backgrounding \
     --disable-background-timer-throttling \
-    "$START_URL" > /config/chrome.log 2>&1 9>&- &
-  CHROME_PID=$!
+    "$START_URL" > /config/chrome.log 2>&1 &
+  CHROME_PID=$!            # descriptor 9 (the profile lock) is inherited on purpose
   # The browser process (google-chrome-stable execs it): what the helper
   # waits on after it has asked Chrome to quit.
   echo "$CHROME_PID" > /tmp/chrome.pid
