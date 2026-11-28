@@ -41,6 +41,29 @@ async function config() {
   return { ...DEFAULTS, ...stored };
 }
 
+// ---------- incognito ----------
+// The manifest keeps the default "spanning" mode: one worker serves regular and
+// incognito windows (the relay accepts one extension connection, so "split" —
+// a second worker — is not an option).
+
+// Whether Chrome lets this extension see incognito windows: "yes", "no", or
+// "unknown" when the query itself fails (callers treat unknown as the cautious
+// answer for what they are doing).
+async function incognitoAccess() {
+  try {
+    if (!(chrome.extension && chrome.extension.isAllowedIncognitoAccess)) return "no";
+    return (await chrome.extension.isAllowedIncognitoAccess()) ? "yes" : "no";
+  } catch { return "unknown"; }
+}
+// A regular (non-incognito) browser window: the focused one, else any.
+async function regularWindowId() {
+  try {
+    const wins = (await chrome.windows.getAll({ windowTypes: ["normal"] })).filter((w) => w && w.incognito !== true);
+    const w = wins.find((x) => x.focused) || wins[0];
+    return w ? w.id : null;
+  } catch { return null; }
+}
+
 // ---------- access wiring ----------
 
 function setBadge({ text, color }) {
@@ -858,32 +881,80 @@ async function handle(cmd, p, gen, reqId) {
       // active:false → opens in background, never steals the user's focus.
       // newWindow:true → its own (unfocused) window, so later activateTab calls
       // never change the active tab of the user's / other automations' windows.
+      // incognito:true → its own incognito window: a clean session next to the
+      // profile's cookies (all open incognito windows share ONE session; it
+      // ends when the last of them closes).
       // The destination is checked (privileged block + allowlist); the pending
       // entry is written before Chrome is called: a tab whose id comes back
       // after a revoke is closed by completeTab, not returned.
       BridgeAccess.assertAllowedUrl(p.url, allowlist);
+      const incognito = p.incognito === true;
+      // A window of its own is a NEW window: naming an existing one as well is a
+      // contradiction, not a preference to guess at.
+      if ((incognito || p.newWindow) && p.windowId != null) throw new Error(`newTab: ${incognito ? "incognito" : "newWindow"} opens its own window and cannot be combined with windowId`);
       const nonce = await BridgeAccess.beginTab({ gen, origin: originOf(p.url), reqId });
       let tab, windowId, newWindow = false;
+      // A window this command creates: ownership is taken only of the ONE tab
+      // Chrome reports for it. A later tabs.query could name someone else's tab
+      // (the user dropped one in, the window was reused). A window whose tab
+      // cannot be identified is left alone — never closed wholesale — and
+      // reported; it is not tracked.
+      const ownWindow = async (opts, wantIncognito) => {
+        const win = await BridgeAccess.dispatch(gen, () => chrome.windows.create(opts));
+        const made = win && Array.isArray(win.tabs) ? win.tabs : [];
+        const ok = !!win && made.length === 1 && Number.isInteger(made[0].id) && (wantIncognito ? win.incognito === true && made[0].incognito === true : made[0].incognito !== true);
+        if (!ok) {
+          BridgeAccess.logEvent({ kind: "refused", origin: originOf(p.url), reqId, detail: { reason: "tab_unidentified" } }).catch(() => {});
+          throw new Error(`${wantIncognito ? "incognito " : ""}window opened but its tab could not be identified (window ${win && win.id}); it is not tracked — close it on the browser's screen`);
+        }
+        tab = made[0]; windowId = win.id; newWindow = true;
+      };
       try {
         await ck(gen);
-        if (p.newWindow) {
-          const win = await BridgeAccess.dispatch(gen, () => chrome.windows.create({ url: p.url, focused: !!p.active }));
-          tab = (win.tabs && win.tabs[0]) || (await chrome.tabs.query({ windowId: win.id }))[0];
-          windowId = win.id; newWindow = true;
+        // Can this extension see incognito windows ("Allow in incognito")?
+        //   no      → they do not exist for it; nothing below changes
+        //   yes     → a tab that did not ask for incognito must not land in one
+        //   unknown → (the query failed) treated as yes for ordinary tabs, and
+        //             as a refusal for a tab that asked for incognito
+        const sees = await incognitoAccess();
+        if (incognito) {
+          // Without the toggle Chrome would open a window this extension can
+          // neither see nor close: refuse before anything is created.
+          if (sees !== "yes") throw new Error(sees === "no"
+            ? 'incognito not allowed: turn on "Allow in incognito" for AI Browser Bridge at chrome://extensions'
+            : "incognito not allowed: Chrome did not answer the permission query");
+          await ownWindow({ url: p.url, incognito: true, focused: !!p.active }, true);
+        } else if (p.newWindow) {
+          const opts = { url: p.url, focused: !!p.active };
+          if (sees !== "no") opts.incognito = false;
+          await ownWindow(opts, false);
         } else {
           // windowId → open in that specific window (e.g. an automation's own
           // window), not whichever window was focused last.
           const opts = { url: p.url, active: !!p.active };
           if (p.windowId != null) opts.windowId = p.windowId;
-          tab = await BridgeAccess.dispatch(gen, () => chrome.tabs.create(opts));
-          windowId = tab.windowId;
+          else if (sees !== "no") {
+            // "The current window" may be an incognito one: name a regular window.
+            const regular = await regularWindowId();
+            if (regular != null) opts.windowId = regular;
+          }
+          if (opts.windowId == null && sees !== "no") {
+            // no regular window to name (only incognito ones are open, or the
+            // window list is unavailable): a regular window of its own
+            await ownWindow({ url: p.url, incognito: false, focused: !!p.active }, false);
+          } else {
+            tab = await BridgeAccess.dispatch(gen, () => chrome.tabs.create(opts));
+            windowId = tab.windowId;
+          }
         }
       } catch (e) {
         await BridgeAccess.completeTab(nonce, null);
         throw e;
       }
       if (!(await BridgeAccess.completeTab(nonce, tab.id))) throw new Error(BridgeAccess.ACCESS_REVOKED((await config()).session));
-      return newWindow ? { id: tab.id, windowId, newWindow: true } : { id: tab.id, windowId };
+      const out = newWindow ? { id: tab.id, windowId, newWindow: true } : { id: tab.id, windowId };
+      if (tab.incognito === true) out.incognito = true; // the context the tab really is in
+      return out;
     }
 
     case "navigate": {

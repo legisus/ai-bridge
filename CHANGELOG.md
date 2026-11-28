@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — Chrome in Docker (branch `docker-chrome`)
+
+The opposite of the 0.1.11 Docker layout: the **browser** lives in the container, the
+jobs and the CLI stay on the Mac. Guide: `docs/DOCKER-CHROME.md`; design:
+`docs/superpowers/specs/2026-11-26-docker-chrome-design.md`.
+
+- `deploy/docker-chrome/`: an image with Google Chrome (Google's `.deb`, no Chromium:
+  the base is the browser-less Selkies image and the build fails on any other browser),
+  Node 22, the relay and the extension; `chrome-start.sh` keeps Chrome running with its
+  own sandbox and provisions the extension after every start (`provision.py`: Developer
+  mode, load unpacked over DevTools, "Allow in incognito" + "Allow User Scripts", token
+  and session name `docker-chrome`, wait for `access granted`).
+- `bin/bridge-docker`: `build`, `up`, `down`, `status`, `restart-chrome`, `provision`,
+  `screen`, `logs`, `cli`; `--staging` runs on port 8766 with its own state next to a live
+  host relay. Guards: mounts under `$HOME` only, one container per Chrome profile, never
+  on a port or state directory a host relay owns. Chrome is stopped through DevTools
+  `Browser.close`, the only stop that leaves the cookie store on disk.
+- **`newTab {"incognito": true}`** opens the URL in an incognito window of its own (a
+  clean session next to the profile's cookies); `listTabs` marks incognito tabs. Refused
+  unless "Allow in incognito" is on. With that toggle on, an ordinary `newTab` always
+  goes to a regular window. With it off (the default) `newTab` behaves as before.
+- Tests: incognito cases in `test/extension.worker.test.js`,
+  `test/docker-chrome.files.test.js` (in `npm test`), `npm run test:docker-chrome`
+  (adds the provisioning tests, needs `python3`), `test/docker-chrome-smoke.sh` (needs
+  Docker).
+- `.dockerignore` no longer excludes `extension/` (the new image copies it; the 0.1.11
+  image still copies `server/` only).
+- Review fixes: `up` reads which state directory a host relay works in from that
+  process (a relay on another directory no longer blocks production), recovers the
+  project's own stopped container, and runs its checks and the creation under an
+  OS-held lock (no stale lock to recover). The browser process itself holds the profile
+  lock, so it survives the death of its start loop. Every stop goes through
+  `deploy/docker-chrome/chrome-stop.sh` and is reported as clean (0), forced (3) or failed
+  (1): `up` closes Chrome before it replaces a container, `down` keeps the container when
+  Chrome cannot be stopped (`down --force` overrides), `restart-chrome` no longer claims
+  success after a failure. Provisioning closes temporary tabs over a fresh connection
+  when its own one died, and reports what it could not verify. The smoke teardown keeps
+  its files when Docker cannot list containers. The switch-over and rollback pause and
+  resume the launchd jobs around a verified layout; variant A is the chosen layout. New
+  tests: `test/docker-chrome.helper.test.sh` (in `npm run test:docker-chrome`),
+  `test/docker-chrome-loop.sh` (needs Docker).
+
 ## 0.1.11 — access switch, target guard, tab hygiene, Docker (PRs #12–#15, November 2026)
 
 Four stacked pull requests implement the Docker-isolated design (`docs/DOCKER.md`,

@@ -1,0 +1,31 @@
+# Google Chrome + AI Browser Bridge extension + relay in one container.
+# Guide: docs/DOCKER-CHROME.md. Normally driven by bin/bridge-docker, which sets
+# the variables below; the defaults are the production layout (the container
+# owns the Mac's bridge port and state directory).
+#
+# Every bind mount must live under $HOME: Colima shares only the home directory,
+# and a bind mount from anywhere else silently becomes a folder inside the VM.
+name: ${BRIDGE_DOCKER_PROJECT:-ai-bridge-chrome}
+services:
+  chrome:
+    image: ${CHROME_IMAGE:-ai-bridge-chrome:local}
+    ports:
+      - "127.0.0.1:${BRIDGE_PUBLISH_PORT:-8765}:8765"   # relay: host loopback only, never 0.0.0.0
+      - "127.0.0.1:${SCREEN_PUBLISH_PORT:-3000}:3000"   # web screen (Selkies): host loopback only
+      # Chrome's debug port 9222 is NOT published, here or anywhere.
+    environment:
+      - PUID=${PUID:-501}                               # the Mac user: files under /data and Downloads keep their owner
+      - PGID=${PGID:-20}
+      - TZ=${TZ:-America/Los_Angeles}
+      - CUSTOM_USER=${CUSTOM_USER:-}                    # optional screen login (base image feature); off by default
+      - PASSWORD=${PASSWORD:-}
+    volumes:
+      - ${CHROME_CONFIG_DIR:-${HOME}/docker/ai-bridge-chrome/config}:/config          # Chrome profile (/config/profile), screen state, logs
+      - ${CHROME_DOWNLOADS_DIR:-${HOME}/Downloads}:/config/Downloads                  # bridge `download` results
+      - ${BRIDGE_DATA_DIR:-${HOME}/.ai-browser-bridge}:/data                          # token, relay log, tabs.json, journal, traces
+    shm_size: 1g
+    security_opt:
+      - seccomp=unconfined                              # Chrome's own sandbox needs user namespaces
+    mem_limit: ${CHROME_MEM_LIMIT:-3g}
+    restart: unless-stopped
+    stop_grace_period: 20s

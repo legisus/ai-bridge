@@ -204,6 +204,161 @@ async function fresh({ allowlist = [] } = {}) {
     assert(reply && reply.ok === false, "manual access-set is refused when the policy cannot be read");
   }
 
+  // (docker-chrome 1) newTab {incognito:true}: its own incognito window, owned like any agent tab
+  {
+    const { S, W, gen } = await fresh({ allowlist: ["ok.example"] });
+    S.windows.incognitoAllowed = true;
+    const t = await W.handle("newTab", { url: "https://ok.example/priv", incognito: true }, gen, "ri1");
+    const made = S.windows.created[S.windows.created.length - 1];
+    assert(made && made.incognito === true && made.url === "https://ok.example/priv" && made.focused === false, "newTab incognito: chrome.windows.create({incognito:true}), unfocused");
+    assert(t.incognito === true && t.newWindow === true && typeof t.id === "number" && t.windowId === S.windows.list[S.windows.list.length - 1].id, "newTab incognito: result carries id, windowId, newWindow, incognito");
+    assert((await W.BridgeAccess.agentTabIds()).includes(t.id), "newTab incognito: the tab is registered as an agent tab");
+    S.frames[t.id] = { url: "https://ok.example/priv", documentId: "d-priv" };
+    const rows = await W.handle("listTabs", {}, gen, "ri2");
+    const row = rows.find((r) => r.id === t.id);
+    assert(row && row.incognito === true && row.agent === true && rows.filter((r) => r.incognito).length === 1, "listTabs marks only the incognito tab with incognito:true");
+    // an ordinary newTab while an incognito window exists goes to a REGULAR window, by id
+    const plain = await W.handle("newTab", { url: "https://ok.example/a" }, gen, "ri2b");
+    const opts = S.tabs.created[S.tabs.created.length - 1];
+    assert(opts.windowId === 1 && !("incognito" in plain) && plain.windowId === 1, "with incognito access on, an ordinary newTab names a regular window (never 'the current window')");
+    const own = await W.handle("newTab", { url: "https://ok.example/w", newWindow: true }, gen, "ri2c");
+    assert(S.windows.created[S.windows.created.length - 1].incognito === false && !("incognito" in own), "newWindow asks for a regular window explicitly when incognito windows are visible");
+    // an explicit windowId that IS an incognito window: allowed, and the result says what the tab is
+    const into = await W.handle("newTab", { url: "https://ok.example/b", windowId: t.windowId }, gen, "ri2d");
+    assert(into.incognito === true && into.windowId === t.windowId, "a tab opened into an incognito window by windowId is reported as incognito");
+    assert(/cannot be combined with windowId/.test(await msgOf(W.handle("newTab", { url: "https://ok.example/c", incognito: true, windowId: 1 }, gen, "ri2e"))), "incognito + windowId is refused");
+    await W.handle("closeTab", { tabId: t.id }, gen, "ri3");
+    assert(S.removed.includes(t.id) && !(await W.BridgeAccess.agentTabIds()).includes(t.id), "closeTab closes the incognito agent tab");
+    // only incognito windows left: an ordinary newTab gets a regular window of its own
+    S.windows.list = S.windows.list.filter((w) => w.incognito);
+    const alone = await W.handle("newTab", { url: "https://ok.example/d" }, gen, "ri3b");
+    assert(alone.newWindow === true && !("incognito" in alone) && S.windows.created[S.windows.created.length - 1].incognito === false, "no regular window open: an ordinary newTab opens a regular window, not an incognito tab");
+  }
+  // (docker-chrome 2) not allowed in incognito / the query fails: refused before any window exists, nothing left pending
+  {
+    const { S, W, gen } = await fresh({ allowlist: ["ok.example"] });
+    const pending = async () => ((await S.chrome.storage.session.get("pendingTabs")).pendingTabs || []).length;
+    let err = await msgOf(W.handle("newTab", { url: "https://ok.example/priv", incognito: true }, gen, "ri4"));
+    assert(/^incognito not allowed/.test(err || "") && S.windows.created.length === 0, "newTab incognito is refused when the extension is not allowed in incognito (no window is created)");
+    assert((await W.BridgeAccess.agentTabIds()).length === 0 && (await pending()) === 0, "a refused incognito newTab leaves no agent tab and no pending creation");
+    S.windows.onIncognitoQuery = () => { throw new Error("boom"); };
+    err = await msgOf(W.handle("newTab", { url: "https://ok.example/priv", incognito: true }, gen, "ri4b"));
+    assert(/^incognito not allowed: Chrome did not answer/.test(err || "") && S.windows.created.length === 0 && (await pending()) === 0, "a failed permission query refuses an incognito newTab (fail closed, pending released)");
+    // an unknown permission state must not weaken "ordinary tabs go to a regular window":
+    // the window is named from the window list, independently of the failed query
+    S.windows.list.push({ id: 77, incognito: true, focused: true });
+    const plain = await W.handle("newTab", { url: "https://ok.example/a" }, gen, "ri4c");
+    assert(typeof plain.id === "number" && S.tabs.created[S.tabs.created.length - 1].windowId === 1 && !("incognito" in plain), "permission query failed: an ordinary newTab still names a regular window");
+    const own = await W.handle("newTab", { url: "https://ok.example/a", newWindow: true }, gen, "ri4d");
+    assert(S.windows.created[S.windows.created.length - 1].incognito === false && own.newWindow === true, "permission query failed: newWindow asks for a regular window explicitly");
+    S.windows.getAllFail = true;
+    const alone = await W.handle("newTab", { url: "https://ok.example/a" }, gen, "ri4e");
+    assert(alone.newWindow === true && S.windows.created[S.windows.created.length - 1].incognito === false, "permission query AND window list failed: a regular window of its own, never 'the current window'");
+    S.windows.getAllFail = false; S.windows.list = S.windows.list.filter((w) => w.id !== 77);
+    S.windows.onIncognitoQuery = null;
+    const n0 = S.windows.created.length;
+    // the destination rules come first, incognito or not
+    assert((await msgOf(W.handle("newTab", { url: "chrome://settings", incognito: true }, gen, "ri6"))) === "privileged target refused" && S.windows.created.length === n0, "newTab incognito: privileged target refused");
+    assert(/not in allowlist/.test(await msgOf(W.handle("newTab", { url: "https://other.example/", incognito: true }, gen, "ri7"))) && S.windows.created.length === n0, "newTab incognito: allowlist applies");
+    assert((await pending()) === 0, "refused destinations never write a pending entry");
+  }
+  // (docker-chrome 3) revoke and failure interleavings of an incognito creation
+  {
+    const { S, W, gen } = await fresh({ allowlist: ["ok.example"] });
+    S.windows.incognitoAllowed = true;
+    await S.chrome.storage.local.set({ autoGrant: false }); await sleep(40);
+    await W.BridgeAccess.setAccess({ granted: true });
+    let g = W.BridgeAccess.currentGen();
+    const pending = async () => ((await S.chrome.storage.session.get("pendingTabs")).pendingTabs || []).length;
+    // (a) revoked while Chrome answers the permission query: no window
+    S.windows.onIncognitoQuery = async () => { S.windows.onIncognitoQuery = null; await W.BridgeAccess.setAccess({ granted: false, source: "test" }); };
+    let err = await msgOf(W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rj1"));
+    assert(/access/i.test(err || "") && S.windows.created.length === 0 && (await pending()) === 0, "revoke during the incognito permission query: refused, no window, pending released");
+    // (b) revoked while Chrome creates the window: the late tab is closed, not returned, not owned
+    await W.BridgeAccess.setAccess({ granted: true }); g = W.BridgeAccess.currentGen();
+    S.windows.onCreate = async () => { S.windows.onCreate = null; await W.BridgeAccess.setAccess({ granted: false, source: "test" }); };
+    err = await msgOf(W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rj2"));
+    const lateId = S.tabs.nextId;
+    assert(/access/i.test(err || "") && S.windows.created.length === 1 && S.removed.includes(lateId) && !(await W.BridgeAccess.agentTabIds()).includes(lateId) && (await pending()) === 0, "revoke during incognito window creation: the late tab is closed and dropped");
+    // (c) same, but the late tab cannot be closed: ownership is kept for the reload/cleanup verification
+    await W.BridgeAccess.setAccess({ granted: true }); g = W.BridgeAccess.currentGen();
+    S.windows.onCreate = async () => { S.windows.onCreate = null; S.failIds.add((S.tabs.nextId || 1000) + 1); await W.BridgeAccess.setAccess({ granted: false, source: "test" }); };
+    err = await msgOf(W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rj3"));
+    const stuck = S.tabs.nextId;
+    assert(/access/i.test(err || "") && (await W.BridgeAccess.agentTabIds()).includes(stuck), "a late incognito tab that cannot be closed stays owned (cleanup can still find it)");
+    S.failIds.delete(stuck);
+    // (d) Chrome fails to create the window: error, pending released, nothing owned
+    await W.BridgeAccess.setAccess({ granted: true }); g = W.BridgeAccess.currentGen();
+    const ownedBefore = (await W.BridgeAccess.agentTabIds()).length;
+    S.windows.onCreate = async () => { S.windows.onCreate = null; throw new Error("Incognito mode is disabled."); };
+    err = await msgOf(W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rj4"));
+    assert(err === "Incognito mode is disabled." && (await pending()) === 0 && (await W.BridgeAccess.agentTabIds()).length === ownedBefore, "incognito creation failure: the error is passed on, pending released");
+    // (e) the created window comes back without its tab, or with someone else's: not owned, not closed
+    for (const [name, tabsOf] of [["no tab", () => []], ["a non-incognito tab", (t) => [{ ...t, incognito: false }]], ["two tabs", (t) => [{ ...t }, { ...t, id: t.id + 500 }]]]) {
+      S.windows.tabsOf = tabsOf;
+      const removedBefore = S.removed.length;
+      err = await msgOf(W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rj5"));
+      assert(/could not be identified/.test(err || "") && (await pending()) === 0 && (await W.BridgeAccess.agentTabIds()).length === ownedBefore && S.removed.length === removedBefore, `incognito window reported with ${name}: no ownership taken, nothing closed, pending released`);
+    }
+    S.windows.tabsOf = null;
+    const evs = ((await W.handle("status", { events: true }, g, "rj6")).events || {}).events || [];
+    assert(evs.some((e) => e.kind === "refused" && e.reqId === "rj5" && e.detail && e.detail.reason === "tab_unidentified"), "an unidentified incognito window is recorded in the event log");
+    // (f) a creation still pending blocks reloadExtension (the drain), incognito like any other
+    let release; S.windows.onCreate = () => new Promise((r) => { release = r; });
+    const slow = W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rj7");
+    await sleep(40);
+    W.__reloadDrainMs = 200;
+    err = await msgOf(W.handle("reloadExtension", {}, W.BridgeAccess.currentGen(), "rj8"));
+    assert(/reload refused/.test(err || "") && S.runtime.reloads === 0, "reloadExtension is refused while an incognito creation is pending");
+    S.windows.onCreate = null; release(); await slow.catch(() => {});
+    // a plain new window without a tab no longer throws a TypeError outside the cleanup path
+    S.windows.incognitoAllowed = false;
+    await W.BridgeAccess.setAccess({ granted: true }); g = W.BridgeAccess.currentGen();
+    // an ORDINARY new window is identified the same way: only the one tab Chrome reports for it.
+    // (Before: a missing tab fell back to tabs.query and could claim — and later close — a foreign tab.)
+    S.tabs.list.push({ id: 777, windowId: 1, active: false, url: "https://user.example/" });
+    const realQuery = S.chrome.tabs.query; let queried = 0; S.chrome.tabs.query = async (q) => { if (q && q.windowId !== undefined) queried++; return [{ id: 777, windowId: q && q.windowId }]; };
+    for (const [name, tabsOf] of [["no tab", () => []], ["two tabs", (t) => [{ ...t }, { id: 777, windowId: t.windowId }]], ["an incognito tab", (t) => [{ ...t, incognito: true }]]]) {
+      S.windows.tabsOf = tabsOf;
+      const removedBefore = S.removed.length, owned = (await W.BridgeAccess.agentTabIds()).length;
+      err = await msgOf(W.handle("newTab", { url: "https://ok.example/w", newWindow: true }, g, "rj9"));
+      assert(/^window opened but its tab could not be identified/.test(err || "") && (await pending()) === 0 && (await W.BridgeAccess.agentTabIds()).length === owned && !(await W.BridgeAccess.agentTabIds()).includes(777) && S.removed.length === removedBefore && queried === 0, `newWindow reported with ${name}: no tabs.query guess, no ownership (the user's tab 777 is never claimed), pending released`);
+    }
+    S.chrome.tabs.query = realQuery; S.windows.tabsOf = null;
+    assert(/newWindow opens its own window and cannot be combined with windowId/.test(await msgOf(W.handle("newTab", { url: "https://ok.example/w", newWindow: true, windowId: 1 }, g, "rj10"))) && (await pending()) === 0, "newWindow + windowId is refused (before anything is pending)");
+  }
+  // (docker-chrome 3b) a timed grant that EXPIRES while an incognito tab is being created (no revoke, no alarm)
+  {
+    const { S, W } = await fresh({ allowlist: ["ok.example"] });
+    S.windows.incognitoAllowed = true;
+    await S.chrome.storage.local.set({ autoGrant: false }); await sleep(40);
+    S.alarms.failCreate = false;
+    const pending = async () => ((await S.chrome.storage.session.get("pendingTabs")).pendingTabs || []).length;
+    const timed = async (ms) => { await W.BridgeAccess.setAccess({ granted: true, until: Date.now() + ms }); return W.BridgeAccess.currentGen(); };
+    // (a) the deadline passes while Chrome answers the permission query
+    let g = await timed(60);
+    S.windows.onIncognitoQuery = async () => { S.windows.onIncognitoQuery = null; await sleep(120); };
+    let err = await msgOf(W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rx1"));
+    assert(/access/i.test(err || "") && S.windows.created.length === 0 && (await pending()) === 0, "grant expires during the incognito permission query: refused at dispatch, no window, pending released");
+    // (b) the deadline passes while Chrome creates the window: the tab that comes back is closed, not returned
+    g = await timed(60);
+    S.windows.onCreate = async () => { S.windows.onCreate = null; await sleep(120); };
+    err = await msgOf(W.handle("newTab", { url: "https://ok.example/p", incognito: true }, g, "rx2"));
+    const late = S.tabs.nextId;
+    assert(/access/i.test(err || "") && S.windows.created.length === 1 && S.removed.includes(late) && !(await W.BridgeAccess.agentTabIds()).includes(late) && (await pending()) === 0, "grant expires during incognito window creation: the late tab is closed and dropped");
+  }
+  // (docker-chrome 4) the extension without incognito access behaves exactly as before
+  {
+    const { S, W, gen } = await fresh({ allowlist: ["ok.example"] });
+    const plain = await W.handle("newTab", { url: "https://ok.example/a" }, gen, "rk1");
+    const opts = S.tabs.created[S.tabs.created.length - 1];
+    assert(JSON.stringify(Object.keys(plain)) === '["id","windowId"]' && !("windowId" in opts) && S.windows.created.length === 0, "incognito access off: newTab is a background tab in the current window, same result shape");
+    const win = await W.handle("newTab", { url: "https://ok.example/a", newWindow: true }, gen, "rk2");
+    assert(JSON.stringify(Object.keys(win)) === '["id","windowId","newWindow"]' && !("incognito" in S.windows.created[0]), "incognito access off: newWindow passes no incognito option, same result shape");
+    const manifest = JSON.parse(require("fs").readFileSync(require("path").join(__dirname, "..", "extension", "manifest.json"), "utf8"));
+    assert(manifest.incognito === undefined || manifest.incognito === "spanning", "the manifest keeps the spanning incognito mode (one worker, one relay connection)");
+  }
+
   console.log(failures ? `\n${failures} TEST(S) FAILED` : "\nAll worker tests passed.");
   process.exit(failures ? 1 : 0);
 })().catch((e) => { console.error("harness error", e); process.exit(1); });

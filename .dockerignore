@@ -1,7 +1,6 @@
 node_modules
 dist
 docs
-extension
 macos
 test
 *.png
@@ -9,3 +8,5 @@ test
 deploy/docker/.env*
 deploy/docker/work*
 deploy/docker/channels*.json
+__pycache__
+*.pyc

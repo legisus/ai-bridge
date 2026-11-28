@@ -1,5 +1,8 @@
 # Running the bridge in Docker — isolated agent, your Chrome on the PC
 
+> The opposite layout — Google Chrome in the container, the jobs on the host — is
+> [DOCKER-CHROME.md](DOCKER-CHROME.md).
+
 **Status:** draft on the `docker-isolated` branch, 2026-11-21, revised the same day
 after nine rounds of the Codex `gpt-6-astra` review (53 findings folded in; the
 base design approved in round six, the observability and tab-hygiene additions in

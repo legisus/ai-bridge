@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# bridge-docker — the Mac-side helper for "Chrome in Docker" (docs/DOCKER-CHROME.md).
+#
+#   bridge-docker [--staging] <command>
+#
+#   build            build the image (ai-bridge-chrome:local) from this clone
+#   up               start the container and wait until the relay reports
+#                    session docker-chrome / access granted
+#   down [--force]   close Chrome cleanly, then stop and remove the container
+#                    (profile, state and images stay). If Chrome cannot be
+#                    stopped the container is NOT removed, unless --force.
+#   status           relay ping, container line, Chrome version
+#   restart-chrome   close Chrome in the container; the loop starts it again and
+#                    re-provisions the extension
+#   provision        re-run the provisioning script by hand
+#   screen           open the container's screen in the Mac's browser
+#   logs [-f]        container log; `logs chrome` = the Chrome loop's log
+#   cli <args…>      run the bridge CLI against this instance (same as `bridge`
+#                    for production; needed for --staging)
+#   env              print the settings this invocation uses
+#
+# Production (default): relay on 127.0.0.1:8765, state in ~/.ai-browser-bridge —
+# the port and directory every job already uses. It refuses to start while a
+# host relay owns them.
+# --staging: relay on 127.0.0.1:8766 with its own state directory, next to a
+# live host relay; the SAME Chrome profile, so logins made in staging are the
+# production logins. Staging and production never run at the same time.
+#
+# Exit status of down / restart-chrome: 0 = Chrome closed cleanly (Browser.close),
+# 3 = done, but Chrome had to be terminated (recent cookie changes may be lost),
+# 1 = Chrome could not be stopped (nothing was removed).
+set -euo pipefail
+
+SELF="$0"; while [ -L "$SELF" ]; do L="$(readlink "$SELF")"; case "$L" in /*) SELF="$L";; *) SELF="$(dirname "$SELF")/$L";; esac; done
+REPO="$(cd "$(dirname "$SELF")/.." && pwd)"
+BASE_DIR="${BRIDGE_DOCKER_HOME:-$HOME/docker/ai-bridge-chrome}"
+
+MODE=production
+if [ "${1:-}" = "--staging" ]; then MODE=staging; shift; fi
+CMD="${1:-}"; [ $# -gt 0 ] && shift
+
+if [ "$MODE" = staging ]; then
+  : "${BRIDGE_DOCKER_PROJECT:=ai-bridge-chrome-staging}"
+  : "${BRIDGE_PUBLISH_PORT:=8766}"
+  : "${BRIDGE_DATA_DIR:=$BASE_DIR/staging-data}"
+  : "${CHROME_DOWNLOADS_DIR:=$BASE_DIR/staging-downloads}"
+else
+  : "${BRIDGE_DOCKER_PROJECT:=ai-bridge-chrome}"
+  : "${BRIDGE_PUBLISH_PORT:=8765}"
+  : "${BRIDGE_DATA_DIR:=$HOME/.ai-browser-bridge}"
+  : "${CHROME_DOWNLOADS_DIR:=$HOME/Downloads}"
+fi
+: "${SCREEN_PUBLISH_PORT:=3000}"
+: "${CHROME_CONFIG_DIR:=$BASE_DIR/config}"
+: "${CHROME_IMAGE:=ai-bridge-chrome:local}"
+: "${PUID:=$(id -u)}"
+: "${PGID:=$(id -g)}"
+export BRIDGE_DOCKER_PROJECT BRIDGE_PUBLISH_PORT SCREEN_PUBLISH_PORT BRIDGE_DATA_DIR CHROME_DOWNLOADS_DIR CHROME_CONFIG_DIR CHROME_IMAGE PUID PGID
+
+COMPOSE=(docker compose -f "$REPO/deploy/docker-chrome/compose.yml" -p "$BRIDGE_DOCKER_PROJECT")
+die() { echo "bridge-docker: $*" >&2; exit 1; }
+cli() { AI_BRIDGE_HOME="$BRIDGE_DATA_DIR" BRIDGE_PORT="$BRIDGE_PUBLISH_PORT" node "$REPO/server/cli.js" "$@"; }
+# This project's container: cid = only when it is RUNNING (what exec needs);
+# cid_any = whatever its state (compose `ps` leaves stopped ones out unless -a).
+cid() { { "${COMPOSE[@]}" ps -q chrome 2>/dev/null || true; } | head -1; }
+cid_any() { { "${COMPOSE[@]}" ps -a -q chrome 2>/dev/null || true; } | head -1; }
+need_container() { local c; c="$(cid)"; [ -n "$c" ] || die "the container is not running ($BRIDGE_DOCKER_PROJECT); run: bridge-docker${MODE:+ }$([ "$MODE" = staging ] && echo --staging) up"; echo "$c"; }
+: "${BRIDGE_UP_WAIT:=180}"   # seconds `up` waits for the relay to report ready
+ready() { cli ping --timeout 5000 2>/dev/null | grep -q '"session":"docker-chrome".*"access":"granted"'; }
+
+need_docker() {
+  docker info > /dev/null 2>&1 && return 0
+  if command -v colima > /dev/null 2>&1; then
+    echo "Docker is not reachable; starting Colima…" >&2
+    colima start > /dev/null 2>&1 || true
+    for _ in $(seq 1 30); do docker info > /dev/null 2>&1 && return 0; sleep 2; done
+  fi
+  die "Docker is not reachable (colima status?)"
+}
+
+# The physical path of a directory that exists (symlinks, `..` and trailing
+# slashes resolved): every comparison below is made on these.
+canon() { (cd "$1" 2>/dev/null && pwd -P) || return 1; }
+under_home() { case "$1" in "$HOME_REAL"/*) return 0;; *) return 1;; esac; }
+port_holder() { { lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true; } | awk 'NR>1 {print $1" (pid "$2")"}' | sort -u | head -3 | paste -sd, -; }
+mode_of() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null; }
+
+# The three mounts, as the container's user needs them: existing, physical path
+# under $HOME, owned by and writable for the invoking user (the container runs
+# with this user's ids). The state directory is private (0700) and an existing
+# token is kept exactly as it is (the relay only creates one when the file is
+# absent) — a directory or token that someone else can read is refused, not
+# repaired. After this the three variables hold canonical paths.
+prepare_dirs() {
+  local d real
+  HOME_REAL="$(canon "$HOME")"
+  [ "$PUID" = "$(id -u)" ] && [ "$PGID" = "$(id -g)" ] || die "PUID/PGID ($PUID/$PGID) differ from the invoking user ($(id -u)/$(id -g)); the mounts are prepared for the invoking user"
+  for d in CHROME_CONFIG_DIR CHROME_DOWNLOADS_DIR BRIDGE_DATA_DIR; do
+    case "${!d}" in /*) ;; *) die "$d must be an absolute path: ${!d}";; esac
+    case "${!d}" in "$HOME"/*|"$HOME_REAL"/*) ;; *) die "${!d} is not under \$HOME: Colima shares only the home directory, the mount would silently become a folder inside the VM";; esac
+  done
+  mkdir -p "$CHROME_CONFIG_DIR" "$CHROME_DOWNLOADS_DIR"
+  [ -d "$BRIDGE_DATA_DIR" ] || mkdir -m 700 -p "$BRIDGE_DATA_DIR"
+  for d in CHROME_CONFIG_DIR CHROME_DOWNLOADS_DIR BRIDGE_DATA_DIR; do
+    real="$(canon "${!d}")" || die "${!d} is not a directory"
+    under_home "$real" || die "${!d} resolves to $real, which is not under \$HOME (Colima shares only the home directory)"
+    [ -w "$real" ] && [ -O "$real" ] || die "$real must be owned by and writable for $(id -un) (the container runs as uid $PUID)"
+    printf -v "$d" %s "$real"
+  done
+  [ "$(mode_of "$BRIDGE_DATA_DIR")" = 700 ] || die "$BRIDGE_DATA_DIR must be mode 700 (it holds the relay token); it is $(mode_of "$BRIDGE_DATA_DIR")"
+  if [ -e "$BRIDGE_DATA_DIR/token" ]; then
+    [ -f "$BRIDGE_DATA_DIR/token" ] && [ -O "$BRIDGE_DATA_DIR/token" ] && [ -s "$BRIDGE_DATA_DIR/token" ] && [ "$(mode_of "$BRIDGE_DATA_DIR/token")" = 600 ] \
+      || die "$BRIDGE_DATA_DIR/token must be a non-empty file owned by $(id -un) with mode 600"
+  fi
+  [ "$CHROME_CONFIG_DIR" != "$BRIDGE_DATA_DIR" ] && [ "$CHROME_CONFIG_DIR" != "$CHROME_DOWNLOADS_DIR" ] && [ "$BRIDGE_DATA_DIR" != "$CHROME_DOWNLOADS_DIR" ] || die "the profile, state and downloads directories must be three different directories"
+}
+
+# The state directory each relay process on the HOST works in, one line per
+# process: "<pid> <physical path>", or "<pid> ?" when it cannot be told. A relay
+# takes its directory from AI_BRIDGE_HOME, else ~/.ai-browser-bridge of ITS
+# home (server/token.js) — so that is read from the process's own environment,
+# not assumed from the fact that some server.js runs. (Relays inside containers
+# are not host processes on a Mac and are covered by the mount check.)
+host_relay_dirs() {
+  local pid argv full env dir home
+  for pid in $(pgrep -f 'server/server\.js' 2>/dev/null || true); do
+    argv="$(ps ww -o command= -p "$pid" 2>/dev/null)" || continue
+    case "$argv" in *node*server/server.js*) ;; *) continue;; esac     # an editor or a grep on that path is not a relay
+    full="$(ps eww -o command= -p "$pid" 2>/dev/null || true)"
+    env="${full#"$argv"}"                                              # what follows the arguments: the environment
+    # a value runs up to the next " NAME=" (a path may contain spaces)
+    dir="$(sed -n 's/^.* AI_BRIDGE_HOME=//p' <<< "$env" | sed 's/ [A-Za-z_][A-Za-z0-9_]*=.*$//')"
+    if [ -z "$dir" ]; then
+      home="$(sed -n 's/^.* HOME=//p' <<< "$env" | sed 's/ [A-Za-z_][A-Za-z0-9_]*=.*$//')"
+      [ -z "$home" ] || dir="$home/.ai-browser-bridge"
+    fi
+    if [ -z "$dir" ]; then echo "$pid ?"; else echo "$pid $(canon "$dir" || echo "$dir")"; fi
+  done
+}
+
+# Refusals, on canonical paths, on EVERY `up` (also when this project's
+# container already exists and compose is about to start or recreate it).
+guard_up() {
+  local mine mine12 list other p holder owned host_state pid dir
+  # This project's own container, running OR stopped (after a stop, a failed
+  # start, a Docker restart): it is not "another container", `up` recovers it.
+  mine="$(cid_any)"; mine12="$(cut -c1-12 <<< "$mine")"
+  # One container per Chrome profile and per state directory. ANY other
+  # container that mounts either counts, running or not: a stopped one with a
+  # restart policy comes back with Docker.
+  list="$(docker ps -a --format '{{.ID}} {{.Names}} {{.State}}')" || die "Docker could not list the containers; not starting anything while that is unknown"
+  other="$(while read -r id name state; do
+      [ -n "$id" ] || continue
+      if [ -n "$mine12" ] && [ "$id" = "$mine12" ]; then continue; fi
+      docker inspect "$id" --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' 2>/dev/null | while read -r src; do
+        [ -n "$src" ] || continue
+        real="$(canon "$src" || echo "$src")"
+        if [ "$real" = "$CHROME_CONFIG_DIR" ]; then echo "$name ($state) mounts the Chrome profile directory"; fi
+        if [ "$real" = "$BRIDGE_DATA_DIR" ]; then echo "$name ($state) mounts the state directory"; fi
+      done
+    done <<< "$list" | sort -u | paste -sd';' -)"
+  [ -z "$other" ] || die "belongs to another container: $other. Remove that one first (bridge-docker [--staging] down) — staging and production share the profile and never run together."
+  # A relay on the host owns ITS state directory (its log, tabs.json, journal):
+  # no container may mount that directory while the relay lives, whatever the
+  # port. A host relay on another directory (the second relay of the guide's
+  # variant B) is none of this container's business.
+  host_state="$(canon "$HOME/.ai-browser-bridge" || true)"
+  while read -r pid dir; do
+    [ -n "$pid" ] || continue
+    if [ "$dir" = "$BRIDGE_DATA_DIR" ]; then
+      die "a host relay is running on $BRIDGE_DATA_DIR (pid $pid); two relays must not share a state directory. $([ "$dir" = "$host_state" ] && echo 'That is ~/.ai-browser-bridge: use --staging, or do the switch-over first.')"
+    fi
+    if [ "$dir" = "?" ] && [ -n "$host_state" ] && [ "$BRIDGE_DATA_DIR" = "$host_state" ]; then
+      die "a host relay is running (pid $pid) and its state directory cannot be read from its environment; assuming ~/.ai-browser-bridge. Two relays must not share that directory. Use --staging, or do the switch-over first."
+    fi
+  done <<< "$(host_relay_dirs)"
+  # The ports: free, or published by this project's own running container
+  # (asked from Docker, not assumed from the container's existence — a stopped
+  # container of ours holds no port, and a port someone else took in the
+  # meantime is still refused).
+  owned=""; [ -z "$mine" ] || owned="$(docker port "$mine" 2>/dev/null || true)"
+  for p in "$BRIDGE_PUBLISH_PORT" "$SCREEN_PUBLISH_PORT"; do
+    if grep -q -- "-> 127\.0\.0\.1:$p\$" <<< "$owned"; then continue; fi
+    holder="$(port_holder "$p")"
+    [ -z "$holder" ] || die "port 127.0.0.1:$p is already held by $holder. $([ "$p" = 8765 ] && echo 'That is the host relay: the switch-over (docs/DOCKER-CHROME.md) stops it first; until then use --staging.')"
+  done
+}
+
+# One `up` at a time on this Mac, for any mode: the checks above and the
+# container creation that follows them must not interleave with another `up`
+# (two starts could otherwise both pass the profile check). The mutex is held
+# by the operating system (lockf on macOS, flock on Linux) on a file that is
+# never removed: it ends with its holder, however that dies, so there is no
+# stale lock to recover and no recovery to race.
+UP_LOCK="${BRIDGE_DOCKER_UP_LOCK:-${TMPDIR:-/tmp}/bridge-docker-up.lock}"
+: "${BRIDGE_UP_LOCK_WAIT:=300}"
+with_up_lock() {
+  local rc=0
+  if command -v lockf > /dev/null 2>&1; then lockf -k -t "$BRIDGE_UP_LOCK_WAIT" "$UP_LOCK" "$@" || rc=$?
+  elif command -v flock > /dev/null 2>&1; then flock -w "$BRIDGE_UP_LOCK_WAIT" -E 75 "$UP_LOCK" "$@" || rc=$?
+  else die "neither lockf nor flock is available; cannot serialize \`up\`"; fi
+  [ "$rc" != 75 ] || die "another bridge-docker up is still running after $BRIDGE_UP_LOCK_WAIT s (lock $UP_LOCK)"
+  return "$rc"
+}
+
+# Would `compose up` leave this running container as it is? Only when it runs
+# the image `up` would start AND compose's own hash of the settings matches.
+# Anything that cannot be read counts as "no".
+unchanged() {
+  local want have
+  want="$(docker image inspect "$CHROME_IMAGE" --format '{{.Id}}' 2>/dev/null)" || return 1
+  have="$(docker inspect "$1" --format '{{.Image}}' 2>/dev/null)" || return 1
+  [ -n "$want" ] && [ "$want" = "$have" ] || return 1
+  want="$("${COMPOSE[@]}" config --hash chrome 2>/dev/null | awk '{print $2}')" || return 1
+  have="$(docker inspect "$1" --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' 2>/dev/null)" || return 1
+  [ -n "$want" ] && [ "$want" = "$have" ]
+}
+
+# The part of `up` that runs under the mutex: checks, then creation.
+create_locked() {
+  local running rc=0 recreate=""
+  prepare_dirs
+  guard_up
+  # Replacement (a rebuilt image, changed settings): compose would stop the old
+  # container with a plain SIGTERM, and Chrome would lose its recent cookie
+  # changes. So Chrome is closed the clean way FIRST, and only then replaced.
+  running="$(cid)"
+  if [ -n "$running" ] && ! unchanged "$running"; then
+    echo "the running container differs from what \`up\` starts (image or settings): closing Chrome before it is replaced"
+    stop_chrome "$running" loop || rc=$?
+    case "$rc" in
+      0) ;;
+      3) echo "bridge-docker: WARNING: Chrome had to be terminated before the replacement; cookie changes of the last ~30 s may be lost" >&2 ;;
+      *) die "Chrome in the running container could not be stopped (status $rc); the container was NOT replaced. Look at: bridge-docker $([ "$MODE" = staging ] && echo '--staging ')logs chrome — or remove it knowingly with: down --force" ;;
+    esac
+    recreate="--force-recreate"         # its Chrome loop has ended: the old container must not be kept
+  fi
+  # shellcheck disable=SC2086
+  "${COMPOSE[@]}" up -d $recreate
+}
+
+# Stop Chrome inside the container and report how it went (the script and its
+# exit statuses: deploy/docker-chrome/chrome-stop.sh). Clean = a DevTools
+# Browser.close: the only stop after which Chrome has written its cookie store
+# out. A SIGTERM loses up to ~30 s of cookie changes, so it is only the
+# fallback — to the browser process alone, never by pattern — and it is
+# reported as such, not as a clean stop.
+#   $2 = chrome : Chrome only; the start loop brings it back and re-provisions
+#   $2 = loop   : Chrome and the start loop (nothing starts another Chrome)
+# Returns 0 clean, 3 forced, anything else = not stopped / unknown.
+stop_chrome() {
+  docker exec -i -u abc -e HOME=/config "$1" sh -s -- "$2" < "$REPO/deploy/docker-chrome/chrome-stop.sh"
+}
+
+case "$CMD" in
+  build)
+    need_docker
+    commit="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    [ -z "$(git -C "$REPO" status --porcelain -- server extension deploy/docker-chrome package.json package-lock.json 2>/dev/null)" ] || commit="$commit-dirty"
+    docker build -f "$REPO/deploy/docker-chrome/Dockerfile" --build-arg GIT_COMMIT="$commit" -t "$CHROME_IMAGE" "$@" "$REPO"
+    # What was actually installed becomes labels (a second, fully cached build):
+    # `docker image inspect` then names the Chrome version and package checksum.
+    ver="$(docker run --rm --entrypoint cat "$CHROME_IMAGE" /opt/ai-bridge/CHROME_VERSION)"
+    sum="$(docker run --rm --entrypoint cat "$CHROME_IMAGE" /opt/ai-bridge/CHROME_DEB_SHA256)"
+    docker build -q -f "$REPO/deploy/docker-chrome/Dockerfile" --build-arg GIT_COMMIT="$commit" \
+      --label "ai-bridge.chrome.version=$ver" --label "ai-bridge.chrome.deb-sha256=$sum" -t "$CHROME_IMAGE" "$@" "$REPO" > /dev/null
+    echo "built $CHROME_IMAGE: commit $commit, $ver, image $(docker image inspect "$CHROME_IMAGE" --format '{{.Id}}')"
+    ;;
+  up)
+    need_docker
+    docker image inspect "$CHROME_IMAGE" > /dev/null 2>&1 || die "image $CHROME_IMAGE not built yet; run: bridge-docker build"
+    # checks + creation under the mutex (this script again, as `__create`, so
+    # that the lock is the operating system's and ends with that process); the
+    # wait below runs outside it: the next `up` already sees this container
+    with_up_lock "$BASH" "$SELF" $([ "$MODE" = staging ] && echo --staging) __create || exit $?
+    echo "waiting for the relay to report session docker-chrome / access granted…"
+    waited=0
+    while :; do
+      if ready; then cli ping; echo "up: relay 127.0.0.1:$BRIDGE_PUBLISH_PORT, screen http://127.0.0.1:$SCREEN_PUBLISH_PORT"; exit 0; fi
+      [ "$waited" -lt "$BRIDGE_UP_WAIT" ] || break
+      sleep 3; waited=$((waited + 3))
+    done
+    cli ping || true
+    die "not ready after $BRIDGE_UP_WAIT s — see: bridge-docker $([ "$MODE" = staging ] && echo '--staging ')logs chrome"
+    ;;
+  __create)                                 # internal: `up` runs this under the mutex
+    create_locked
+    ;;
+  down)
+    need_docker
+    force=no; [ "${1:-}" != --force ] || force=yes
+    # Close Chrome and end its loop first (cookies written out, nothing starts
+    # another one), then remove the container. A stop that failed is not
+    # hidden: the container stays unless --force; a forced stop is reported
+    # and exits 3.
+    c="$(cid)"; rc=0
+    if [ -n "$c" ]; then
+      stop_chrome "$c" loop || rc=$?
+      case "$rc" in
+        0) ;;
+        3) echo "bridge-docker: WARNING: Chrome had to be terminated (no clean Browser.close); cookie changes of the last ~30 s may be lost" >&2 ;;
+        *) if [ "$force" = yes ]; then
+             echo "bridge-docker: WARNING: Chrome could not be stopped (status $rc); removing the container anyway (--force). Recent cookie changes may be lost" >&2; rc=3
+           else
+             die "Chrome could not be stopped (status $rc); the container was NOT removed. Look at: bridge-docker $([ "$MODE" = staging ] && echo '--staging ')logs chrome — or remove it knowingly with: down --force"
+           fi ;;
+      esac
+    fi
+    "${COMPOSE[@]}" down
+    [ "$rc" = 0 ] || exit 3
+    ;;
+  status)
+    need_docker
+    echo "mode: $MODE   project: $BRIDGE_DOCKER_PROJECT   relay: 127.0.0.1:$BRIDGE_PUBLISH_PORT   screen: http://127.0.0.1:$SCREEN_PUBLISH_PORT"
+    c="$(cid)"
+    if [ -z "$c" ]; then echo "container: not running"; exit 1; fi
+    docker ps --filter "id=$c" --format 'container: {{.Names}}  {{.Status}}  {{.Ports}}'
+    echo "chrome: $(docker exec "$c" sh -c 'curl -fsS http://127.0.0.1:9222/json/version 2>/dev/null | grep -o "\"Browser\": *\"[^\"]*\"" || echo "not running"') (image: $(docker exec "$c" cat /opt/ai-bridge/CHROME_VERSION 2>/dev/null))"
+    printf 'relay: '; cli ping --timeout 5000 || exit 1
+    ready || { echo "NOT READY: expected session docker-chrome, access granted" >&2; exit 1; }
+    ;;
+  restart-chrome)
+    need_docker; c="$(need_container)"
+    rc=0; stop_chrome "$c" chrome || rc=$?
+    case "$rc" in
+      0) echo "Chrome closed cleanly; the loop restarts it and re-provisions the extension (bridge-docker status)" ;;
+      3) echo "bridge-docker: WARNING: Chrome had to be terminated (no clean Browser.close); cookie changes of the last ~30 s may be lost. The loop restarts it (bridge-docker status)" >&2; exit 3 ;;
+      *) die "Chrome did not stop (status $rc); it was not restarted — see: bridge-docker $([ "$MODE" = staging ] && echo '--staging ')logs chrome" ;;
+    esac
+    ;;
+  provision)
+    need_docker; c="$(need_container)"
+    docker exec -u abc -e HOME=/config "$c" /lsiopy/bin/python3 -I /usr/local/bin/provision.py
+    ;;
+  screen)
+    open "http://127.0.0.1:$SCREEN_PUBLISH_PORT"
+    ;;
+  logs)
+    need_docker
+    if [ "${1:-}" = chrome ]; then c="$(need_container)"; docker exec "$c" tail -n "${2:-60}" /config/chrome-start.log
+    else "${COMPOSE[@]}" logs --tail 200 "$@"; fi
+    ;;
+  cli)
+    cli "$@"
+    ;;
+  env)
+    printf '%s=%s\n' mode "$MODE" BRIDGE_DOCKER_PROJECT "$BRIDGE_DOCKER_PROJECT" BRIDGE_PUBLISH_PORT "$BRIDGE_PUBLISH_PORT" SCREEN_PUBLISH_PORT "$SCREEN_PUBLISH_PORT" \
+      BRIDGE_DATA_DIR "$BRIDGE_DATA_DIR" CHROME_CONFIG_DIR "$CHROME_CONFIG_DIR" CHROME_DOWNLOADS_DIR "$CHROME_DOWNLOADS_DIR" CHROME_IMAGE "$CHROME_IMAGE" PUID "$PUID" PGID "$PGID"
+    ;;
+  *)
+    sed -n '2,31p' "$SELF" | sed 's/^# \{0,1\}//'
+    [ -z "$CMD" ] || [ "$CMD" = help ] || [ "$CMD" = -h ] || [ "$CMD" = --help ] || exit 2
+    ;;
+esac

@@ -5,6 +5,7 @@
 //   bridge listTabs
 //   bridge newTab '{"url":"https://example.com"}'                  # background tab
 //   bridge newTab '{"url":"https://example.com","newWindow":true}' # own unfocused window
+//   bridge newTab '{"url":"https://example.com","incognito":true}' # own incognito window (needs "Allow in incognito")
 //   bridge eval '{"tabId":123}' --file script.js
 //   bridge eval '{"tabId":123,"code":"document.title"}'
 //   bridge pdf '{"tabId":123}' --out page.pdf
